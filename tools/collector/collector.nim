@@ -287,7 +287,8 @@ proc main(): int =
           argValue(args, "hold-on-degraded").defaultInt(1,
             "hold-on-degraded") != 0),
       readDocFile(calendarPath),
-      tokenSource)
+      tokenSource,
+      lastPathPart(outDir))
   except CollectorError as e:
     fail(2, "COLLECTOR CONFIG: " & e.msg)
   except CoverageError as e:

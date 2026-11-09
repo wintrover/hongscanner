@@ -36,7 +36,7 @@ Consumed by Core (eight):
 | kind | role |
 |---|---|
 | `calendar` | session days; `days[date].open/close` are the only source of session bounds |
-| `config` | `session_date` (required) + `params`; the only source of the run date |
+| `config` | `session_date` (required) + `params`; `run_id` (optional) — the run directory's basename; the only source of the run date |
 | `ws_frame` | one trade tick: `symbol`, `t` (`HH:MM:SS+09:00`), `price` (int), `vol` (cumulative int), `m` (field 290, optional) |
 | `rest_resp` | terminal record of one REST attempt (success, HTTP/vendor error, or transport failure) |
 | `sub` | one subscription request or acknowledgement (validated acceptance) |
@@ -567,6 +567,18 @@ design; the NO_EFFECT class of §10 is stated over the Core artifacts of
 §1 (`bars.hcj.jsonl`, `signals.hcj.jsonl`). Event byte-identity is defined
 between the live-produced file and the replay of the same input bytes:
 same input bytes, same event bytes.
+
+The id tuple carries the run's own identity when the config record
+declares one: `run_id` (the run directory's basename, the same value the
+recorder's COMMITTED marker carries) joins the digest object between
+`rule_id` and `session_id`. One date may hold more than one run — a
+failed run's recorded facts are immutable and its same-day restart is a
+different run whose facts must coexist in the notify ledger; the
+`run_id` namespace keeps the two id spaces disjoint (2026-11-09
+incident: the legacy date-only id space collided and the ledger refused
+the restart's whole batch). A config record without `run_id` (every
+sealed pre-2026-11-09 run) keeps the legacy five-key digest
+byte-identically — old sealed runs replay with their recorded ids.
 
 ### 13.5 Determinism boundary
 

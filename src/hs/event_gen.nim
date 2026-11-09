@@ -107,6 +107,17 @@ type
     ## re-consuming the recorded stream (stateAt + step); nothing else
     ## exists to persist.
     sessionId*: string       ## config.session_date (record 2)
+    runId*: string           ## config.run_id (optional, record 2): the
+                             ## run's own identity — the run directory's
+                             ## basename, the same value the recorder's
+                             ## COMMITTED marker carries. Namespaces the
+                             ## event ids (2026-11-09: a failed run and its
+                             ## same-day restart must coexist in the notify
+                             ## ledger; the id space of one date alone
+                             ## collided and the immutable ledger refused
+                             ## the restart's facts). Absent on legacy
+                             ## records: their ids keep the legacy rule and
+                             ## sealed runs replay byte-identically.
     pageCap*: int            ## config.page_cap, defaultPageCap when absent
     lastT*: string           ## last observation timestamp derived so far
     lastSeq*: int            ## seq of the last consumed record
@@ -141,17 +152,34 @@ proc initEventGenState*(): EventGenState =
 # ------------------------------------------------------------------- facts
 
 proc eventIdOf*(sessionId, eventType, ruleId, entity: string;
-                transitionSeq: int): string =
-  ## x-event-id-rule, verbatim: sha256 lowercase hex over the HCJ
-  ## canonical serialization of
+                transitionSeq: int; runId = ""): string =
+  ## x-event-id-rule: sha256 lowercase hex over the HCJ canonical
+  ## serialization (keys in codepoint-ascending order, no whitespace, bare
+  ## integer) of
   ## {"entity":E,"event_type":T,"rule_id":R,"session_id":S,"transition_seq":Q}
-  ## (keys in codepoint-ascending order, no whitespace, bare integer).
-  ## Q is the input record seq and enters only this digest.
-  let t = hObj(("entity", hStr(entity)),
-               ("event_type", hStr(eventType)),
-               ("rule_id", hStr(ruleId)),
-               ("session_id", hStr(sessionId)),
-               ("transition_seq", hInt(transitionSeq)))
+  ## — plus "run_id":U sorted between "rule_id" and "session_id" when a
+  ## runId is given. Q is the input record seq and enters only this digest.
+  ## runId (the config record's run_id, the run directory's basename —
+  ## the same identity the recorder's COMMITTED marker carries) namespaces
+  ## the digest when present: a same-date restart of a failed run is a
+  ## DIFFERENT run whose facts must coexist with the failure's facts in
+  ## the immutable notify ledger (2026-11-09 incident: the legacy id space
+  ## collided and the ledger refused the restart's whole event batch).
+  ## Absent runId keeps the legacy object byte-identically, so every
+  ## sealed pre-run_id run replays with its recorded ids.
+  let t = if runId.len == 0:
+      hObj(("entity", hStr(entity)),
+           ("event_type", hStr(eventType)),
+           ("rule_id", hStr(ruleId)),
+           ("session_id", hStr(sessionId)),
+           ("transition_seq", hInt(transitionSeq)))
+    else:
+      hObj(("entity", hStr(entity)),
+           ("event_type", hStr(eventType)),
+           ("rule_id", hStr(ruleId)),
+           ("run_id", hStr(runId)),
+           ("session_id", hStr(sessionId)),
+           ("transition_seq", hInt(transitionSeq)))
   sha256Hex(canonical(t))
 
 proc eventHcj*(e: EventFact): HcjValue =
@@ -191,7 +219,8 @@ proc judged(s: EventGenState; seqNo: int; eventType, ruleId, symbol,
   let sym = if validCode(symbol): symbol else: ""
   let entity = if sym.len > 0: sym else: "*"
   EventFact(
-    eventId: eventIdOf(s.sessionId, eventType, ruleId, entity, seqNo),
+    eventId: eventIdOf(s.sessionId, eventType, ruleId, entity, seqNo,
+                       s.runId),
     eventType: eventType,
     observedAt: observedAt,
     sessionId: s.sessionId,
@@ -262,6 +291,11 @@ proc consumeConfig(s: var EventGenState; r: Record) =
     if pc.kind != hkInt or int(pc.ival) < 1:
       raise egenerr("event judgment: config.page_cap must be an integer >= 1")
     s.pageCap = int(pc.ival)
+  if raw.has("run_id"):
+    let ri = raw.get("run_id")
+    if ri.kind != hkStr:
+      raise egenerr("event judgment: config.run_id must be a string")
+    s.runId = ri.strVal
 
 proc gapEvents(s: var EventGenState; r: Record; events: var seq[EventFact]) =
   ## Every gap record is DATA_GAP_SUSPECTED (§3: a gap is a period whose
@@ -529,7 +563,7 @@ proc finish*(s: EventGenState): seq[EventFact] =
     return @[]
   result = @[EventFact(
     eventId: eventIdOf(s.sessionId, "SESSION_INCOMPLETE",
-                       ruleSessionIncomplete, "*", s.lastSeq),
+                       ruleSessionIncomplete, "*", s.lastSeq, s.runId),
     eventType: "SESSION_INCOMPLETE",
     observedAt: s.fallbackT,
     sessionId: s.sessionId,

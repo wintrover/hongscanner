@@ -175,6 +175,31 @@ block config:
         "\"environment\":\"demo\"" in canonical(pre[1].raw) and
         "\"repoll_seconds\":300" in canonical(pre[1].raw) and
         "\"page_cap\":10" in canonical(pre[1].raw))
+  proc cfgWithRunId(runId: string): CollectorConfig =
+    initCollectorConfig(
+      "2026-10-29", "demo", "demo-profile",
+      "000", "0000", "0", "0", "1", "0", "0", "1",
+      Params(warmupBars: 0, lookbackBars: 3, trendMinBp: 50,
+             countermoveMinBp: 50, directionalTriggerBp: 30,
+             holdOnDegraded: true),
+      calRaw(), "kiwoomcli", runId)
+  let runPre = cfgWithRunId("fidelity-2026-10-29-a").preambleRecords()
+  check("a run_id reaches the config record verbatim",
+        "\"run_id\":\"fidelity-2026-10-29-a\"" in canonical(runPre[1].raw))
+  check("an absent run_id keeps the config record run_id-free (legacy " &
+        "streams record byte-identical configs)",
+        "run_id" notin canonical(pre[1].raw) and
+        (block:
+           var stripped: seq[HcjPair] = @[]
+           for p in runPre[1].raw.pairs:
+             if p.k != "run_id": stripped.add(p)
+           canonical(hObj(stripped)) == canonical(pre[1].raw)))
+  coreErr("a run_id with a path separator is refused (basename rule)",
+          "run_id must be a directory basename", proc () =
+    discard cfgWithRunId("runs/foo"))
+  coreErr("a run_id with whitespace is refused (basename rule)",
+          "run_id must be a directory basename", proc () =
+    discard cfgWithRunId("run id"))
   coreErr("a non-approved environment is refused (staging)",
           "environment must be demo or real", proc () =
     discard initCollectorConfig(
