@@ -75,8 +75,8 @@ void main() {
     await store.bootstrap();
 
     expect(store.pushState.phase, PushPhase.denied);
-    // The app still synced all recorded facts — denial only kills push.
-    expect(store.status.phase, LoadPhase.loaded);
+    // The app still synced the projection — denial only kills push.
+    expect(store.marketView.phase, LoadPhase.loaded);
     expect(store.pushState.askedCount, 1);
   });
 
@@ -154,7 +154,7 @@ void main() {
     expect(store.pushState.phase, PushPhase.unwired);
     expect(store.pushState.token, isNull);
     // Everything else still loads.
-    expect(store.events.phase, LoadPhase.loaded);
+    expect(store.marketView.phase, LoadPhase.loaded);
     expect(store.syncCount, 1);
   });
 

@@ -27,7 +27,7 @@ class EventDetailScreen extends StatelessWidget {
                 leading: Icon(Icons.touch_app_outlined),
                 title: Text('이벤트 미선택'),
                 subtitle: Text(
-                    'Timeline 목록이나 알림 탭으로 이벤트를 선택하면 기록된 사실이 표시됩니다.'),
+                    'Market View 목록이나 알림 탭으로 이벤트를 선택하면 기록된 사실이 표시됩니다.'),
               ),
             )
           else ...[

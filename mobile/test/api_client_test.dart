@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hongscanner/api/api_client.dart';
+import 'package:hongscanner/api/api_models.dart';
 
 import 'test_kit.dart';
 
@@ -21,36 +22,36 @@ void main() {
       );
     });
 
-    test('builds GET paths under the base origin', () async {
+    test('builds the market-view GET path under the base origin', () async {
       final transport = FakeTransport(
-          (_) async => okJson(fixtureStatus));
+          (_) async => okJson(fixtureMarketView));
       final client = ApiClient(
           baseUrl: 'http://127.0.0.1:8080', transport: transport);
-      await client.fetchStatus();
+      await client.fetchMarketView();
       expect(transport.requests.single.toString(),
-          'http://127.0.0.1:8080/status');
+          'http://127.0.0.1:8080/mobile/market-view');
       client.close();
       expect(transport.closed, isFalse,
           reason: 'an injected transport is owned by the caller; close() '
               'only closes transports the client created itself');
     });
 
-    test('session_id filter becomes a query parameter', () async {
+    test('builds the single-event GET path under the base origin', () async {
       Uri? captured;
       final transport = FakeTransport((uri) async {
         captured = uri;
-        return okJson(fixtureEvents);
+        return okJson({'delivery': <Object?>[], 'event': evUpEnter});
       });
       final client = ApiClient(
           baseUrl: 'http://127.0.0.1:8080', transport: transport);
-      await client.fetchEvents(sessionId: '2026-10-30');
-      expect(captured!.queryParameters['session_id'], '2026-10-30');
+      await client.fetchEvent(evUpEnterId);
+      expect(captured!.toString(), 'http://127.0.0.1:8080/events/$evUpEnterId');
     });
   });
 
   group('ApiClient identifier validation (server rules, client-side)', () {
     test('non-hex event id is refused before any request', () async {
-      final transport = FakeTransport((_) async => okJson(fixtureStatus));
+      final transport = FakeTransport((_) async => okJson(fixtureMarketView));
       final client = ApiClient(
           baseUrl: 'http://127.0.0.1:8080', transport: transport);
       await expectLater(
@@ -65,7 +66,7 @@ void main() {
     test('uppercase or short event id is refused', () async {
       final client = ApiClient(
         baseUrl: 'http://127.0.0.1:8080',
-        transport: FakeTransport((_) async => okJson(fixtureStatus)),
+        transport: FakeTransport((_) async => okJson(fixtureMarketView)),
       );
       for (final bad in ['ABC', 'a' * 63, 'A' * 64]) {
         await expectLater(
@@ -75,98 +76,81 @@ void main() {
         );
       }
     });
-
-    test('path-traversal session name is refused before any request', () async {
-      final transport = FakeTransport((_) async => okJson(fixtureSessions));
-      final client = ApiClient(
-          baseUrl: 'http://127.0.0.1:8080', transport: transport);
-      await expectLater(
-        client.fetchVerification('../other-run'),
-        throwsA(isA<ApiClientException>()
-            .having((e) => e.code, 'code', ApiErrorCode.invalidIdentifier)),
-      );
-      expect(transport.requests, isEmpty);
-    });
   });
 
   group('ApiClient response parsing (contract shapes)', () {
-    test('fetchStatus parses the recorded blocks', () async {
-      final client = ApiClient(
-          baseUrl: 'http://127.0.0.1:8080',
-          transport: fixtureTransport());
-      final status = await client.fetchStatus();
-      expect(status.sessionsCount, 1);
-      expect(status.sessionsLatest.session, fixtureSession);
-      expect(status.sessionsLatest.sessionDate, '2026-11-02');
-      expect(status.ledgerPresent, isTrue);
-      expect(status.eventsCount, 4);
-      expect(status.byType?['CANDIDATE_ENTERED'], 2);
-      expect(status.latestEvent?.eventType, 'SESSION_ENDED');
-      expect(status.deliveryConfigured, isTrue);
-      expect(status.deliveryPresent, isTrue);
-      expect(status.byState, {'ACCEPTED': 1});
+    Future<MarketViewResponse> fetchFixture() async => ApiClient(
+        baseUrl: 'http://127.0.0.1:8080',
+        transport: fixtureTransport()).fetchMarketView();
+
+    test('fetchMarketView parses the projection blocks', () async {
+      final marketView = await fetchFixture();
+      expect(marketView.asOf, '2026-11-02T15:30:58+09:00');
+      expect(marketView.runsPresent, isTrue);
+      expect(marketView.run?.session, fixtureSession);
+      expect(marketView.run?.sessionDate, '2026-11-02');
+      expect(marketView.run?.runId, 'run-2026-11-02-1');
+      expect(marketView.run?.startedAt, '2026-11-02T09:00:00+09:00');
+      expect(marketView.risingTop10, hasLength(2));
+      expect(marketView.fallingTop10.single.symbol, '000660');
+      expect(marketView.fallingTop10.single.direction, 'DOWN');
+      expect(marketView.fallingTop10.single.rank, 1);
+      expect(marketView.history, hasLength(4));
+      expect(marketView.latest?.eventId, evDownExitId);
+      expect(marketView.latest?.eventType, 'CANDIDATE_EXITED');
+      expect(marketView.status?.byDataQuality,
+          {'INCOMPLETE': 1, 'OBSERVING': 3});
     });
 
-    test('fetchStatus keeps null = no record (absent ledger, unconfigured)',
+    test('history keeps the server order (oldest→newest), CANDIDATE_* only',
         () async {
-      final absentLedger = {
-        'delivery': {
-          'by_state': null,
-          'configured': false,
-          'devices': null,
-          'pairs': null,
-          'present': null,
-        },
-        'events': {
-          'by_severity': null,
-          'by_type': null,
-          'count': null,
-          'latest_event': null,
-          'latest_session_id': null,
-          'ledger_present': false,
-        },
-        'sessions': {'count': 0, 'latest': null},
-      };
-      final client = ApiClient(
-          baseUrl: 'http://127.0.0.1:8080',
-          transport: FakeTransport(
-              (uri) async => uri.path.endsWith('/status')
-                  ? okJson(absentLedger)
-                  : errorJson(404, 'not_found', 'nothing here')));
-      final status = await client.fetchStatus();
-      expect(status.ledgerPresent, isFalse);
-      expect(status.eventsCount, isNull,
-          reason: 'absent ledger is null, never a fake zero');
-      expect(status.byType, isNull);
-      expect(status.deliveryConfigured, isFalse);
-      expect(status.deliveryPresent, isNull);
-      expect(status.byState, isNull);
+      final marketView = await fetchFixture();
+      expect(marketView.history.map((i) => i.eventId).toList(),
+          [evUpEnterId, evDownEnterId, evUpUpdateId, evDownExitId]);
+      expect(
+        marketView.history.map((i) => i.eventType ?? '').toList(),
+        everyElement(startsWith('CANDIDATE_')),
+        reason: 'the projection retains candidate events only — the '
+            'client must not need to filter',
+      );
     });
 
-    test('fetchCandidates keeps direction facts for grouping', () async {
-      final client = ApiClient(
-          baseUrl: 'http://127.0.0.1:8080',
-          transport: fixtureTransport());
-      final candidates = await client.fetchCandidates();
-      expect(candidates.count, 3);
-      expect(candidates.sessionId, '2026-11-02');
-      expect(candidates.byDirection['UP']?.length, 2);
-      expect(candidates.byDirection['DOWN']?.length, 1);
-      expect(candidates.byDirection['DOWN']?.first.symbol, '000660');
-    });
-
-    test('fetchEvents joins nothing: facts and delivery stay separate',
+    test('rank null on CANDIDATE_EXITED history items — absence kept',
         () async {
+      final marketView = await fetchFixture();
+      final exited = marketView.history.last;
+      expect(exited.eventType, 'CANDIDATE_EXITED');
+      expect(exited.rank, isNull,
+          reason: 'honest absence, never coerced to 0');
+      expect(exited.dataQuality, 'INCOMPLETE');
+      expect(marketView.history.first.rank, 1,
+          reason: 'ranked history items keep their rank');
+    });
+
+    test('null absence semantics: no run, no status, no as_of', () async {
       final client = ApiClient(
           baseUrl: 'http://127.0.0.1:8080',
-          transport: fixtureTransport());
-      final events = await client.fetchEvents();
-      expect(events.count, 4);
-      expect(events.events?.length, 4);
-      expect(events.delivery?.keys, [evUpEnterId]);
-      expect(events.deliveryFor(evUpEnterId).single.state, 'ACCEPTED');
-      expect(events.deliveryFor(evSessionEndId), isEmpty,
-          reason: 'no key means no delivery record — honest absence');
+          transport: FakeTransport((_) async => okJson({
+                'as_of': null,
+                'falling_top10': <Object?>[],
+                'history': <Object?>[],
+                'latest': null,
+                'rising_top10': <Object?>[],
+                'run': null,
+                'runs_present': false,
+                'status': null,
+              })));
+      final marketView = await client.fetchMarketView();
+      expect(marketView.runsPresent, isFalse);
+      expect(marketView.run, isNull,
+          reason: 'run:null = no eligible run recorded, '
+              'not a zero-filled run');
+      expect(marketView.asOf, isNull);
+      expect(marketView.status, isNull);
+      expect(marketView.latest, isNull);
+      expect(marketView.history, isEmpty);
+      expect(marketView.risingTop10, isEmpty);
+      expect(marketView.fallingTop10, isEmpty);
     });
 
     test('fetchEvent returns fact plus its delivery records', () async {
@@ -179,58 +163,6 @@ void main() {
       expect(detail.event.evidenceRef, 'ka10027:stex_tp=1:sort_tp=1');
       expect(detail.event.rank, 1);
       expect(detail.delivery.single.deviceId, 'dev-1');
-    });
-
-    test('fetchSessions parses the run directory list', () async {
-      final client = ApiClient(
-          baseUrl: 'http://127.0.0.1:8080',
-          transport: fixtureTransport());
-      final sessions = await client.fetchSessions();
-      expect(sessions.count, 1);
-      expect(sessions.sessions.single.session, fixtureSession);
-      expect(sessions.sessions.single.runJsonPresent, isTrue);
-    });
-
-    test('fetchVerification parses checksums and recorded verdict', () async {
-      final client = ApiClient(
-          baseUrl: 'http://127.0.0.1:8080',
-          transport: fixtureTransport());
-      final verification =
-          await client.fetchVerification(fixtureSession);
-      expect(verification.committedMarkerPresent, isTrue);
-      expect(verification.sessionEndRecorded, isTrue);
-      expect(verification.checksumsPresent, isTrue);
-      expect(verification.artifacts, hasLength(2));
-      expect(verification.artifacts.first.match, isTrue);
-      expect(verification.artifacts[1].match, isFalse);
-      expect(verification.artifactsMatchCount, 1);
-      expect(verification.verdictRecorded, isTrue);
-      expect(verification.verdictLine, 'VERDICT MATCH');
-      expect(verification.verdictSource, 'verify.stdout');
-    });
-
-    test('unrecorded verdict stays unrecorded (fail-closed)', () {
-      final verification = parseVerification({
-        'checksums': {'artifacts': [], 'present': false},
-        'committed_marker': {'file': 'input.hcj.jsonl.committed', 'present': false},
-        'events_file': {'present': false, 'sha256': null},
-        'replay_verdict': {
-          'note': 'verify.stdout present but no VERDICT line recorded',
-          'recorded': false,
-        },
-        'run_json_present': false,
-        'session': fixtureSession,
-        'session_date': null,
-        'session_end_recorded': false,
-        'code_commit': null,
-      });
-      expect(verification.verdictRecorded, isFalse);
-      expect(verification.verdictNote,
-          'verify.stdout present but no VERDICT line recorded');
-      expect(verification.checksumsPresent, isFalse);
-      expect(verification.artifacts, isEmpty);
-      expect(verification.sessionDate, isNull);
-      expect(verification.codeCommit, isNull);
     });
   });
 
@@ -255,7 +187,7 @@ void main() {
           transport: FakeTransport(
               (_) async => errorJson(500, 'data_fault', 'ledger line 3 is bad JSON')));
       try {
-        await client.fetchEvents();
+        await client.fetchMarketView();
         fail('expected ApiClientException');
       } on ApiClientException catch (e) {
         expect(e.statusCode, 500);
@@ -270,7 +202,7 @@ void main() {
           transport: FakeTransport(
               (_) async => throw const SocketFailure()));
       try {
-        await client.fetchStatus();
+        await client.fetchMarketView();
         fail('expected ApiClientException');
       } on ApiClientException catch (e) {
         expect(e.code, ApiErrorCode.network);
@@ -284,7 +216,7 @@ void main() {
           transport: FakeTransport((_) async => TransportResponse(
               statusCode: 200, body: utf8.encode('<html>502</html>'))));
       try {
-        await client.fetchStatus();
+        await client.fetchMarketView();
         fail('expected ApiClientException');
       } on ApiClientException catch (e) {
         expect(e.code, ApiErrorCode.format);
@@ -297,7 +229,7 @@ void main() {
           transport: FakeTransport((_) async =>
               TransportResponse(statusCode: 503, body: utf8.encode('{"x":1}\n'))));
       try {
-        await client.fetchStatus();
+        await client.fetchMarketView();
         fail('expected ApiClientException');
       } on ApiClientException catch (e) {
         expect(e.code, ApiErrorCode.http);

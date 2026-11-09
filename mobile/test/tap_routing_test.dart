@@ -40,6 +40,10 @@ void main() {
     final store =
         makeStore(transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
     await store.bootstrap();
+    // Cold-start routing fetches the detail asynchronously; drain the
+    // queue so the assertion observes the completed fetch (the fetch is
+    // real — no fake loaded state).
+    await pumpEventQueue();
 
     expect(store.tabIndex, AppStore.detailTabIndex);
     expect(store.selectedEventId, evUpUpdateId);
@@ -84,7 +88,7 @@ void main() {
         makeStore(transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
     await store.bootstrap();
 
-    expect(store.tabIndex, 0, reason: 'no initial message — overview stays');
+    expect(store.tabIndex, 0, reason: 'no initial message — market view stays');
     push.tapController
         .add(PushMessage.fromData({'event_type': 'SESSION_ENDED'}));
     await pumpEventQueue();
@@ -114,7 +118,7 @@ void main() {
     // The shell's NavigationBar reflects the routed tab and the detail
     // screen renders the recorded fact.
     expect(find.text('CANDIDATE_ENTERED · 005930 · UP #1'),
-        findsNothing, reason: 'timeline tab is not the visible stack child');
+        findsNothing, reason: 'market view tab is not the visible stack child');
     expect(find.text('근거 (evidence_ref)'), findsOneWidget);
     // The evidence_ref value renders twice on the detail screen by design:
     // once highlighted in the 근거 card and once verbatim in the recorded

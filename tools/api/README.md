@@ -27,9 +27,12 @@ HTTP 서버 (serve.py, 기본 127.0.0.1 바인드, GET 전용)
 
 - 이 API는 **기록된 사실의 읽기 전용 투영**이다. 판정하지 않고,
   재생하지 않고, 어떤 값을 새로 계산해 사실로 만들지 않는다. 응답은
-  (1) 기록된 레코드의 투영과 (2) 계약이 명시한 저렴한 재도출 —
-  CHECKSUMS.sha256 대조용 sha256 재계산, 마커·기록 존재 확인 — 만
-  담는다.
+  (1) 기록된 레코드의 투영, (2) 계약이 명시한 저렴한 재도출 —
+  CHECKSUMS.sha256 대조용 sha256 재계산, 마커·기록 존재 확인 — 과
+  (3) §3.7이 명시한 **유계 폴딩 투영** — 선택된 하나의 런에 기록된
+  이벤트 팩트를 접고, 기록된 필드로 정렬·선출·계수하는 순수 계산 —
+  만 담는다. 폴딩도 새 사실을 만들지 않는다: 랭크·순서·카운트는
+  전부 기록된 값이다.
 - **Nim verify 바이너리 실행은 이 API 프로세스의 범위 밖이다.** API는
   replay·verify를 실행하지 않으며, `VERDICT` 판정은 운영자가 런
   디렉터리에 남긴 기록 파일(`verify.stdout`)을 **원문 그대로 인용**할
@@ -93,7 +96,9 @@ python3.13 tools/api/serve.py \
   파일이 아직 없을 때 `/status`의 `events.count`는 0이 아니라 null이다.
 - 이벤트 배열의 순서는 **ledger 파일 순서**(단일 작성자 append 순서)다.
   API가 재정렬하지 않는다. 세션 목록은 런 디렉터리 이름 코드포인트
-  오름차순이다.
+  오름차순이다. 유일한 예외는 `/mobile/market-view`(§3.7)이다: 그
+  배열의 순서는 §3.7이 직접 규정한다 — `history`는 선택된 런의
+  events 파일 순서, top10은 폴드 규칙(rank 오름차순)이다.
 - 오류 본문: `{"error": {"code", "message"}}`. message는 요청 값을
   재출력하지 않고, 파일 이름만 담는다(절대 경로 비노출).
 
@@ -108,7 +113,12 @@ python3.13 tools/api/serve.py \
 
 이벤트 계열 엔드포인트(`/candidates`, `/events`)의 권위는 **event
 ledger**다. 런 디렉터리의 `events.hcj.jsonl`은 검증 엔드포인트에서
-해시 대상 아티팩트로만 다룬다.
+해시 대상 아티팩트로만 다룬다. **예외 §3.7**: `/mobile/market-view`는
+run-범위 원천 — 선택 규칙이 고른 하나의 런 디렉터리의
+`events.hcj.jsonl` — 을 읽는다. 이벤트에는 run_id가 기록되지
+않으므로(스키마 x-event-id-rule: run_id는 event_id 다이제스트에만
+들어간다) 같은 날짜의 재시작 런들이 섞인 ledger를 session_id로 접으면
+유령 오염이 생긴다 — run-범위 파일은 그 오염을 갖지 않는다.
 
 ### 3.1 `GET /status` — 최신 세션·이벤트·전달 요약
 
@@ -249,6 +259,103 @@ runs 루트의 **디렉터리만**, 이름 오름차순으로:
   승인 권위는 GATES P12다. 응답은 세션이 지금 기록에 갖고 있는 검증
   관련 사실의 목록일 뿐이다.
 
+### 3.7 `GET /mobile/market-view` — 최신 적격 시장 수집 런의 유계 투영 (VS-1)
+
+모바일 단일 화면을 위한 하나의 읽기다. 이 라우트는 판정하지 않는다:
+랭크는 기록된 팩트에서 오고, 여기서 하는 일은 기록된 이벤트를
+**접고·기록 필드(rank)로 정렬해 선출하고·계수**하는 것뿐이다(§0 세
+번째 항목의 유계 폴딩 투영). 쿼리 파라미터·정렬 옵션·페이지네이션은
+없다. `--ledger`·`--delivery`는 읽지 않는다 — 원천은 아래 선택 규칙이
+고른 **런 디렉터리 하나**다.
+
+**적격 판정(기록 바이트만, 벽시계 없음)** — runs 루트의 top-level
+디렉터리가 다음 세 조건을 모두 만족하면 적격 시장 수집 런이다:
+
+1. `input.hcj.jsonl`과 `events.hcj.jsonl`이 모두 존재한다.
+2. input.hcj.jsonl의 **커밋된 config 레코드**(수집기 프리앰블의 둘째
+   레코드)의 `environment`가 `"demo"` 또는 `"real"`이다. 실제 수집 런은
+   run.json이 없고 이 config 레코드가 신원이다. `environment`는
+   수집기 전용 필드라 smoke·gen_fixture 산출물과 drill·observe
+   디렉터리는 여기서 탈락한다.
+3. 같은 config 레코드의 `session_date`가 `^\d{4}-\d{2}-\d{2}$`
+   (수집기 자체 검증 형상)이다.
+
+config 레코드 읽기는 유계다: input.hcj.jsonl 전체(개장 중 하루 종일
+커지는 파일)는 절대 읽지 않고 **첫 16 KiB 윈도**만 읽고, 그 안의
+LF-종단 커밋 라인(비-LF 꼬리는 §0 규약대로 미커밋으로 건너뛴다)에서
+첫 `kind:"config"` 레코드까지만 파싱한다. 파싱한 커밋 라인이 불량
+JSON·빈 줄이면 DataFault(§4). 창 안에 config 레코드가 없으면 그 런은
+비적격이다 — 부재는 부재로 서빙한다.
+
+**선택(결정적 3단계)** — 적격 런들 중 (1) `session_date` 최대(사전식),
+(2) 동률이면 그 런의 `events.hcj.jsonl` **마지막 커밋 이벤트의
+`observed_at`** 최대(기록 문자열 비교; 커밋된 이벤트가 없으면 이
+단계에서 최하위), (3) 그래도 동률이면 디렉터리 이름 코드포인트 최대.
+마지막 이벤트 관찰도 유계다: 파일 끝 **64 KiB 윈도**에서 마지막
+LF-종단 라인만 파싱해 `observed_at`을 읽는다(전체 파일을 읽지
+않는다). 커밋된 마지막 라인이 불량이면 DataFault.
+
+**폴드** — 선택된 런의 `events.hcj.jsonl`을 `read_committed_lines`
+규약(§0)으로 한 번 패스한다. `(symbol, direction)` 상태는
+last-record-wins: `CANDIDATE_ENTERED`/`CANDIDATE_UPDATED`는
+`{rank, event_id, event_type, observed_at, data_quality}`를 덮어쓰고
+`CANDIDATE_EXITED`는 상태에서 제거한다. 패스 후 방향별(UP/DOWN)로
+**rank 오름차순** 정렬해 앞 10개가 `rising_top10`/`falling_top10`이다.
+정규 기록의 랭크는 조밀 1..N이라 동률이 없어야 한다 — 불량 기록으로
+동률이 나타나면 **레저 순서(파일 순서) 위치**가 동률을 깬다(이 계약이
+명시하는 유일한 동률 규칙). `history`는 파일 순서 그대로 **최근
+`CANDIDATE_*` 이벤트 최대 100건**. `status.by_data_quality`는 그 런의
+**모든** 이벤트에 대한 data_quality 합계(키 오름차순). `as_of`·
+`latest`는 그 런의 마지막 커밋 이벤트가 기록한 필드에서 온다. 폴드가
+유지하는 메모리는 상태 + 최근 100 링 + 카운터뿐이다(이벤트별 복사본
+없음). 폴드가 의존하는 필드(event_id·event_type·observed_at·
+data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
+정수 rank)의 커밋된 기록이 형상을 벗어나면 DataFault다.
+
+```json
+{
+ "as_of": "2026-11-09T13:45:58+09:00",
+ "falling_top10": [ {"data_quality": "OBSERVING", "direction": "DOWN",
+                     "event_id": "…", "event_type": "CANDIDATE_UPDATED",
+                     "observed_at": "…", "rank": 2, "symbol": "000660"} ],
+ "history": [ {"data_quality": "OBSERVING", "direction": "UP",
+               "event_id": "…", "event_type": "CANDIDATE_ENTERED",
+               "observed_at": "…", "rank": 1, "symbol": "005930"}, … ],
+ "latest": {"data_quality": "INCOMPLETE", "event_id": "…",
+            "event_type": "SUBSCRIPTION_TRUNCATED",
+            "observed_at": "…"},
+ "rising_top10": [ {"data_quality": "OBSERVING", "direction": "UP",
+                    "event_id": "…", "event_type": "CANDIDATE_ENTERED",
+                    "observed_at": "…", "rank": 3, "symbol": "006660"}, … ],
+ "run": {"environment": "demo", "run_id": "fidelity-…-v4",
+         "session": "fidelity-…-v4", "session_date": "2026-11-09"},
+ "runs_present": true,
+ "status": {"by_data_quality": {"INCOMPLETE": 2, "OBSERVING": 705}}
+}
+```
+
+- **아이템(top10·history 공용)은 화이트리스트 7 필드**: data_quality·
+  direction·event_id·event_type·observed_at·rank·symbol. 후보 전이
+  이외의 기록 필드(rule_id·severity·evidence_ref·…)는 투영되지
+  않는다. `CANDIDATE_EXITED` history 아이템의 `rank`는 **null**이다
+  (기록 부재, 0이 아니다 — §2). 아이템 수는 최대 120(10+10+100)이고
+  필드가 기록 형상(이벤트 스키마의 enum·고정 패턴·6자리 심볼)으로
+  유계라 **응답 크기는 계약상 64 KiB를 넘지 않는다** — 모바일 규모의
+  단일 응답이다(§7).
+- **빈 상태**: runs 루트에 디렉터리가 없으면 `runs_present:false`·
+  `run:null`·나머지 전부 null/빈 배열·`status:null`. 디렉터리는
+  있어도 적격 런이 없으면 `runs_present:true`에 같은 null/빈값.
+  선택된 런에 커밋된 이벤트가 0개면 `run`은 채워지고 `as_of`·
+  `latest`는 null, 세 목록은 빈 배열, `status.by_data_quality`는
+  `{}`다(§3.1의 present-but-empty 규율과 같다).
+- **배열 순서는 §2에 대한 명시된 예외다**: `history`는 선택된 런의
+  events 파일 순서, top10 순서는 이 §의 폴드 규칙(rank 오름차순)이다.
+- **캐비앗**: (1) 이중 방향 코드는 event_gen이 UP 방향으로 한 번만
+  판정하므로(중복 제거) DOWN 목록에서 누락될 수 있다. (2) `history`는
+  최근 후보 이벤트 최대 100건이다 — 피크 이벤트율에서 이 창은 몇 분
+  치고 하루 전체 이력이 아니다. 하루 이력·더 큰 창·새 쿼리 파라미터는
+  **이 §을 고치는 계약 변경** 없이는 생기지 않는다.
+
 ## 4. 오류 응답 (fail-closed)
 
 | 상황 | 응답 |
@@ -308,6 +415,9 @@ runs 루트의 **디렉터리만**, 이름 오름차순으로:
   노출은 이 API 프로세스의 기능이 아니라 플랫폼 ingress(§1)의
   역할이며, 그 계약 없는 직접 노출은 금지다.
 - 페이지네이션·정렬 옵션·커서 — 개인용 규모에서 요청 시 재검토.
+  모바일 규모의 답은 이미 계약돼 있다: §3.7의 유계 투영(아이템 수·
+  필드가 유계라 응답 ≤ 64 KiB)이다. 다른 라우트의 페이지네이션은
+  계속 유예다.
 - 캐시·ETag·압축 — 없다(기록 재독이 권위다).
 - 데몬화·systemd·자동 기동·헬스체크 인프라 — 명시적 시작만 계약이다.
 - 판정·replay·verify 실행 — 이 프로세스의 역할이 영원히 아니다.

@@ -86,8 +86,8 @@ void main() {
         authCredentials:
             const Credentials(username: fixtureUser1, password: fixtureValue1),
       );
-      await client.fetchStatus();
-      await client.fetchEvents();
+      await client.fetchMarketView();
+      await client.fetchEvent(evUpEnterId);
       expect(transport.headersSeen, hasLength(2));
       for (final headers in transport.headersSeen) {
         expect(headers?['authorization'], fixtureHeader);
@@ -98,7 +98,7 @@ void main() {
       final transport = fixtureTransport();
       final client = ApiClient(
           baseUrl: 'http://127.0.0.1:8080', transport: transport);
-      await client.fetchStatus();
+      await client.fetchMarketView();
       expect(transport.headersSeen.single, isNull);
     });
 
@@ -110,10 +110,10 @@ void main() {
         authCredentials:
             const Credentials(username: fixtureUser1, password: fixtureValue1),
       );
-      await client.fetchStatus();
+      await client.fetchMarketView();
       client.authCredentials =
           const Credentials(username: fixtureUser2, password: fixtureValue2);
-      await client.fetchSessions();
+      await client.fetchEvent(evUpEnterId);
       expect(
         transport.headersSeen.first?['authorization'],
         'Basic ${base64Encode(utf8.encode('$fixtureUser1:$fixtureValue1'))}',
@@ -137,7 +137,7 @@ void main() {
             )),
       );
       try {
-        await client.fetchStatus();
+        await client.fetchMarketView();
         fail('expected ApiClientException');
       } on ApiClientException catch (e) {
         expect(e.statusCode, 401);
@@ -194,7 +194,7 @@ void main() {
       });
     }
 
-    test('401 prompts once, saves, and the retry loads every section',
+    test('401 prompts once, saves, and the retry loads the projection',
         () async {
       final credentialsStore = MemoryCredentialStore();
       final store = makeStore(
@@ -210,14 +210,10 @@ void main() {
       });
 
       expect(prompts, 1,
-          reason: 'one prompt per resync even though all five sections 401');
+          reason: 'one prompt per resync even though the single fetch 401s');
       expect(await credentialsStore.load(),
           const Credentials(username: fixtureUser1, password: fixtureValue1));
-      expect(store.status.phase, LoadPhase.loaded);
-      expect(store.events.phase, LoadPhase.loaded);
-      expect(store.candidates.phase, LoadPhase.loaded);
-      expect(store.sessions.phase, LoadPhase.loaded);
-      expect(store.verification.phase, LoadPhase.loaded);
+      expect(store.marketView.phase, LoadPhase.loaded);
     });
 
     test('cancel keeps the visible 401 states and never retries', () async {
@@ -230,10 +226,8 @@ void main() {
       });
 
       expect(prompts, 1);
-      expect(store.status.phase, LoadPhase.error);
-      expect(store.status.errorMessage, contains('인증 필요 (401)'));
-      expect(store.events.phase, LoadPhase.error);
-      expect(store.events.errorMessage, contains('인증 필요 (401)'));
+      expect(store.marketView.phase, LoadPhase.error);
+      expect(store.marketView.errorMessage, contains('인증 필요 (401)'));
     });
 
     test('stored credentials cover the next start without any prompt',
@@ -253,8 +247,7 @@ void main() {
 
       expect(prompts, 0,
           reason: '자격증명은 최초 1회 입력 — 저장된 페어가 이후 세션을 커버한다');
-      expect(store.status.phase, LoadPhase.loaded);
-      expect(store.verification.phase, LoadPhase.loaded);
+      expect(store.marketView.phase, LoadPhase.loaded);
     });
 
     test('no re-entry callback wired: 401 stays a visible error', () async {
@@ -262,8 +255,8 @@ void main() {
           transport: authGate(expectedHeader: fixtureHeader));
       await store.bootstrap();
 
-      expect(store.status.phase, LoadPhase.error);
-      expect(store.status.errorMessage, contains('인증 필요 (401)'));
+      expect(store.marketView.phase, LoadPhase.error);
+      expect(store.marketView.errorMessage, contains('인증 필요 (401)'));
     });
 
     test('a failing prompt is not a retry trigger (fail-closed)', () async {
@@ -276,8 +269,8 @@ void main() {
       });
 
       expect(prompts, 1);
-      expect(store.status.phase, LoadPhase.error);
-      expect(store.status.errorMessage, contains('인증 필요 (401)'));
+      expect(store.marketView.phase, LoadPhase.error);
+      expect(store.marketView.errorMessage, contains('인증 필요 (401)'));
     });
   });
 
