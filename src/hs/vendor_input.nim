@@ -79,6 +79,13 @@
 ##     TRs explicitly declared paginated (paginatedTrs — ka10027 and ka10080),
 ##     not of vendor input in general.
 ##   - CANDIDATES: up = sort_tp "1", down = sort_tp "3", stex_tp "1" (KRX).
+##     The candidate universe is further bounded by the code shape
+##     (isCandidateCode: exactly 6 digits): the ranking mixes in rows whose
+##     stk_cd is not that shape (ELW/ETF/ETN-style alphanumeric codes — the
+##     official request enum documents no ELW exclusion and no stk_cls
+##     value table, checked 2026-11-09), and those rows are partitioned
+##     into the excluded lists, never into candidates and never into a
+##     failure.
 ##
 ## Unverified by a live capture (G2/G4): actual response values, present vs
 ## absent optional row fields, row field max lengths (not enforced), the sign
@@ -193,8 +200,15 @@ type
     wsPayloads*: seq[RawWsPayload]
 
   UpDownCandidates* = object
-    up*: seq[string]    ## stk_cd in vendor order, sort_tp "1"
-    down*: seq[string]  ## stk_cd in vendor order, sort_tp "3"
+    ## The candidate universe of one completed up+down query pair. The
+    ## in-scope lists (up/down) carry only candidate-shaped codes; rows
+    ## whose stk_cd is not that shape (ELW/ETF/ETN-style alphanumeric
+    ## codes) are out of the universe and land in the excluded lists in
+    ## vendor order — preserved in the raw evidence, never judged.
+    up*: seq[string]    ## in-scope stk_cd in vendor order, sort_tp "1"
+    down*: seq[string]  ## in-scope stk_cd in vendor order, sort_tp "3"
+    upExcluded*: seq[string]   ## out-of-scope stk_cd in vendor order, up leg
+    downExcluded*: seq[string] ## out-of-scope stk_cd in vendor order, down leg
 
 const
   ka10027ApiId* = "ka10027"
@@ -678,6 +692,19 @@ proc chainSymbols*(spec: TrSpec; chain: PageChain;
                    "row without stk_cd cannot yield a candidate (fail-closed)")
       result.add(cd.get.asStr)
 
+proc isCandidateCode*(cd: string): bool =
+  ## The candidate universe's code shape: exactly 6 digits. The official
+  ## ka10027 request enum has no value that excludes ELW (checked
+  ## 2026-11-09 against the spec JSON: stk_cnd documents ETF/ETN/우선주/
+  ## 관리주 exclusions only) and documents no stk_cls value table, so the
+  ## code shape itself is the declared deterministic boundary between the
+  ## candidate universe and everything else the ranking mixes in (the
+  ## 2026-11-09 demo capture: ELW "18064K", alphanumeric ETF/ETN and mock
+  ## stock codes). An out-of-shape row is out of the universe — its raw
+  ## evidence stays preserved in the response bytes, and the excluded
+  ## lists carry its code; it is never a candidate and never a failure.
+  cd.len == 6 and allDigits(cd)
+
 proc upDownCandidates*(upChain, downChain: PageChain;
                        pageCap: int = defaultPageCap;
                        upTruncated = false; downTruncated = false):
@@ -688,6 +715,11 @@ proc upDownCandidates*(upChain, downChain: PageChain;
   ## upTruncated/downTruncated declare that leg cap-closed: the caller owns
   ## that leg's truncation fact and consumes it as a declared truncated
   ## subset (the other validation of that leg is unchanged).
+  ## Rows whose stk_cd is not the 6-digit candidate shape (isCandidateCode)
+  ## are partitioned out of the universe into upExcluded/downExcluded in
+  ## vendor order: the vendor spec offers no request value that excludes
+  ## them, so the shape is the universe boundary. A row without stk_cd
+  ## still rejects the whole chain (fail-closed, unchanged).
   if upChain.query.direction != dirUp:
     raise verr(vfContract, "up chain query direction is not up (sort_tp 1)")
   if downChain.query.direction != dirDown:
@@ -695,8 +727,11 @@ proc upDownCandidates*(upChain, downChain: PageChain;
   if upChain.query.stexTp != krxStexTp or downChain.query.stexTp != krxStexTp:
     raise verr(vfContract,
                "candidate queries are KRX-only: stex_tp must be " & krxStexTp)
-  result.up = chainSymbols(ka10027Spec, upChain, pageCap, upTruncated)
-  result.down = chainSymbols(ka10027Spec, downChain, pageCap, downTruncated)
+  for cd in chainSymbols(ka10027Spec, upChain, pageCap, upTruncated):
+    if isCandidateCode(cd): result.up.add(cd) else: result.upExcluded.add(cd)
+  for cd in chainSymbols(ka10027Spec, downChain, pageCap, downTruncated):
+    if isCandidateCode(cd): result.down.add(cd)
+    else: result.downExcluded.add(cd)
 
 # ---------------------------------------------------------------- verification
 

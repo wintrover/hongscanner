@@ -7,7 +7,10 @@
 ## judgment (event_gen, the rest-truncated mirror), the recorded config
 ## selection_policy, and the end-to-end stream: same raw REST in, same
 ## selection and same events out; the candidate event universe stays the
-## FULL recorded universe (exclusions are recorded, never judged away);
+## FULL recorded IN-SCOPE universe (selection exclusions are recorded,
+## never judged away; out-of-shape rows are partitioned out of the
+## universe at derivation — the 2026-11-09 ELW incident fix — and stay
+## preserved in the raw bytes);
 ## verify MATCH. No network, no wall clock, no credentials.
 ## Run: nim c -r --hints:off --warnings:off --path:src tests/test_subscription_selection_contract.nim
 import std/[os, strutils, tempfiles]
@@ -233,6 +236,19 @@ block selectionUnit:
         selEmpty.selected.up.len == 0 and selEmpty.selected.down.len == 0 and
         selEmpty.facts[0].excludedCount == 0 and
         selEmpty.facts[1].excludedCount == 0)
+  let scopeC = UpDownCandidates(
+    up: codesOf(50, 100000), down: codesOf(5, 300000),
+    upExcluded: @["18064K", "0147B0"], downExcluded: @["0088M0"])
+  let selScope = selectTopPerDirection(scopeC)
+  check("selection: out-of-shape rows are not candidates — below the cap " &
+        "everything in-scope is kept and the facts count the scope " &
+        "exclusion separately from the selection exclusion",
+        selScope.selected.up == codesOf(50, 100000) and
+        selScope.selected.down == codesOf(5, 300000) and
+        selScope.facts[0].candidateCount == 50 and
+        selScope.facts[0].excludedCount == 0 and
+        selScope.facts[0].scopeExcludedCount == 2 and
+        selScope.facts[1].scopeExcludedCount == 1)
   var composed = false
   try:
     discard composeRegData(sel.selected.up, sel.selected.down)
@@ -304,6 +320,48 @@ block collectorInitialSelection:
         c.candPending.up == ups[0 ..< 100] and
         c.candPending.down == downs[0 ..< 100] and
         c.awaiting == awCandReg and c.candidatesKnown)
+
+# -------------------------- collector: out-of-shape codes (2026-11-09 fix)
+
+block scopeExclusionLive:
+  ## The 2026-11-09 demo session death, reproduced: the up ranking's very
+  ## first row is the ELW "18064K" (flu_rt +29.90 — inside any top-N
+  ## selection). The pre-fix collector raised "candidate code is not a
+  ## 6-digit code" at REG composition and exited fail-closed (run
+  ## fidelity-2026-11-09-demo-v2, COLLECTOR_EXIT=2). The contract fix:
+  ## derivation partitions out-of-shape rows out of the candidate
+  ## universe, so the session survives, the REG carries only
+  ## candidate-shaped codes, and the gap fact carries the scope count.
+  let ups = @["18064K"] & codesOf(149, 100000)
+  let downs = codesOf(120, 300000)
+  var c = newCollector()
+  discard c.step(ev("ready", ts))
+  discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  discard c.step(evWs(1, ackPayload()))
+  discard c.step(evRest("up", 1, 200, "Y", "k1", restBody(ups[0 ..< 100])))
+  discard c.step(evRest("up", 2, 200, "N", "", restBody(ups[100 ..< 150])))
+  discard c.step(evRest("down", 1, 200, "Y", "k1", restBody(downs[0 ..< 100])))
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = c.step(evRest("down", 2, 200, "N", "",
+                               restBody(downs[100 ..< 120])))
+  check("scope: the mixed ranking completes — page, gaps, REG, no rejection",
+        recs.kinds() == @["rest_resp", "gap", "gap", "sub"])
+  check("scope: the up gap counts 149 in-scope candidates and the 1 " &
+        "out-of-shape row separately",
+        "direction=up" in detailToken(recs[1].raw) and
+        "candidate_count=149" in detailToken(recs[1].raw) and
+        "selected_count=100" in detailToken(recs[1].raw) and
+        "excluded_count=49" in detailToken(recs[1].raw) and
+        "scope_excluded_count=1" in detailToken(recs[1].raw))
+  check("scope: the down gap carries a zero scope count (uniform detail)",
+        "direction=down" in detailToken(recs[2].raw) and
+        "candidate_count=120" in detailToken(recs[2].raw) and
+        "scope_excluded_count=0" in detailToken(recs[2].raw))
+  check("scope: the REG carries only candidate-shaped codes — the ELW " &
+        "never reaches composition",
+        dirs.dirKinds() == @["reg"] and dirs[0].data[0].codes ==
+          codesOf(149, 100000)[0 ..< 100] & downs[0 ..< 100])
 
 # ----------------------------------------------- collector: below the cap
 
@@ -621,6 +679,71 @@ block fullRun:
   let v = verifyOf(runDir)
   check("stream: verify declares MATCH on the selected-universe run",
         v.verdict == vMatch and v.matched)
+
+# ---------------------- the full run with out-of-shape rows (e2e, fix)
+
+proc scopeStreamSession(): seq[RecOut] =
+  ## The incident's data shape as a full canned session: the up ranking
+  ## leads with two out-of-shape rows (the ELW "18064K" and a mock
+  ## alphanumeric code) above 149 in-scope codes, the down leg is clean.
+  let ups = @["18064K", "0147B0"] & codesOf(149, 100000)
+  let downs = codesOf(120, 300000)
+  var c = newCollector()
+  var outp = c.cfg.preambleRecords()
+  proc feed(line: string) =
+    var recs: seq[RecOut]
+    discard c.handleEvent(line, recs)
+    for r in recs: outp.add(r)
+  feed(ev("ready", ts))
+  feed(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  feed(evWs(1, ackPayload()))
+  feed(evRest("up", 1, 200, "Y", "k1", restBody(ups[0 ..< 100])))
+  feed(evRest("up", 2, 200, "N", "", restBody(ups[100 ..< 151])))
+  feed(evRest("down", 1, 200, "Y", "k1", restBody(downs[0 ..< 100])))
+  feed(evRest("down", 2, 200, "N", "", restBody(downs[100 ..< 120])))
+  feed(evWs(1, ackPayload()))
+  feed(evWs(1, tick0B(item = "100001", t20 = "090500")))
+  feed(evWs(1, tick0B(item = "300001", t20 = "090600")))
+  feed(evWs(1, state0S(value215 = "4")))
+  feed(evWs(1, ackPayload(trnm = "REMOVE", code = 0)))
+  outp
+
+block scopeExcludedStream:
+  ## End-to-end with the incident's data shape: the recorded stream keeps
+  ## the raw pages verbatim (the out-of-shape rows included — the evidence
+  ## never lies), replay re-derives the identical partition, the candidate
+  ## events judge only the in-scope universe (the ELW is never a
+  ## candidate, so never judged), and verify MATCHes the sealed run.
+  let dir = sealStream(scopeStreamSession())
+  let res = replayOf(dir)
+  check("scope stream: the mixed-universe session replays OK",
+        res.status == rsOk)
+  check("scope stream: the candidate events judge the full recorded " &
+        "IN-SCOPE universe (149 up + 120 down — never the out-of-shape " &
+        "rows)",
+        countType(res, "CANDIDATE_ENTERED") == 269)
+  var elwEntered = false
+  for e in res.events:
+    if "\"event_type\":\"CANDIDATE_ENTERED\"" in e and
+       ("\"symbol\":\"18064K\"" in e or "\"symbol\":\"0147B0\"" in e):
+      elwEntered = true
+  check("scope stream: the out-of-shape rows are never candidate events",
+        not elwEntered)
+  check("scope stream: the raw evidence keeps the out-of-shape rows " &
+        "verbatim (the ELW code stays hex-encoded in the recorded page " &
+        "bytes)",
+        hexOf("18064K") in readFile(dir / inputFile))
+  check("scope stream: both directions judged their SUBSCRIPTION_TRUNCATED " &
+        "fact with the scope count in the gap detail",
+        countType(res, "SUBSCRIPTION_TRUNCATED") == 2)
+  let runDir = writeRunOf(dir, res)
+  let v = verifyOf(runDir)
+  check("scope stream: verify declares MATCH on the mixed-universe run",
+        v.verdict == vMatch and v.matched)
+  let dirB = sealStream(scopeStreamSession())
+  check("scope stream: deterministic — the same mixed input seals " &
+        "byte-identically",
+        readFile(dir / inputFile) == readFile(dirB / inputFile))
 
 # ------------------------------------------------------------- determinism
 

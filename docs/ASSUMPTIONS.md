@@ -35,7 +35,7 @@ changeable assumption; treating one as a requirement is what stalled v1–v5.
 | P5 | exit codes 0/2/3/4/5/6/7 | separate codes per command |
 | P6 | no `--allow-dirty`; debugging builds stay non-canonical | escape hatch (rejected) |
 | P7 | public repo + synthetic CI; calendars gitignored | private repo (not needed for CI minutes) |
-| P8 | candidates are queried via `ka10027` with `stex_tp="1"` and one query per direction (`sort_tp="1"`/`"3"`); query scope and page upper limit are declared and recorded (VS-2 target, no producer yet); the subscription set is each direction's first 100 confirmed candidates in vendor response order — never re-ranked (policy `kiwoom_response_order_first_100_v1`, user-approved 2026-11-03; exclusions recorded as `subscription_truncated`/SUBSCRIPTION_TRUNCATED, cross-direction duplicates rejected) | any other universe, uncapped pagination, or re-scoring the vendor's order (unapproved) |
+| P8 | candidates are queried via `ka10027` with `stex_tp="1"` and one query per direction (`sort_tp="1"`/`"3"`); query scope and page upper limit are declared and recorded (VS-2 target, no producer yet); the candidate universe is the 6-digit-code-shaped rows (`isCandidateCode`, 2026-11-09: the official enum has no ELW exclusion and no stk_cls value table, so the code shape is the boundary — out-of-shape rows are partitioned out at derivation, preserved in raw bytes, never candidates); `stk_cnd` is pinned `"16"` (documented ETF+ETN exclusion, honored by demo 2026-11-09); the subscription set is each direction's first 100 confirmed candidates in vendor response order — never re-ranked (policy `kiwoom_response_order_first_100_v1`, user-approved 2026-11-03; exclusions recorded as `subscription_truncated`/SUBSCRIPTION_TRUNCATED, cross-direction duplicates rejected) | any other universe, uncapped pagination, re-scoring the vendor's order (unapproved), or filtering by undocumented stk_cls values (rejected) |
 | P9 | approval is a separate decision with its own conditions (GATES); `session_end` and `VERDICT MATCH` never imply approval | treat MATCH as approval (rejected) |
 | P10 | `NO_TRIGGER_OBSERVED` is only for complete, valid runs, and only describes the observed stream | read zero signals as market-level absence (rejected: tick completeness is not guaranteed) |
 | P11 | the config record may declare `environment` (`demo` or `prod`); verify enforces the commit-marker gate only for a declared environment, and synthetic streams report the marker state without enforcing it | enforcing the marker gate on synthetic streams (rejected: CI has no recorder) |
@@ -250,6 +250,33 @@ still requires G2 credentials.
   cur_prc / pred_pre_sig / pred_pre / flu_rt / sel_req / buy_req /
   now_trde_qty / cntr_str / cnt; the response carries **no query-time
   field**.
+- ka10027 stk_cnd enum and ELW exclusion (official spec JSON, collected
+  2026-11-09 from
+  raw.githubusercontent.com/Kiwoom-Securities/Kiwoom-REST-API/main/kiwoom/_data/kiwoom_api_spec.json):
+  stk_cnd (한글명 종목조건) 원문 — "0:전체조회, 1:관리종목제외,
+  4:우선주+관리주제외, 3:우선주제외, 5:증100제외, 6:증100만보기,
+  7:증40만보기, 8:증30만보기, 9:증20만보기, 11:정리매매종목제외,
+  12:증50만보기, 13:증60만보기, 14:ETF제외, 15:스펙제외, 16:ETF+ETN제외".
+  **No value mentions ELW** — no documented query-level ELW exclusion
+  exists. Response `stk_cls` (한글명 종목분류) has an **empty
+  description**: the value table is undocumented, so stk_cls-based
+  filtering has no official basis. ELW 6-char alphanumeric codes have no
+  documented format rule (only the ka30009 example "57JBHH" and the
+  조건검색 9001 prefix note "J: ELW").
+- ka10027 ranking composition, demo measured (2026-11-09 10:0x KST,
+  장중, probe bodies sha256 bd786673557e550f…/37dc7c293025c935…/482016e961570288…
+  preserved at /tmp/hs-probe/): with stk_cnd="0" the page-1 up ranking
+  mixes 200 rows of which 33 are non-6-digit codes; with "14" or "16" the
+  demo server honors the documented value and the count drops to 7 — but
+  **ELW "18064K" (stk_cls 17, flu_rt +29.90, top of the ranking) remains
+  in every variant**, and the 7 residual non-digit rows include mock
+  alphanumeric codes on real stock names (래블업 0147B0, 엘리스 0158S0,
+  엠에스바이오 0013Y0, 메쥬 0088M0). The first live F-1 session
+  (runs/fidelity-2026-11-09-demo-v2, 09:49) therefore died fail-closed at
+  the 6-digit candidate contract. Consequence (REPLAY_CONTRACT §12.1):
+  the code shape is the declared universe boundary; `stk_cnd="16"` is the
+  pinned default (documented ETF+ETN exclusion, honored by demo). Whether
+  the real server honors stk_cnd="16" identically: UNKNOWN until F-4.
 - WS 0B spec (official, collected 2026-11-06): LOGIN
   {"trnm":"LOGIN","token":…} · REG {"trnm":"REG","grp_no","refresh",
   "data":[{item,type}]} · REMOVE; inbound {"trnm":"REAL","data":[{type:
