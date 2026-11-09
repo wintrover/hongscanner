@@ -214,10 +214,10 @@ class ApiClient {
   }
 
   /// `GET /mobile/market-view` — the single bounded projection for the
-  /// phone: rising/falling top 10, the retained candidate-event history
-  /// (≤100, oldest→newest), and the run/as_of context. The server
-  /// projection is authoritative; this client never recomputes ranks or
-  /// refilters events into candidates.
+  /// phone: rising/falling top 10, the retained TOP10 state-change
+  /// history (≤100, oldest→newest), and the run/as_of context. The
+  /// server projection is authoritative; this client never recomputes
+  /// ranks or refilters the change records.
   Future<MarketViewResponse> fetchMarketView() async =>
       MarketViewResponse.fromMap(
           await _getJson('mobile/market-view', const {}));

@@ -93,10 +93,11 @@ final Map<String, Object?> fixtureDeliveryRecord = {
   'updated_at': '2026-11-02T09:00:06+09:00',
 };
 
-/// One `/mobile/market-view` item: exactly the frozen item fields. When
-/// [rank] or [name] is null the key is present with a JSON null — the
-/// contract's honest-absence shape (CANDIDATE_EXITED history rows carry no
-/// rank; a ledger without a name record carries no name).
+/// One `/mobile/market-view` top-10 item: exactly the frozen item fields
+/// (event_type is the ledger-recorded CANDIDATE_* value). When [rank] or
+/// [name] is null the key is present with a JSON null — the contract's
+/// honest-absence shape (a ledger without a name record carries no
+/// name).
 Map<String, Object?> fixtureMarketItem(
   String eventId, {
   required String eventType,
@@ -118,12 +119,42 @@ Map<String, Object?> fixtureMarketItem(
       'symbol': symbol,
     };
 
+/// One `/mobile/market-view` history item: a TOP10 state-change record —
+/// `change_type` of the 4-kind vocabulary plus `prev_rank`, and no
+/// `event_type` (top-10 rows carry that instead). When [rank] or [name]
+/// is null the key is present with a JSON null — the contract's
+/// honest-absence shape (CANDIDATE_EXITED rows carry no rank; a ledger
+/// without a name record carries no name).
+Map<String, Object?> fixtureHistoryChangeItem(
+  String eventId, {
+  required String changeType,
+  required String observedAt,
+  required String direction,
+  int? prevRank,
+  int? rank,
+  String symbol = '005930',
+  String dataQuality = 'OBSERVING',
+  String? name,
+}) =>
+    {
+      'change_type': changeType,
+      'data_quality': dataQuality,
+      'direction': direction,
+      'event_id': eventId,
+      'name': name,
+      'observed_at': observedAt,
+      'prev_rank': prevRank,
+      'rank': rank,
+      'symbol': symbol,
+    };
+
 /// `/mobile/market-view` fixture: the single bounded projection the phone
-/// renders — rising/falling top 10 in ascending rank, the retained
-/// candidate history (oldest→newest, rank null on the EXITED row), and
-/// the run/as_of context. Same synthetic world as the ledger fixtures.
-/// Stock names are the real KRX names for the synthetic symbols; the
-/// CANDIDATE_EXITED row has no name record (symbol-fallback coverage).
+/// renders — rising/falling top 10 in ascending rank, the retained TOP10
+/// state-change records (oldest→newest, one per change kind, rank null
+/// on the CANDIDATE_EXITED row), and the run/as_of context. Same
+/// synthetic world as the ledger fixtures. Stock names are the real KRX
+/// names for the synthetic symbols; the CANDIDATE_EXITED row has no name
+/// record (symbol-fallback coverage).
 final Map<String, Object?> fixtureMarketView = {
   'as_of': '2026-11-02T15:30:58+09:00',
   'falling_top10': [
@@ -136,31 +167,35 @@ final Map<String, Object?> fixtureMarketView = {
         name: 'SK하이닉스'),
   ],
   'history': [
-    fixtureMarketItem(evUpEnterId,
-        eventType: 'CANDIDATE_ENTERED',
+    fixtureHistoryChangeItem(evUpEnterId,
+        changeType: 'TOP10_ENTERED',
         observedAt: '2026-11-02T09:00:05+09:00',
         direction: 'UP',
-        rank: 1,
+        prevRank: 11,
+        rank: 7,
         symbol: '005930',
         name: '삼성전자'),
-    fixtureMarketItem(evDownEnterId,
-        eventType: 'CANDIDATE_ENTERED',
+    fixtureHistoryChangeItem(evDownEnterId,
+        changeType: 'RANK_CHANGED',
         observedAt: '2026-11-02T09:01:12+09:00',
         direction: 'DOWN',
-        rank: 1,
+        prevRank: 5,
+        rank: 2,
         symbol: '000660',
         name: 'SK하이닉스'),
-    fixtureMarketItem(evUpUpdateId,
-        eventType: 'CANDIDATE_UPDATED',
+    fixtureHistoryChangeItem(evUpUpdateId,
+        changeType: 'TOP10_EXITED',
         observedAt: '2026-11-02T09:02:41+09:00',
         direction: 'UP',
-        rank: 2,
+        prevRank: 8,
+        rank: 11,
         symbol: '005930',
         name: '삼성전자'),
-    fixtureMarketItem(evDownExitId,
-        eventType: 'CANDIDATE_EXITED',
+    fixtureHistoryChangeItem(evDownExitId,
+        changeType: 'CANDIDATE_EXITED',
         observedAt: '2026-11-02T09:03:30+09:00',
         direction: 'DOWN',
+        prevRank: 3,
         rank: null,
         symbol: '000660',
         dataQuality: 'INCOMPLETE',

@@ -99,32 +99,41 @@ class EventDetailResponse {
 }
 
 /// One `/mobile/market-view` projection item: a server-ranked row of the
-/// rising/falling top 10 or an entry of the retained candidate history.
-/// The server projection is authoritative — the app never recomputes
-/// ranks or filters events into candidates, so this model is a read-only
+/// rising/falling top 10 or a TOP10 state-change record of the retained
+/// history. The server projection is authoritative — the app never
+/// recomputes ranks or derives changes, so this model is a read-only
 /// display projection, not a re-derivation.
 class MarketViewItem {
   const MarketViewItem({
+    this.changeType,
     this.dataQuality,
     this.direction,
     this.eventId,
     this.eventType,
     this.name,
     this.observedAt,
+    this.prevRank,
     this.rank,
     this.symbol,
   });
 
   factory MarketViewItem.fromMap(Map<String, Object?> raw) => MarketViewItem(
+        changeType: _asString(raw['change_type']),
         dataQuality: _asString(raw['data_quality']),
         direction: _asString(raw['direction']),
         eventId: _asString(raw['event_id']),
         eventType: _asString(raw['event_type']),
         name: _asString(raw['name']),
         observedAt: _asString(raw['observed_at']),
+        prevRank: _asInt(raw['prev_rank']),
         rank: _asInt(raw['rank']),
         symbol: _asString(raw['symbol']),
       );
+
+  /// TOP10 state-change kind: TOP10_ENTERED / TOP10_EXITED /
+  /// CANDIDATE_EXITED / RANK_CHANGED. History items only — top-10 rows
+  /// carry the ledger event_type instead.
+  final String? changeType;
 
   final String? dataQuality;
   final String? direction;
@@ -137,7 +146,12 @@ class MarketViewItem {
 
   final String? observedAt;
 
-  /// Candidate rank; null on CANDIDATE_EXITED history items — honest
+  /// Rank recorded in the previous observation group; null = no prior
+  /// state (a new candidate). History items only.
+  final int? prevRank;
+
+  /// Rank: the row's rank on top-10 items, the new rank after the change
+  /// on history items. null on CANDIDATE_EXITED history items — honest
   /// absence, never rendered as 0.
   final int? rank;
 
@@ -208,10 +222,11 @@ class MarketViewStatus {
 
 /// `GET /mobile/market-view` response: the single bounded projection the
 /// phone renders — the rising/falling top 10 (server-ranked, ascending
-/// rank) and the retained candidate-event tail (≤100, server order:
-/// oldest→newest; CANDIDATE_* only), plus the run/as_of context. The
-/// client never reorders or refilters anything here: the server order is
-/// the display order.
+/// rank) and the retained TOP10 state-change records (≤100, server
+/// order: oldest→newest; TOP10_ENTERED / TOP10_EXITED / CANDIDATE_EXITED
+/// / RANK_CHANGED), plus the run/as_of context. The client never
+/// reorders or refilters anything here: the server order is the display
+/// order.
 class MarketViewResponse {
   const MarketViewResponse({
     required this.asOf,
@@ -249,7 +264,8 @@ class MarketViewResponse {
   /// Projection timestamp; null when the server recorded none.
   final String? asOf;
 
-  /// Retained candidate-event tail in server order (oldest→newest), ≤100.
+  /// Retained TOP10 state-change records in server order
+  /// (oldest→newest), ≤100.
   final List<MarketViewItem> history;
 
   final MarketViewLatest? latest;
