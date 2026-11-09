@@ -127,6 +127,19 @@ void main() {
           reason: 'ranked history items keep their rank');
     });
 
+    test('name parses as recorded: value, JSON null, and key absence',
+        () async {
+      final marketView = await fetchFixture();
+      expect(marketView.risingTop10.first.name, '삼성전자',
+          reason: 'a recorded name parses as-is');
+      expect(marketView.fallingTop10.single.name, 'SK하이닉스');
+      expect(marketView.history.last.name, isNull,
+          reason: 'name:null on the EXITED row — honest absence; the UI '
+              'falls back to the symbol, never a blank title');
+      expect(MarketViewItem.fromMap(const {'event_id': 'x'}).name, isNull,
+          reason: 'an item without the name key reads as absence too');
+    });
+
     test('null absence semantics: no run, no status, no as_of', () async {
       final client = ApiClient(
           baseUrl: 'http://127.0.0.1:8080',

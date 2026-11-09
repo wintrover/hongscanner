@@ -10,14 +10,19 @@ or no connection. No real market data enters the app or the repository
 
 ## Layout
 
-- `lib/main.dart` — app root, bottom-navigation shell (2 tabs),
-  `defaultAppStore()` / `defaultPushService()` composition points
-- `lib/screens/` — Market View · Event Detail (all data-driven), plus
-  `app_scope.dart` (InheritedNotifier) and shared honest-state widgets in
-  `widgets.dart`
+- `lib/main.dart` — app root, bottom-navigation shell (2 tabs: 후보 ·
+  히스토리), `defaultAppStore()` / `defaultPushService()` composition
+  points
+- `lib/app_routes.dart` — the process-lifetime navigator key plus the
+  event-detail route push helper the store calls (store-driven routing
+  from notification taps)
+- `lib/screens/` — 후보 (top-10 cards) · 히스토리 (candidate events) ·
+  Event Detail route (all data-driven), plus `app_scope.dart`
+  (InheritedNotifier) and shared honest-state widgets in `widgets.dart`
 - `lib/state/app_store.dart` — the single `ChangeNotifier` store: the
-  market-view projection section, event selection/routing, push
-  permission flow, bounded-backoff resync
+  market-view projection section, event selection/routing (detail route
+  via the global navigator key), push permission flow, bounded-backoff
+  resync
 - `lib/api/api_client.dart` · `lib/api/api_models.dart` — typed GET-only
   client matching `tools/api/README.md` (identifier validation mirrors
   the server's; `null` = "no record" is preserved, never coerced to 0)
@@ -110,20 +115,29 @@ Basic Auth), which the app supports as follows:
 
 ## Screens — recorded facts only
 
-- **Market View** — the single `GET /mobile/market-view` projection,
-  exactly three market elements: 상승 TOP 10, 하락 TOP 10, and the
-  retained 최근 후보 이벤트 (≤100, server order oldest→newest). A run
-  header (`session_date`, `as_of`) and `status.by_data_quality` render
-  verbatim (INCOMPLETE/UNKNOWN stay visible, never flattened to normal),
-  and per-item `data_quality` shows on every row. The server projection
-  is authoritative: the app never recomputes ranks or filters events
-  into candidates, and `runs_present:false` / `run:null` renders as
-  "기록 없음" — never zero-filled rows. Market prices are not served by
+- **후보 (tab 0)** — the rising/falling top 10 cards of the single
+  `GET /mobile/market-view` projection. Row titles are the recorded
+  stock name (`name`), falling back to the symbol when the ledger has no
+  name record; ranks render in the server's ascending order. The server
+  projection is authoritative: the app never recomputes ranks or filters
+  events into candidates, and `runs_present:false` / `run:null` renders
+  as "기록 없음" — never zero-filled rows. Market prices are not served by
   the API and are not shown.
-- **Event Detail** — the selected fact verbatim (canonical field order),
-  its `evidence_ref` (근거) highlighted, and its delivery records.
-  Reached from Market View rows (top-10 / history) and notification
-  taps.
+- **히스토리 (tab 1)** — the retained 최근 후보 이벤트 (≤100, server order
+  oldest→newest) from the same projection; a tab switch reads the store
+  and never refetches.
+- **Data quality display** — a normal-quality row (the OK / COMPLETE /
+  OBSERVING set) shows just the observation time; anything else
+  (INCOMPLETE, UNKNOWN, null, unrecognized) keeps an explicit quality
+  suffix on the row, so incompleteness is never disguised as normal. The
+  run header (`session_date`, `as_of`) and the `status.by_data_quality`
+  aggregate card are no longer rendered.
+- **Event Detail (route)** — the selected fact verbatim (canonical field
+  order), its `evidence_ref` (근거) highlighted, and its delivery
+  records. Pushed onto the root navigator from 후보/히스토리 rows and
+  notification taps (`store.openEvent`); a tap that lands before the
+  first frame is kept pending and flushed right after it, and back pops
+  the route to the tab shell.
 
 Loading (skeleton), "기록 없음", and offline/error states are rendered
 as distinct UI states — the app never renders absence as success.
@@ -149,8 +163,9 @@ notification re-synthesis are forbidden by design.
 - **Permission**: one automatic ask on the first run; the ask count,
   timestamp and decision are persisted (Android 13+ cannot distinguish
   "denied" from "asked before", so the app's own recorded history is the
-  only fact). Denied keeps the app fully functional and shows 푸시
-  비활성 with an explicit "다시 요청" button — no silent re-nagging.
+  only fact). Denied keeps the app fully functional; there is no push
+  UI on screen anymore — the state and the re-ask path live in the
+  store, with no silent re-nagging.
 - **Foreground**: the OS does not display notification messages while
   the app is foregrounded; the app shows an in-app banner (chosen,
   documented policy). Banners dedup by `event_id` (a bounded history of
@@ -160,9 +175,11 @@ notification re-synthesis are forbidden by design.
   reaches the phone (default INFO; the operator can set HIGH/CRITICAL
   server-side), so banner volume has two bounds.
 - **Background tap** → `onMessageOpenedApp` → data `event_id` → Event
-  Detail tab with a `/events/{id}` fetch. **Cold start** →
-  `getInitialMessage()`, same routing. Payloads without a usable
-  `event_id` are not routed (nothing is invented).
+  Detail route (pushed on the root navigator) with a `/events/{id}`
+  fetch. **Cold start** → `getInitialMessage()`, same routing (a tap
+  that lands before the first frame is kept pending and flushed after
+  it). Payloads without a usable `event_id` are not routed (nothing is
+  invented).
 - **Terminated state display** is the OS notification itself — the
   official path.
 
@@ -198,15 +215,14 @@ where `Firebase.initializeApp` has not run. Remaining live steps:
    It still fails closed (throws `StateError`) until step 3 succeeds.
 5. **Token registration** — the app has NO write path to the server.
    `FcmPushService` registers the app instance (`register()`) and the
-   Market View push card displays the delivered Firebase Installation ID
-   (`onRegistered`) in full, selectable for copying — no truncation.
-   The operator registers it with the server-side
+   delivered Firebase Installation ID (`onRegistered`) is logged once
+   to logcat — `[HS-OPS] fcm registration id: <fid>`, read with
+   `adb logcat -s flutter` — and never displayed on screen. The
+   operator registers it with the server-side
    `tools/notify/notify_register.py` CLI via `--token-file` (or stdin):
    bearer-authenticated, the token value never touches argv or logs and
-   is stored outside the repo. The identifier the card shows — the FID
-   after the token-API migration — is exactly what gets registered.
-   The card also shows the ask history so the operator can see why push
-   is active or disabled.
+   is stored outside the repo. The logged FID is exactly what gets
+   registered.
 6. **Token API migration** — DONE (code-only; no Firebase project
    needed). firebase_messaging 17.x deprecates `getToken()` /
    `onTokenRefresh` in favor of the FID registration APIs added in
@@ -275,13 +291,16 @@ APK artifacts are gitignored (`/build/`) and never committed.
 ## Tests & CI
 
 - `flutter test` — the mobile suite: API client against fake transports
-  (market-view contract shapes, null/absence semantics, error
-  classification), fixture-driven widget tests for the market view (the
-  three elements, rank-1 row, history drill-down into Event Detail,
+  (market-view contract shapes, name parsing and symbol-fallback
+  semantics, null/absence semantics, error classification),
+  fixture-driven widget tests for the two-tab shell (top-10 cards with
+  names, the candidate history, conditional quality display,
+  drill-down into the pushed Event Detail route with a natural back,
   honest-absence and offline states), permission flow (first-run ask
-  once, denial persistence, manual re-ask, unwired), stub-message tap
-  routing (cold start, background tap, foreground banner, bad payloads),
-  and resync (single-fetch backoff, recovery, lifecycle resume,
+  once, denial persistence, manual re-ask, unwired, FID logged to
+  logcat instead of rendered), stub-message tap routing (cold start
+  pending→flush, background tap, foreground banner, bad payloads), and
+  resync (single-fetch backoff, recovery, lifecycle resume,
   pull-to-refresh).
 - `flutter analyze` — clean. NOTE: in this repo's non-ASCII checkout path
   `flutter analyze` crashes (LSP tool bug, exit 255); run it from an

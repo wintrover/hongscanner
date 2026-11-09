@@ -79,10 +79,15 @@ MARKET_CONFIG_HEAD_BYTES = 16384
 MARKET_EVENTS_TAIL_BYTES = 65536
 MARKET_TOP_N = 10
 MARKET_HISTORY_N = 100
+# The stock-name dictionary (README §3.7): the only folded vendor body
+# values are the ka10027 ranking rows' stk_nm, keyed by stk_cd.
+MARKET_NAME_API = "ka10027"
+MARKET_NAME_LIST_KEY = "pred_pre_flu_rt_upper"
 # The §3.7 item whitelist: the projection is field-bounded so the
 # response size is mechanically capped (at most 120 items).
 MARKET_ITEM_FIELDS = ("data_quality", "direction", "event_id",
-                      "event_type", "observed_at", "rank", "symbol")
+                      "event_type", "name", "observed_at", "rank",
+                      "symbol")
 
 
 class DataFault(Exception):
@@ -266,6 +271,86 @@ def read_last_observed_at(path):
     return observed_at
 
 
+def fold_market_names(path):
+    """symbol -> stock name from the ka10027 rest_resp bodies recorded in
+    one input.hcj.jsonl (README §3.7). File order, last record wins.
+    This is the one documented whole-input scan: unlike the config head
+    (16 KiB) it walks every committed line, so callers memoize it (the
+    Projector's (path, size, mtime_ns) cache) and the walk streams one
+    line at a time — a market-day input is gigabytes, never one read.
+    Line discipline is the committed-lines rule: a trailing line without
+    LF is not committed and stops the walk; a malformed committed line
+    is a DataFault. A rest_resp envelope the recorder itself guarantees
+    (raw object, string api_id, hex body_hex) faulting that guarantee is
+    corruption, also a DataFault. The body content is NOT guaranteed
+    (the recorder preserves every response verbatim, successful or not):
+    a body that does not decode to a JSON object carrying the ranking
+    list simply contributes no names — a recorded non-success response
+    carries no ranking to fold. Rows inside a decoded list are the
+    fold's dependent shape: every row must be an object with string
+    stk_cd and stk_nm, or it is a DataFault."""
+    names = {}
+    try:
+        f = open(path, "rb")
+    except FileNotFoundError:
+        return names
+    except OSError as exc:
+        raise DataFault("%s unreadable: %s"
+                        % (os.path.basename(path), _reason(exc)))
+    name = os.path.basename(path)
+    with f:
+        for i, raw in enumerate(f, start=1):
+            if not raw.endswith(b"\n"):
+                break  # torn tail: a concurrent append, not committed yet
+            raw = raw[:-1]
+            if not raw:
+                raise DataFault("%s line %d is empty" % (name, i))
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise DataFault("%s line %d is not valid UTF-8 JSON: %s"
+                                % (name, i, exc))
+            if not isinstance(obj, dict):
+                raise DataFault("%s line %d is not a JSON object" % (name, i))
+            if obj.get("kind") != "rest_resp":
+                continue
+            rec = obj.get("raw")
+            if not isinstance(rec, dict):
+                raise DataFault("%s line %d rest_resp raw is not a JSON "
+                                "object" % (name, i))
+            api_id = rec.get("api_id")
+            if not isinstance(api_id, str):
+                raise DataFault("%s line %d rest_resp has no api_id"
+                                % (name, i))
+            if api_id != MARKET_NAME_API:
+                continue
+            body_hex = rec.get("body_hex")
+            if not isinstance(body_hex, str):
+                raise DataFault("%s line %d rest_resp has no body_hex"
+                                % (name, i))
+            try:
+                body = bytes.fromhex(body_hex)
+            except ValueError:
+                raise DataFault("%s line %d body_hex is not hex" % (name, i))
+            try:
+                doc = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            rows = doc.get(MARKET_NAME_LIST_KEY)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict) \
+                        or not isinstance(row.get("stk_cd"), str) \
+                        or not isinstance(row.get("stk_nm"), str):
+                    raise DataFault("%s line %d ranking row has no stk_cd "
+                                    "or stk_nm" % (name, i))
+                names[row["stk_cd"]] = row["stk_nm"]
+    return names
+
+
 class Projector:
     """Read-only projection of the recorded sources. Every method
     returns plain JSON-safe data (strings, integers, booleans, null,
@@ -276,6 +361,11 @@ class Projector:
         self.ledger_path = ledger_path
         self.delivery_path = delivery_path
         self._runs_real = os.path.realpath(runs_root)
+        # The §3.7 name-dictionary memoization: one entry, the last
+        # published (path, size, mtime_ns) -> names fold. ThreadingHTTPServer
+        # serves concurrent requests, so the slot is guarded by one lock.
+        self._names_lock = threading.Lock()
+        self._names_entry = None
 
     # ---- run directories -------------------------------------------------
 
@@ -482,16 +572,56 @@ class Projector:
 
     # ---- mobile market view (README §3.7) ---------------------------------
 
+    def _market_names(self, path):
+        """The memoized symbol -> name dictionary for one input.hcj.jsonl:
+        a pure derivation of recorded bytes, so unlike the per-request
+        event fold it is cached in-process. The key is the practical
+        invalidation triple (path, size, mtime_ns) — not a cryptographic
+        fingerprint: a rewrite restoring the same size and mtime_ns would
+        be served stale. A scan is published only when the file's stat
+        matches before and after the read (a file changing mid-scan is
+        served as its consistent prefix, never cached). A DataFault is
+        never cached — a corrupt file faults on every request until it
+        is fixed. The slot holds one entry: a different selected run
+        rescans."""
+        try:
+            before = os.stat(path)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise DataFault("%s unreadable: %s"
+                            % (os.path.basename(path), _reason(exc)))
+        with self._names_lock:
+            entry = self._names_entry
+        if entry is not None and entry[:3] == (path, before.st_size,
+                                               before.st_mtime_ns):
+            return entry[3]
+        names = fold_market_names(path)
+        try:
+            after = os.stat(path)
+        except OSError:
+            return names
+        if (after.st_size, after.st_mtime_ns) \
+                == (before.st_size, before.st_mtime_ns):
+            with self._names_lock:
+                self._names_entry = (path, before.st_size,
+                                     before.st_mtime_ns, names)
+        return names
+
     @staticmethod
-    def _market_item(ev, rank, pos=None):
-        """The whitelisted README §3.7 item: seven recorded fields, rank
-        null on CANDIDATE_EXITED (honest absence, never 0). `pos` rides
-        along in fold state as the ledger-order position for the
-        documented malformed-rank tie-break; it is never projected."""
+    def _market_item(ev, rank, names, pos=None):
+        """The whitelisted README §3.7 item: eight fields, seven recorded
+        plus `name` — the recorded ka10027 stock name for the fact's
+        symbol, null when the recorded bodies never named it (honest
+        absence, the app falls back to the symbol). rank is null on
+        CANDIDATE_EXITED. `pos` rides along in fold state as the
+        ledger-order position for the documented malformed-rank
+        tie-break; it is never projected."""
         item = {"data_quality": ev["data_quality"],
                 "direction": ev["direction"],
                 "event_id": ev["event_id"],
                 "event_type": ev["event_type"],
+                "name": names.get(ev["symbol"]),
                 "observed_at": ev["observed_at"],
                 "rank": rank,
                 "symbol": ev["symbol"]}
@@ -506,8 +636,9 @@ class Projector:
         recorded facts, and this method only folds them, orders by a
         recorded field, selects and counts. The runs root is listed once
         per request and every identity is read from recorded bytes (the
-        committed config record), never the wall clock. Everything is a
-        local — nothing is cached between requests."""
+        committed config record), never the wall clock. The event fold
+        and the response stay per-request locals; the one cached object
+        is the derived name dictionary (§3.7, _market_names)."""
         names = self._session_names()
         eligible = []
         for name in names:
@@ -539,6 +670,8 @@ class Projector:
         # committed observed_at (None ranks last), then max dirname.
         session, environment, session_date, run_id, _ = max(
             eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        stock_names = self._market_names(
+            os.path.join(self.runs_root, session, INPUT_JSONL))
         events, _ = read_committed_lines(
             os.path.join(self.runs_root, session, EVENTS_JSONL))
         live = {}      # (symbol, direction) -> item + ledger position
@@ -571,8 +704,8 @@ class Projector:
                         or rank < 1:
                     raise DataFault("%s record %d has no rank >= 1"
                                     % (EVENTS_JSONL, pos))
-                live[key] = self._market_item(ev, rank, pos)
-            history.append(self._market_item(ev, rank))
+                live[key] = self._market_item(ev, rank, stock_names, pos)
+            history.append(self._market_item(ev, rank, stock_names))
             if len(history) > MARKET_HISTORY_N:
                 del history[0]
         rising, falling = [], []

@@ -11,7 +11,7 @@ import 'test_kit.dart';
 /// RefreshIndicator arms at a drag of (viewport × 0.25) ÷ 1.5, so the
 /// arming threshold scales with viewport height: a tall 1200×4000 surface
 /// needs a ~650 px pull before the indicator fires, and a human-scale
-/// 300 px drag is silently cancelled. 800×1000 keeps the Market View
+/// 300 px drag is silently cancelled. 800×1000 keeps the 후보 tab
 /// content visible and pull-to-refresh reachable (verified: the same
 /// 300 px drag does not resync at 4000 px but does at 1000 px).
 Future<void> pumpApp(WidgetTester tester, AppStore store) async {
@@ -105,10 +105,13 @@ void main() {
     await store.bootstrap();
     await pumpApp(tester, store);
 
-    // The Market View list is the initial tab; a slow drag past the
-    // refresh threshold triggers the indicator (a fling is too fast and
-    // cancels it).
-    await tester.drag(find.byType(RefreshIndicator), const Offset(0, 300));
+    // The 후보 tab's list is the initial tab (both tabs carry a
+    // RefreshIndicator over the same store; the visible one — child 0 of
+    // the IndexedStack — is the first match); a slow drag past the refresh
+    // threshold triggers the indicator (a fling is too fast and cancels
+    // it).
+    await tester.drag(
+        find.byType(RefreshIndicator).first, const Offset(0, 300));
     await tester.pump();
     await tester.pumpAndSettle();
 

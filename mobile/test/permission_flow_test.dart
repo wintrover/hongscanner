@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hongscanner/main.dart';
 import 'package:hongscanner/services/push_permission.dart';
@@ -158,7 +159,7 @@ void main() {
     expect(store.syncCount, 1);
   });
 
-  testWidgets('denied push renders the disabled state with a re-ask button',
+  testWidgets('denied push: no push UI on screen, re-ask path intact',
       (WidgetTester tester) async {
     final push = FakePushService(
         ready: true, decision: PushPermissionDecision.denied);
@@ -167,24 +168,51 @@ void main() {
     await store.bootstrap();
     await tester.pumpWidget(HongScannerApp(store: store));
 
-    expect(find.text('푸시 비활성 — 권한 거부됨'), findsOneWidget);
-    expect(find.text('다시 요청'), findsOneWidget);
-    expect(find.textContaining('요청 이력: 1회'), findsOneWidget);
+    // The push card/token UI is gone from the screens: the denial stays a
+    // recorded store state (푸시 비활성, ask history) with the re-ask path —
+    // never a card.
+    expect(find.textContaining('푸시'), findsNothing);
+    expect(find.text('다시 요청'), findsNothing);
+    expect(store.pushState.phase, PushPhase.denied);
+    expect(store.pushState.askedCount, 1);
+    // The app itself stays fully functional.
+    expect(store.marketView.phase, LoadPhase.loaded);
+
+    // The re-ask path is unchanged.
+    await store.requestPushPermission();
+    expect(push.askCount, 2);
+    expect(store.pushState.askedCount, 2);
   });
 
-  testWidgets('the delivered FID renders in full — copyable, not truncated',
+  testWidgets(
+      'the delivered FID is logged once for logcat, never rendered',
       (WidgetTester tester) async {
-    // FID-scale length (~150 chars): a 60-char prefix would visibly cut it.
-    final fid = 'fcm-${'a1B2c3D4' * 18}x';
-    final push = FakeTokenPushService(
-        ready: true, decision: PushPermissionDecision.granted, fid: fid);
-    final store =
-        makeStore(transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
-    await store.bootstrap();
-    await tester.pumpWidget(HongScannerApp(store: store));
+    final logs = <String>[];
+    final originalDebugPrint = debugPrint;
+    debugPrint = (String? message, {int? wrapWidth}) =>
+        logs.add(message ?? '');
+    try {
+      // FID-scale length (~150 chars): the operator registers exactly this
+      // identifier with tools/notify/register.
+      final fid = 'fcm-${'a1B2c3D4' * 18}x';
+      final push = FakeTokenPushService(
+          ready: true, decision: PushPermissionDecision.granted, fid: fid);
+      final store =
+          makeStore(transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+      await store.bootstrap();
+      await tester.pumpWidget(HongScannerApp(store: store));
 
-    expect(find.textContaining(fid), findsOneWidget,
-        reason: 'the operator registers exactly the displayed identifier — '
-            'a truncated prefix would be a broken registration');
+      // Operator path: exactly one logcat line (`adb logcat -s flutter`)
+      // carrying the full FID — the on-screen token area is gone, so
+      // logcat is the pickup surface, never a widget.
+      expect(
+          logs.where((line) => line == '[HS-OPS] fcm registration id: $fid'),
+          hasLength(1));
+      expect(find.textContaining(fid), findsNothing);
+    } finally {
+      // Restore inside the body: the test binding asserts foundation
+      // debug variables are unchanged once the body completes.
+      debugPrint = originalDebugPrint;
+    }
   });
 }

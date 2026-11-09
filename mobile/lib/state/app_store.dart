@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import '../api/api_client.dart';
 import '../api/api_models.dart';
 import '../api/credentials.dart';
+import '../app_routes.dart';
 import '../services/credential_store.dart';
 import '../services/push_permission.dart';
 import '../services/push_service.dart';
@@ -89,8 +90,9 @@ class PushUiState {
   }
 }
 
-/// Central app state: the market-view projection, event
-/// selection/routing, push permission flow and resync scheduling.
+/// Central app state: the market-view projection, event selection/routing
+/// (the detail route, pushed through the global navigator key), push
+/// permission flow and resync scheduling.
 ///
 /// Honest by contract: this store never synthesizes content. The
 /// projection shows exactly what the API recorded; missing records stay
@@ -148,7 +150,16 @@ class AppStore extends ChangeNotifier {
 
   String? selectedEventId;
   Section<EventDetailResponse> eventDetail = const Section();
+
+  /// Shell tab index: 0 = 후보 (top 10 cards), 1 = 히스토리 (candidate
+  /// events). Tab switches never refetch — both tabs read the single
+  /// [marketView] section.
   int tabIndex = 0;
+
+  /// Event id routed before the navigator existed (a cold-start tap that
+  /// landed ahead of the app's first frame): the shell's post-frame
+  /// callback turns it into the detail route via [flushPendingEvent].
+  String? pendingEventId;
 
   PushUiState pushState = const PushUiState(phase: PushPhase.unwired);
 
@@ -173,8 +184,6 @@ class AppStore extends ChangeNotifier {
   /// the failed pass may be retried once. Absent (null) = no dialog path
   /// wired; a 401 then just stays a visible error.
   Future<bool> Function()? onUnauthorized;
-
-  static const int detailTabIndex = 1;
 
   // ---- bootstrap --------------------------------------------------------
 
@@ -302,9 +311,10 @@ class AppStore extends ChangeNotifier {
   /// Wires the token-registration flow (firebase_messaging 17.x FID
   /// APIs). Subscribes [PushTokenSource.onRegistered] *before* calling
   /// [PushTokenSource.register] so the delivered FID cannot race the
-  /// listener, and shows exactly what the source delivered: no FID means
-  /// no token on the card, never a fabricated one. The identifier is
-  /// display-only — the operator registers it with the server CLI.
+  /// listener, and records exactly what the source delivered: no FID
+  /// means no recorded token, never a fabricated one. The identifier is
+  /// never displayed — it is logged once (logcat) for the operator to
+  /// register with the server CLI.
   Future<void> _wireTokenSource() async {
     if (!_push.isReady) {
       pushState = pushState.copyWith(
@@ -318,6 +328,11 @@ class AppStore extends ChangeNotifier {
     _fidSub = tokenSource.onRegistered.listen(
       (fid) {
         pushState = pushState.copyWith(token: fid, clearTokenError: true);
+        // Operator path: the FID never renders on screen. It is logged
+        // here once for `adb logcat -s flutter` pickup and registered
+        // server-side with tools/notify/register (the workflow the token
+        // card used to document).
+        debugPrint('[HS-OPS] fcm registration id: $fid');
         notifyListeners();
       },
       onError: (Object e) {
@@ -362,11 +377,15 @@ class AppStore extends ChangeNotifier {
   }
 
   /// Routing target for notification taps and list selections: selects the
-  /// event, switches to the detail tab, and fetches the recorded fact.
+  /// event, fetches the recorded fact, and shows the detail route (a
+  /// mounted detail route updates in place). When the navigator does not
+  /// exist yet — a tap that lands before the app's first frame — the id is
+  /// kept in [pendingEventId] for the shell's post-frame flush; the
+  /// selection and fetch still run immediately either way.
   Future<void> openEvent(String eventId) async {
     selectedEventId = eventId;
-    tabIndex = detailTabIndex;
     eventDetail = const Section.loading();
+    pendingEventId = showEventDetail() ? null : eventId;
     notifyListeners();
     try {
       final detail = await _api.fetchEvent(eventId);
@@ -377,6 +396,15 @@ class AppStore extends ChangeNotifier {
       eventDetail = Section.error(_describe(e), offline: e.isConnectivityProblem);
     }
     notifyListeners();
+  }
+
+  /// First-frame flush: turns a pre-frame routed event into the detail
+  /// route. [openEvent] already ran the selection and fetch — this only
+  /// performs the deferred screen transition.
+  void flushPendingEvent() {
+    final pending = pendingEventId;
+    if (pending == null) return;
+    if (showEventDetail()) pendingEventId = null;
   }
 
   // ---- sync -------------------------------------------------------------

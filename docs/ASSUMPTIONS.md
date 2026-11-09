@@ -278,6 +278,19 @@ still requires G2 credentials.
   the code shape is the declared universe boundary; `stk_cnd="16"` is the
   pinned default (documented ETF+ETN exclusion, honored by demo). Whether
   the real server honors stk_cnd="16" identically: UNKNOWN until F-4.
+- ka10027 stock names for the mobile projection (official spec + terms
+  of use, recorded 2026-11-09): `stk_nm` (한글명 종목명) is a documented
+  row field of the official ka10027 response spec (`pred_pre_flu_rt_upper`
+  LIST, same source as the entries above). serve.py projects names only
+  from RECORDED input.hcj.jsonl bodies (folded stk_cd→stk_nm at
+  serve-time; no vendor call, AGENTS §0.3). Kiwoom terms of use 제5조③
+  restricts query results obtained through this service to use on the
+  querying device itself (자기기기 내 이용) — serving the operator's own
+  recorded results to the operator's own mobile app stays inside that
+  boundary. Whether a BARE stock name (stk_nm alone, no price/quote
+  field) is 시세정보 has no official definition (interpretation limit,
+  recorded fail-closed — the projection carries the name only as a
+  recorded-verbatim dictionary value and never re-queries the vendor).
 - WS 0B spec (official, collected 2026-11-06): LOGIN
   {"trnm":"LOGIN","token":…} · REG {"trnm":"REG","grp_no","refresh",
   "data":[{item,type}]} · REMOVE; inbound {"trnm":"REAL","data":[{type:
