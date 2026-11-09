@@ -482,6 +482,12 @@ proc selectCandidates(records: var seq[RecOut]; cand: UpDownCandidates;
   ## and the policy id. Distinct from rest_truncated: a leg can close
   ## at the page cap and above the selection cap at once, or only above
   ## the selection cap.
+  ## scope_excluded_count in the detail is the count of rows the
+  ## derivation partitioned out of the candidate universe by code shape
+  ## (vendor_input.isCandidateCode) — a declared universe boundary, not a
+  ## data gap; the excluded codes stay preserved in the raw response
+  ## bytes and recompute identically on replay. The gap itself still
+  ## fires only for the selection truncation (excludedCount > 0).
   let sel = selectTopPerDirection(cand)
   for i in 0 ..< sel.facts.len:
     let f = sel.facts[i]
@@ -492,6 +498,7 @@ proc selectCandidates(records: var seq[RecOut]; cand: UpDownCandidates;
       f.direction & " candidate_count=" & $f.candidateCount &
       " selected_count=" & $f.selectedCount &
       " excluded_count=" & $f.excludedCount &
+      " scope_excluded_count=" & $f.scopeExcludedCount &
       " remaining_unverified_pages=" &
       (if (i == 0 and upTruncated) or (i == 1 and downTruncated): "true"
        else: "false") &

@@ -66,7 +66,7 @@ Nim collector-core (src/hs/collector.nim + tools/collector/collector.nim)
  "rest_domain":"https://mockapi.kiwoom.com",
  "ws_endpoint":"wss://mockapi.kiwoom.com:10000/api/dostk/websocket",
  "api_id":"ka10027",
- "rest_params":{"mrkt_tp":"000","trde_qty_cnd":"0000","stk_cnd":"0",
+ "rest_params":{"mrkt_tp":"000","trde_qty_cnd":"0000","stk_cnd":"16",
    "crd_cnd":"0","updown_incls":"1","pric_cnd":"0","trde_prica_cnd":"0",
    "stex_tp":"1"},
  "page_cap":10,"repoll_seconds":300,"drain_seconds":10,
@@ -81,7 +81,13 @@ Nim collector-core (src/hs/collector.nim + tools/collector/collector.nim)
   환경으로의 자동 대체 접속은 존재하지 않는다(fail-closed).
 - `rest_params`는 ka10027 9필드 중 `sort_tp`를 제외한 8필드(방향별로
   core가 `sort_tp` 1/3을 붙여 요청한다). 값 도메인은 vendor_input.nim의
-  공식 enum 검증을 통과해야 한다.
+  공식 enum 검증을 통과해야 한다. 기본값 `stk_cnd="16"`은 공식 스펙의
+  "16:ETF+ETN제외"다(2026-11-09 demo 실측: 요청이 존중되어 비-6자리
+  코드가 페이지당 33→7로 감소). 스펙 어디에도 ELW를 제외하는 값은 없고
+  `stk_cls` 값 체계도 문서화돼 있지 않으므로, 랭킹에 남는 비-6자리
+  코드(ELW·모의 알파벳 코드)는 core 파생 단계에서 후보 유니버스 밖으로
+  파티션된다(vendor_input.isCandidateCode — 원문은 그대로 보존, 결코
+  후보도 실패도 아님; ASSUMPTIONS "Vendor facts" 참조).
 - `ws_endpoint`는 선택된 환경의 WS 베이스에 공식 WS API 경로
   `/api/dostk/websocket`(kwcli `api_commands.csv` ka10171~73의 WS 경로,
   SDK `ws_client.connect`는 `uri = base + api_url`로 합성)를 붙인

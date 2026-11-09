@@ -203,11 +203,14 @@ type
   DirectionSelection* = object
     ## The selection facts of one direction. candidateCount is what the
     ## recorded pages affirm — the confirmed count, never an estimate
-    ## of a truncated remainder.
+    ## of a truncated remainder — of the IN-SCOPE candidates (the
+    ## 6-digit-shaped codes; out-of-shape rows were partitioned out at
+    ## derivation and count only in scopeExcludedCount).
     direction*: string      ## "up" | "down"
     candidateCount*: int
     selectedCount*: int
     excludedCount*: int
+    scopeExcludedCount*: int ## rows out of the candidate universe by code shape
 
   SelectionResult* = object
     ## The composition input plus the per-direction facts. facts[0] is
@@ -507,11 +510,13 @@ proc selectTopPerDirection*(cands: UpDownCandidates): SelectionResult =
   result.facts[0] = DirectionSelection(
     direction: "up", candidateCount: cands.up.len,
     selectedCount: result.selected.up.len,
-    excludedCount: cands.up.len - result.selected.up.len)
+    excludedCount: cands.up.len - result.selected.up.len,
+    scopeExcludedCount: cands.upExcluded.len)
   result.facts[1] = DirectionSelection(
     direction: "down", candidateCount: cands.down.len,
     selectedCount: result.selected.down.len,
-    excludedCount: cands.down.len - result.selected.down.len)
+    excludedCount: cands.down.len - result.selected.down.len,
+    scopeExcludedCount: cands.downExcluded.len)
 
 # ---------------------------------------------------------------- composition
 

@@ -458,6 +458,42 @@ block candidates:
       discard upDownCandidates(ch(dirUp, @[pg(pageBody(@[]), "Y", "K", 500)]),
                                ch(dirDown, @[downP]), 1, upTruncated = true))
 
+block candidateScope:
+  ## The 2026-11-09 demo capture incident: the ka10027 ranking mixes rows
+  ## whose stk_cd is not the 6-digit candidate shape (ELW "18064K" and
+  ## mock alphanumeric codes at the TOP of the up ranking, so they enter
+  ## any top-N selection). The official request enum documents no ELW
+  ## exclusion and no stk_cls value table, so the code shape itself is
+  ## the declared universe boundary: partitioned out, never a candidate,
+  ## never a failure, preserved in the raw bytes.
+  check("scope: exactly 6 digits is the candidate code shape",
+        isCandidateCode("005930") and not isCandidateCode("18064K") and
+        not isCandidateCode("0147B0") and not isCandidateCode("12345") and
+        not isCandidateCode("1234567") and not isCandidateCode(""))
+  let upP = pg(pageBody(@[rowMap("18064K", "+6760", "+29.90"),
+                          rowMap("005930", "+1000", "+29.88"),
+                          rowMap("0147B0", "+642", "+29.86"),
+                          rowMap("000660", "+2000", "+29.84")]))
+  let downP = pg(pageBody(@[rowMap("035420", "-3000", "-3.00"),
+                            rowMap("0088M0", "-500", "-2.90")]))
+  let c = upDown(@[upP], @[downP])
+  check("scope: only candidate-shaped codes are candidates, in vendor order",
+        c.up == @["005930", "000660"] and c.down == @["035420"])
+  check("scope: out-of-shape codes are excluded per leg in vendor order",
+        c.upExcluded == @["18064K", "0147B0"] and
+        c.downExcluded == @["0088M0"])
+  let c2 = upDown(@[upP], @[downP])
+  check("scope: deterministic — the same pages partition identically",
+        c.up == c2.up and c.upExcluded == c2.upExcluded and
+        c.down == c2.down and c.downExcluded == c2.downExcluded)
+  let dup = upDown(@[pg(pageBody(@[rowMap("005930", "+1", "+1.00"),
+                                   rowMap("18064K", "+2", "+2.00"),
+                                   rowMap("005930", "+3", "+3.00")]))],
+                   @[downP])
+  check("scope: lossless per class — kept duplicates stay kept, the " &
+        "out-of-shape row stays excluded",
+        dup.up == @["005930", "005930"] and dup.upExcluded == @["18064K"])
+
 # ---------------------------------------------------------------- ws identity
 
 block wsIdentity:

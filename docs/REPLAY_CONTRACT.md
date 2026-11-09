@@ -273,6 +273,18 @@ auditable:
 - API: Kiwoom REST `ka10027` (전일대비등락률상위), `POST /api/dostk/rkinfo`.
 - Exchange: `stex_tp="1"` (KRX). `2` (NXT) and `3` (통합) are outside the
   candidate universe.
+- Code shape: the candidate universe is the rows whose `stk_cd` is exactly
+  6 digits (`vendor_input.isCandidateCode`). The ranking mixes rows whose
+  code is not that shape — ELW-style "18064K" at the TOP of the 2026-11-09
+  demo up ranking, mock alphanumeric stock/ETF codes — and the official
+  request enum documents no ELW exclusion while `stk_cls` has no documented
+  value table, so the code shape itself is the declared deterministic
+  boundary. An out-of-shape row is partitioned out of the universe at
+  derivation (`upExcluded`/`downExcluded`, vendor order): it is never a
+  candidate, never a candidate event, and never a failure — the raw
+  response bytes keep it verbatim and replay recomputes the identical
+  partition. This is a declared universe boundary, not a data gap. A row
+  without `stk_cd` still rejects the whole chain (fail-closed, unchanged).
 - Direction: one query per direction — `sort_tp="1"` (rise-rate) and
   `sort_tp="3"` (fall-rate). Direction comes from the query itself, not
   from a sign convention on thresholds.
@@ -308,13 +320,18 @@ auditable:
   subscription-truncated-v1, HIGH/INCOMPLETE; the
   `DATA_GAP_SUSPECTED` fact of the same record stays): an exclusion is
   never "no candidate", and the candidate events keep judging the FULL
-  recorded universe. The cap is a declared scope limit, mirroring the
+  recorded in-scope universe (out-of-shape rows were partitioned out of
+  the universe at derivation — the code-shape provision above — and are
+  never candidates). The cap is a declared scope limit, mirroring the
   pagination provision above: the session is not INCOMPLETE for the
   subscription truncation alone — what stays blocking for approval is an
   unresolved data gap (pages not fetched below the cap, unconfirmed
   mandatory subscriptions, connection loss; GATES Approval condition 3).
   The policy id is recorded in the config record
-  (`selection_policy`). Cross-direction duplicates (a code in both
+  (`selection_policy`). The `subscription_truncated` gap detail carries
+  `scope_excluded_count` per direction: the count of rows the derivation
+  partitioned out by code shape (a universe boundary, never a data gap).
+  Cross-direction duplicates (a code in both
   kept sets) are still a rejection (fail-closed; no auto-dedup), and
   the composition caps (`checkDirectionCaps`) stay as unchanged
   defense.

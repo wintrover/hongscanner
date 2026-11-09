@@ -267,7 +267,7 @@ proc main(): int =
       sessionDate, environment, profile,
       argValue(args, "mrkt-tp").defaultStr("000"),
       argValue(args, "trde-qty-cnd").defaultStr("0000"),
-      argValue(args, "stk-cnd").defaultStr("0"),
+      argValue(args, "stk-cnd").defaultStr("16"),
       argValue(args, "crd-cnd").defaultStr("0"),
       argValue(args, "updown-incls").defaultStr("1"),
       argValue(args, "pric-cnd").defaultStr("0"),
