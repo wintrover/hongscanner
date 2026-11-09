@@ -278,15 +278,17 @@ class FakeWS:
     async def send(self, text):
         self.sent.append(text)
 
-    async def recv(self, decode=None):
+    async def recv(self):
+        # The real websockets client API: recv() takes no decode argument
+        # (removed in websockets 8.0) and returns str for a text frame,
+        # bytes for a binary frame. The fake mirrors exactly that shape —
+        # a fake more permissive than the real client would hide kwarg
+        # mismatches from the suite (the 2026-11-09 live-session defect
+        # this signature now locks out).
         item = await self.inbox.get()
         if item is _CLOSE:
             raise FakeConnectionClosed(FakeFrame(self.close_code or 1000,
                                                  "test close"))
-        if decode is False and isinstance(item, str):
-            return item.encode("utf-8")
-        if decode is True and isinstance(item, bytes):
-            return item.decode("utf-8")
         return item
 
     async def close(self, code=1000):
@@ -649,6 +651,17 @@ class SidecarContract(unittest.IsolatedAsyncioTestCase):
             lambda evs: any(e.get("ev") == "ws" and
                             e.get("payload_hex") == payload.hex() for e in evs),
             "the 0B payload forwarded byte-exact")
+
+        # A text frame (str) — the actual Kiwoom wire shape — must forward
+        # as the same opaque bytes: recv() without decode returns str for
+        # text frames (websockets >= 8.0), the regression the 2026-11-09
+        # live session measured.
+        text_frame = payload.decode("utf-8")
+        h.fake_ws.deliver(text_frame)
+        await h.wait_for(
+            lambda evs: sum(1 for e in evs if e.get("ev") == "ws" and
+                            e.get("payload_hex") == payload.hex()) >= 2,
+            "the str text frame forwarded as the same opaque bytes")
 
         ping_doc = b'{"trnm":"PING","x":1}'
         h.fake_ws.deliver(ping_doc)
