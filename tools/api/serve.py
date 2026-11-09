@@ -88,6 +88,20 @@ MARKET_NAME_LIST_KEY = "pred_pre_flu_rt_upper"
 MARKET_ITEM_FIELDS = ("data_quality", "direction", "event_id",
                       "event_type", "name", "observed_at", "rank",
                       "symbol")
+# The §3.7 change-history vocabulary: the display-only classification
+# of one TOP10 state change between CONFIRMED observation groups. Not
+# event types — the ledger's event_type is projected verbatim only in
+# top10 items, never in a change record.
+MARKET_CHANGE_TYPES = ("CANDIDATE_EXITED", "RANK_CHANGED",
+                        "TOP10_ENTERED", "TOP10_EXITED")
+# The §3.7 change-record whitelist: nine fields — change_type (a
+# MARKET_CHANGE_TYPES value) and prev_rank (the previous confirmed
+# group's recorded rank) are the projection's own display values; every
+# other value is recorded in the change's evidence event, name comes
+# from the folded dictionary. Field-bounded like MARKET_ITEM_FIELDS.
+MARKET_CHANGE_FIELDS = ("change_type", "data_quality", "direction",
+                        "event_id", "name", "observed_at", "prev_rank",
+                        "rank", "symbol")
 
 
 class DataFault(Exception):
@@ -629,16 +643,44 @@ class Projector:
             item["pos"] = pos
         return item
 
+    @staticmethod
+    def _market_change(change_type, item, prev_rank, names):
+        """The §3.7 change record: nine whitelisted fields — a
+        display-only classification of one TOP10 state change between
+        CONFIRMED observation groups plus the recorded values of the
+        change's evidence event (`item`, the whitelist item of the
+        upsert that last recorded the state, or of the EXITED with rank
+        null). `prev_rank` is the rank the previous confirmed group
+        recorded (null when there was no previous state). Not an event:
+        the classification follows MARKET_CHANGE_TYPES, the record mints
+        no id of its own and never enters a journal — its event_id is
+        the evidence event's, so the existing /events/{id} drilldown
+        applies unchanged."""
+        record = {"change_type": change_type,
+                  "data_quality": item["data_quality"],
+                  "direction": item["direction"],
+                  "event_id": item["event_id"],
+                  "name": names.get(item["symbol"]),
+                  "observed_at": item["observed_at"],
+                  "prev_rank": prev_rank,
+                  "rank": item["rank"],
+                  "symbol": item["symbol"]}
+        return {field: record[field] for field in MARKET_CHANGE_FIELDS}
+
     def market_view(self):
         """GET /mobile/market-view (README §3.7): the bounded,
         deterministic, read-only projection of the latest ELIGIBLE
         market-collection run. No judgment happens here: ranks are
         recorded facts, and this method only folds them, orders by a
-        recorded field, selects and counts. The runs root is listed once
-        per request and every identity is read from recorded bytes (the
-        committed config record), never the wall clock. The event fold
-        and the response stay per-request locals; the one cached object
-        is the derived name dictionary (§3.7, _market_names)."""
+        recorded field, selects, counts, and classifies TOP10 changes
+        by the contract's state-comparison projection — recorded
+        snapshots are compared, so every value in a change record is a
+        recorded value and the classification follows the §3.7
+        vocabulary. The runs root is listed once per request and every
+        identity is read from recorded bytes (the committed config
+        record), never the wall clock. The event fold and the response
+        stay per-request locals; the one cached object is the derived
+        name dictionary (§3.7, _market_names)."""
         names = self._session_names()
         eligible = []
         for name in names:
@@ -670,13 +712,105 @@ class Projector:
         # committed observed_at (None ranks last), then max dirname.
         session, environment, session_date, run_id, _ = max(
             eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        run_dir = os.path.join(self.runs_root, session)
         stock_names = self._market_names(
-            os.path.join(self.runs_root, session, INPUT_JSONL))
+            os.path.join(run_dir, INPUT_JSONL))
         events, _ = read_committed_lines(
-            os.path.join(self.runs_root, session, EVENTS_JSONL))
-        live = {}      # (symbol, direction) -> item + ledger position
-        history = []   # the last MARKET_HISTORY_N candidate items
+            os.path.join(run_dir, EVENTS_JSONL))
+        # The seal (README §3.7): the recorder's finish() marker — the
+        # same recorded fact the verification endpoint reads (§3.6),
+        # checked once per request. Its absence means live or crashed:
+        # the last observation group is unconfirmed and its changes are
+        # never derived (a partial batch is not made to look complete).
+        sealed = os.path.isfile(os.path.join(run_dir, COMMITTED_MARKER))
+        live = {}       # (symbol, direction) -> item + ledger position
+        changes = []    # the last MARKET_HISTORY_N change records
         quality = Counter()
+        prev_snapshot = None  # (symbol, direction) -> rank at the end of
+        #                       the last CONFIRMED observation group
+        #                       (ranks beyond 10 included); None until
+        #                       the first group is confirmed — that
+        #                       group is only the comparison baseline
+        group_exits = {}  # the current group's EXITED events, key ->
+        #                   (event, ledger position): the evidence a
+        #                   CANDIDATE_EXITED change record cites
+        group_stamp = None  # observed_at of the current observation group
+
+        def confirm_group():
+            """The §3.7 state-comparison projection: derive the TOP10
+            change records of the just-closed observation group by
+            comparing the previous confirmed snapshot with the live
+            state. The classification follows MARKET_CHANGE_TYPES; every
+            projected value is recorded. The first group (no snapshot)
+            is the baseline and records zero changes."""
+            nonlocal prev_snapshot
+            recorded = []  # (evidence position, change record)
+            if prev_snapshot is not None:
+                # The current TOP10 per direction: the same rule the
+                # response top10 uses — ascending recorded rank, the
+                # documented ledger-position tie-break, first ten.
+                current_top10 = set()
+                for direction in ("UP", "DOWN"):
+                    rows = [entry for entry in live.values()
+                            if entry["direction"] == direction]
+                    rows.sort(key=lambda entry: (entry["rank"],
+                                                 entry["pos"]))
+                    for entry in rows[:MARKET_TOP_N]:
+                        current_top10.add((entry["symbol"], direction))
+                # The previous TOP10 members: what left or moved.
+                for key, prev_rank in prev_snapshot.items():
+                    if prev_rank > MARKET_TOP_N:
+                        continue  # outside the previous TOP10: it can
+                        #           only enter, handled below
+                    entry = live.get(key)
+                    if entry is None:
+                        if key not in group_exits:
+                            # A valid ledger cannot produce this: live
+                            # state is removed only by an EXITED event,
+                            # so a previous-TOP10 symbol missing from
+                            # live must carry this group's evidence.
+                            raise DataFault(
+                                "%s TOP10 symbol %s (%s) left the live "
+                                "state with no CANDIDATE_EXITED record "
+                                "in its observation group"
+                                % (EVENTS_JSONL, key[0], key[1]))
+                        ev, ev_pos = group_exits[key]
+                        recorded.append((ev_pos, self._market_change(
+                            "CANDIDATE_EXITED",
+                            self._market_item(ev, None, stock_names),
+                            prev_rank, stock_names)))
+                    elif entry["rank"] <= MARKET_TOP_N:
+                        if entry["rank"] != prev_rank:
+                            recorded.append((entry["pos"], self._market_change(
+                                "RANK_CHANGED", entry, prev_rank,
+                                stock_names)))
+                    else:
+                        recorded.append((entry["pos"], self._market_change(
+                            "TOP10_EXITED", entry, prev_rank,
+                            stock_names)))
+                # The new TOP10 members: what entered.
+                for key in current_top10:
+                    prev_rank = prev_snapshot.get(key)
+                    if prev_rank is not None \
+                            and prev_rank <= MARKET_TOP_N:
+                        continue  # already in the previous TOP10
+                    entry = live[key]
+                    if entry["rank"] > MARKET_TOP_N:
+                        continue  # displayed only because the direction
+                        #           shrank below ten members — entering
+                        #           means reaching rank <= 10
+                    recorded.append((entry["pos"], self._market_change(
+                        "TOP10_ENTERED", entry, prev_rank, stock_names)))
+            # Group order: the ledger position of the evidence event —
+            # an explicit sort, never dict iteration order.
+            recorded.sort(key=lambda pair: pair[0])
+            for _, record in recorded:
+                changes.append(record)
+                if len(changes) > MARKET_HISTORY_N:
+                    del changes[0]
+            prev_snapshot = {key: item["rank"]
+                             for key, item in live.items()}
+
         for pos, ev in enumerate(events, start=1):
             for field in ("event_id", "event_type", "observed_at",
                           "data_quality"):
@@ -686,7 +820,7 @@ class Projector:
             event_type = ev["event_type"]
             quality[ev["data_quality"]] += 1
             if not event_type.startswith(CANDIDATE_PREFIX):
-                continue
+                continue  # non-candidate events never close a group
             if not isinstance(ev.get("symbol"), str) \
                     or not isinstance(ev.get("direction"), str):
                 raise DataFault("%s record %d has no symbol or direction"
@@ -695,9 +829,17 @@ class Projector:
                 raise DataFault("%s record %d direction is not UP or DOWN"
                                 % (EVENTS_JSONL, pos))
             key = (ev["symbol"], ev["direction"])
+            if group_stamp is not None and ev["observed_at"] != group_stamp:
+                # A different observed_at opens the next observation
+                # group, so the previous group's recorded batch is
+                # complete: confirm it. Same-stamp consecutive batches
+                # merge into one group (fail-safe: no false exits).
+                confirm_group()
+                group_exits = {}
+            group_stamp = ev["observed_at"]
             if event_type == "CANDIDATE_EXITED":
+                group_exits[key] = (ev, pos)
                 live.pop(key, None)
-                rank = None
             else:
                 rank = ev.get("rank")
                 if not isinstance(rank, int) or isinstance(rank, bool) \
@@ -705,9 +847,12 @@ class Projector:
                     raise DataFault("%s record %d has no rank >= 1"
                                     % (EVENTS_JSONL, pos))
                 live[key] = self._market_item(ev, rank, stock_names, pos)
-            history.append(self._market_item(ev, rank, stock_names))
-            if len(history) > MARKET_HISTORY_N:
-                del history[0]
+        # End of file: only the seal confirms the final group — after
+        # the seal the recorder appends no candidate event (the only
+        # post-seal append is SESSION_ENDED, not a candidate), so the
+        # group's batch can no longer be partial.
+        if group_stamp is not None and sealed:
+            confirm_group()
         rising, falling = [], []
         for direction, target in (("UP", rising), ("DOWN", falling)):
             rows = [entry for entry in live.values()
@@ -723,7 +868,7 @@ class Projector:
         last = events[-1] if events else None
         return {
             "as_of": last["observed_at"] if last else None,
-            "history": history,
+            "history": changes,
             "latest": ({field: last[field] for field in
                         ("data_quality", "event_id", "event_type",
                          "observed_at")} if last else None),

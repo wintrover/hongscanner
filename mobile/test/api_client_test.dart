@@ -102,16 +102,21 @@ void main() {
           {'INCOMPLETE': 1, 'OBSERVING': 3});
     });
 
-    test('history keeps the server order (oldest→newest), CANDIDATE_* only',
+    test('history keeps the server order (oldest→newest), change kinds',
         () async {
       final marketView = await fetchFixture();
       expect(marketView.history.map((i) => i.eventId).toList(),
           [evUpEnterId, evDownEnterId, evUpUpdateId, evDownExitId]);
       expect(
-        marketView.history.map((i) => i.eventType ?? '').toList(),
-        everyElement(startsWith('CANDIDATE_')),
-        reason: 'the projection retains candidate events only — the '
-            'client must not need to filter',
+        marketView.history.map((i) => i.changeType ?? '').toList(),
+        everyElement(isIn(const [
+          'TOP10_ENTERED',
+          'TOP10_EXITED',
+          'CANDIDATE_EXITED',
+          'RANK_CHANGED',
+        ])),
+        reason: 'the server sends change records only — the client must '
+            'not need to filter',
       );
     });
 
@@ -119,12 +124,16 @@ void main() {
         () async {
       final marketView = await fetchFixture();
       final exited = marketView.history.last;
-      expect(exited.eventType, 'CANDIDATE_EXITED');
+      expect(exited.changeType, 'CANDIDATE_EXITED');
       expect(exited.rank, isNull,
           reason: 'honest absence, never coerced to 0');
       expect(exited.dataQuality, 'INCOMPLETE');
-      expect(marketView.history.first.rank, 1,
-          reason: 'ranked history items keep their rank');
+      expect(marketView.history.first.rank, 7,
+          reason: 'ranked change records keep the new rank');
+      expect(marketView.history.first.prevRank, 11,
+          reason: 'prev_rank parses as the previous recorded rank');
+      expect(exited.prevRank, 3,
+          reason: 'the EXITED row keeps its previous-group rank');
     });
 
     test('name parses as recorded: value, JSON null, and key absence',
@@ -138,6 +147,10 @@ void main() {
               'falls back to the symbol, never a blank title');
       expect(MarketViewItem.fromMap(const {'event_id': 'x'}).name, isNull,
           reason: 'an item without the name key reads as absence too');
+      expect(MarketViewItem.fromMap(const {'event_id': 'x'}).prevRank,
+          isNull,
+          reason: 'an item without the prev_rank key reads as absence '
+              'too — no prior state');
     });
 
     test('null absence semantics: no run, no status, no as_of', () async {

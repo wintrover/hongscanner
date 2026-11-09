@@ -16,7 +16,7 @@ or no connection. No real market data enters the app or the repository
 - `lib/app_routes.dart` — the process-lifetime navigator key plus the
   event-detail route push helper the store calls (store-driven routing
   from notification taps)
-- `lib/screens/` — 후보 (top-10 cards) · 히스토리 (candidate events) ·
+- `lib/screens/` — 후보 (top-10 cards) · 히스토리 (TOP10 상태 변화 기록) ·
   Event Detail route (all data-driven), plus `app_scope.dart`
   (InheritedNotifier) and shared honest-state widgets in `widgets.dart`
 - `lib/state/app_store.dart` — the single `ChangeNotifier` store: the
@@ -123,9 +123,10 @@ Basic Auth), which the app supports as follows:
   events into candidates, and `runs_present:false` / `run:null` renders
   as "기록 없음" — never zero-filled rows. Market prices are not served by
   the API and are not shown.
-- **히스토리 (tab 1)** — the retained 최근 후보 이벤트 (≤100, server order
-  oldest→newest) from the same projection; a tab switch reads the store
-  and never refetches.
+- **히스토리 (tab 1)** — the retained TOP10 상태 변화 (진입·이탈·순위
+  변경·후보 종료) 최근 100건 (server order oldest→newest, 이전 순위→새
+  순위 표시) from the same projection; a tab switch reads the store and
+  never refetches.
 - **Data quality display** — a normal-quality row (the OK / COMPLETE /
   OBSERVING set) shows just the observation time; anything else
   (INCOMPLETE, UNKNOWN, null, unrecognized) keeps an explicit quality
@@ -294,7 +295,7 @@ APK artifacts are gitignored (`/build/`) and never committed.
   (market-view contract shapes, name parsing and symbol-fallback
   semantics, null/absence semantics, error classification),
   fixture-driven widget tests for the two-tab shell (top-10 cards with
-  names, the candidate history, conditional quality display,
+  names, the TOP10 change history, conditional quality display,
   drill-down into the pushed Event Detail route with a natural back,
   honest-absence and offline states), permission flow (first-run ask
   once, denial persistence, manual re-ask, unwired, FID logged to

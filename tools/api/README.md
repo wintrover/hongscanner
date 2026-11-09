@@ -31,8 +31,12 @@ HTTP 서버 (serve.py, 기본 127.0.0.1 바인드, GET 전용)
   CHECKSUMS.sha256 대조용 sha256 재계산, 마커·기록 존재 확인 — 과
   (3) §3.7이 명시한 **유계 폴딩 투영** — 선택된 하나의 런에 기록된
   이벤트 팩트를 접고, 기록된 필드로 정렬·선출·계수하는 순수 계산 —
-  만 담는다. 폴딩도 새 사실을 만들지 않는다: 랭크·순서·카운트는
-  전부 기록된 값이다.
+  과 (4) §3.7이 명시한 **상태 비교 투영** — 기록된 상태(스냅샷) 간
+  비교로 표시용 변화 분류를 도출하는 순수 계산 — 만 담는다. 폴딩도
+  상태 비교도 새 사실을 만들지 않는다: 랭크·순서·카운트는 전부
+  기록된 값이고, 상태 비교 투영의 모든 값도 기록값이며 분류는 §3.7의
+  계약 어휘를 따른다. 변화 레코드는 팩트가 아닌 **표시용 투영**이라
+  어떤 저널·팩트·id·판정에도 역류하지 않는다(REPLAY_CONTRACT §13.1).
 - **Nim verify 바이너리 실행은 이 API 프로세스의 범위 밖이다.** API는
   replay·verify를 실행하지 않으며, `VERDICT` 판정은 운영자가 런
   디렉터리에 남긴 기록 파일(`verify.stdout`)을 **원문 그대로 인용**할
@@ -101,8 +105,9 @@ python3.13 tools/api/serve.py \
 - 이벤트 배열의 순서는 **ledger 파일 순서**(단일 작성자 append 순서)다.
   API가 재정렬하지 않는다. 세션 목록은 런 디렉터리 이름 코드포인트
   오름차순이다. 유일한 예외는 `/mobile/market-view`(§3.7)이다: 그
-  배열의 순서는 §3.7이 직접 규정한다 — `history`는 선택된 런의
-  events 파일 순서, top10은 폴드 규칙(rank 오름차순)이다.
+  배열의 순서는 §3.7이 직접 규정한다 — `history`는 변화 레코드 순서
+  (관찰 그룹 = 원장 순, 그룹 내 = 증명 이벤트의 원장 위치 순, 최근
+  100건 oldest→newest), top10은 폴드 규칙(rank 오름차순)이다.
 - 오류 본문: `{"error": {"code", "message"}}`. message는 요청 값을
   재출력하지 않고, 파일 이름만 담는다(절대 경로 비노출).
 
@@ -267,8 +272,10 @@ runs 루트의 **디렉터리만**, 이름 오름차순으로:
 
 모바일 단일 화면을 위한 하나의 읽기다. 이 라우트는 판정하지 않는다:
 랭크는 기록된 팩트에서 오고, 여기서 하는 일은 기록된 이벤트를
-**접고·기록 필드(rank)로 정렬해 선출하고·계수**하는 것뿐이다(§0 세
-번째 항목의 유계 폴딩 투영). 쿼리 파라미터·정렬 옵션·페이지네이션은
+**접고·기록 필드(rank)로 정렬해 선출하고·계수하고·계약이 명시한 상태
+비교로 변화를 분류**하는 것뿐이다(§0의 유계 폴딩 투영·상태 비교 투영).
+변화 분류도 판정(시장 평가)이 아니다 — 비교하는 양쪽 상태와 증명
+이벤트의 모든 값이 기록값이다. 쿼리 파라미터·정렬 옵션·페이지네이션은
 없다. `--ledger`·`--delivery`는 읽지 않는다 — 원천은 아래 선택 규칙이
 고른 **런 디렉터리 하나**다.
 
@@ -301,22 +308,83 @@ JSON·빈 줄이면 DataFault(§4). 창 안에 config 레코드가 없으면 그
 LF-종단 라인만 파싱해 `observed_at`을 읽는다(전체 파일을 읽지
 않는다). 커밋된 마지막 라인이 불량이면 DataFault.
 
-**폴드** — 선택된 런의 `events.hcj.jsonl`을 `read_committed_lines`
-규약(§0)으로 한 번 패스한다. `(symbol, direction)` 상태는
-last-record-wins: `CANDIDATE_ENTERED`/`CANDIDATE_UPDATED`는
-`{rank, event_id, event_type, observed_at, data_quality}`를 덮어쓰고
-`CANDIDATE_EXITED`는 상태에서 제거한다. 패스 후 방향별(UP/DOWN)로
-**rank 오름차순** 정렬해 앞 10개가 `rising_top10`/`falling_top10`이다.
-정규 기록의 랭크는 조밀 1..N이라 동률이 없어야 한다 — 불량 기록으로
-동률이 나타나면 **레저 순서(파일 순서) 위치**가 동률을 깬다(이 계약이
-명시하는 유일한 동률 규칙). `history`는 파일 순서 그대로 **최근
-`CANDIDATE_*` 이벤트 최대 100건**. `status.by_data_quality`는 그 런의
-**모든** 이벤트에 대한 data_quality 합계(키 오름차순). `as_of`·
-`latest`는 그 런의 마지막 커밋 이벤트가 기록한 필드에서 온다. 폴드가
-유지하는 메모리는 상태 + 최근 100 링 + 카운터뿐이다(이벤트별 복사본
+**폴드(top10)·변화 이력 공통 기반** — 선택된 런의 `events.hcj.jsonl`을
+`read_committed_lines` 규약(§0)으로 한 번 패스한다. `(symbol,
+direction)` 상태는 last-record-wins: `CANDIDATE_ENTERED`/
+`CANDIDATE_UPDATED`는 `{rank, event_id, event_type, observed_at,
+data_quality}`를 덮어쓰고 `CANDIDATE_EXITED`는 상태에서 제거한다.
+패스 후 방향별(UP/DOWN)로 **rank 오름차순** 정렬해 앞 10개가
+`rising_top10`/`falling_top10`이다. 정규 기록의 랭크는 조밀 1..N이라
+동률이 없어야 한다 — 불량 기록으로 동률이 나타나면 **레저 순서(파일
+순서) 위치**가 동률을 깬다(이 계약이 명시하는 유일한 동률 규칙). top10은
+언제나 이 최종 live 상태(last-record-wins) 그대로다 — 봉인 여부와
+무관하다. `status.by_data_quality`는 그 런의 **모든** 이벤트에 대한
+data_quality 합계(키 오름차순). `as_of`·`latest`는 그 런의 마지막 커밋
+이벤트가 기록한 필드에서 온다(`SESSION_ENDED` 등 후보 이외의 이벤트
+포함).
+
+**변화 이력(`history`) — 상태 비교 투영** — `history`는 **확정된 관찰
+그룹별 TOP10 상태 변화 최근 100건**(oldest→newest)이다. **관찰
+그룹** = 후보 이벤트(`CANDIDATE_*`)의 `observed_at`이 유지되는 연속
+구간이다(비-후보 이벤트는 그룹 판정에서 제외). 동일 스탬프의 연속
+배치는 하나의 그룹으로 **병합**한다 — fail-safe: 같은 스탬프를 경계로
+쪼개면 존재하지 않는 이탈을 만들어낸다. **그룹 확정 규칙**: 다른
+`observed_at` 그룹의 시작, 또는 **런 봉인**만이 그룹을 확정한다. 봉인 =
+선택된 런 디렉터리의 `input.hcj.jsonl.committed` 존재(recorder
+`finish()`의 최종 산물이며 **봉인 시점에만** 생성된다; §3.6 검증
+엔드포인트가 읽는 것과 동일한 신호·파일명 규약, 요청당 존재 확인 1회).
+봉인 후 events에 추가되는 것은 `SESSION_ENDED`(후보 아님)뿐이므로
+봉인된 마지막 그룹의 배치는 더 이상 부분배치가 될 수 없다. **파일
+끝에서 미봉인이면 마지막 그룹은 확정되지 않고 그 변화는 `history`에
+없다**(마커 부재 = 라이브 진행 중이거나 크래시 — 마지막 그룹 완결
+불확정. 라이브 런에서 최대 1배치 = 300초 지연이며, 부분 배치를 완전해
+보이게 하지 않는다. top10은 위 규칙대로 최종 live 상태 그대로).
+
+**변화 어휘·분류 규칙** — 그룹 확정 시점에 직전 확정 그룹 종료 시점의
+상태 스냅샷(`(symbol, direction)` → rank 맵, rank 11+ 포함)과 현 시점
+live 상태를 비교한다. 현재 TOP10 = live 후보를 (rank, 원장 위치)
+정렬해 상위 10(응답 top10과 동일 규칙), 이전 TOP10 = 스냅샷에서 rank
+≤10. 변화 생성 범위는 방향별 (이전 TOP10 ∪ 현재 TOP10) — 그룹당 최대
+40건, 100 링은 3개 이상의 그룹을 스팬한다:
+
+- `TOP10_ENTERED` — 이전 TOP10 밖 또는 이전 상태 없음에서 **rank ≤10**
+  진입. `rank` = 새 순위, `prev_rank` = 이전 기록 순위(신규 후보면
+  null, TOP10 밖에서 올라오면 그 rank).
+- `TOP10_EXITED` — 이전 TOP10 구성원이 live에서 rank >10으로 밀림.
+  `rank` = 새(>10) 순위, `prev_rank` = 이전 TOP10 내 순위.
+- `RANK_CHANGED` — TOP10 내 순위 변화(둘 다 ≤10, 서로 다름).
+- `CANDIDATE_EXITED` — 이전 TOP10 구성원의 후보 종료(EXITED).
+  `rank` = **null**(정직한 부재), `prev_rank` = 이전 TOP10 내 순위.
+
+동일 순위·TOP10 밖 변화(예: 15위→14위)·증거만 변경은 무기록이다.
+최초 그룹은 비교 기준점일 뿐 변화 0건이다. 방향 전환(UP 종료 + DOWN
+진입)은 별도 판정 없이 **두 기록**(`CANDIDATE_EXITED` +
+`TOP10_ENTERED`)로 표현한다. UP/DOWN 비율은 원장에 기록된 대로다
+(인위적 균형 금지). 한 방향의 후보가 10개 미만이 되어 rank 11+ 심볼이
+top10 **표시**에 들어와도 그것은 진입이 아니다 — 진입은 rank ≤10
+도달이며, 표시 자체는 top10의 last-record-wins 규칙이 그대로 반영한다.
+
+**변화 레코드(9 필드)** — `change_type`(위 4종 — 서버 표시용 변화
+분류, 원장 `event_type`과 별개) + `data_quality`·`direction`·
+`event_id`·`name`·`observed_at`·`rank`·`symbol`·`prev_rank`.
+`event_id` = 그 변화를 확정한 **증명 이벤트**의 id(해당 상태를
+마지막으로 기록한 이벤트 — upsert 계열은 live의 최종 이벤트, 이탈은
+그룹 내 `EXITED`)이며 드릴다운은 기존 `/events/{id}`를 재사용한다.
+`name`은 top10과 같은 종목명 사전에서 온다. 원장 위치(`pos`)는
+정렬에만 쓰이고 **절대 투영되지 않는다**.
+
+**순서·메모리·fail-closed** — `history` 순서: 그룹 = 원장 순, 그룹 내
+= 증명 이벤트의 원장 위치(pos) 오름차순 **명시 정렬**(dict 순회 순서
+의존 금지), 최근 100건 oldest→newest(100 초과 시 가장 오래된 기록부터
+제거). 폴드가 유지하는 메모리는 상태 + 직전 확정 그룹 스냅샷
+((symbol,direction)→rank 맵, rank 11+ 포함) + 현 그룹의 EXITED 증거
+맵 + 변화 100 링 + 카운터 + 봉인 마커 존재 확인뿐이다(이벤트별 복사본
 없음). 폴드가 의존하는 필드(event_id·event_type·observed_at·
-data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
-정수 rank)의 커밋된 기록이 형상을 벗어나면 DataFault다.
+data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
+이상 정수 rank)의 커밋된 기록이 형상을 벗어나면 DataFault다. 추가
+불변식: **이전 TOP10 심볼이 현재 live에 부재한데 그 그룹 내에 그
+심볼의 EXITED 이벤트가 없으면 DataFault다**(유효한 원장에서는 불가능
+— live 제거는 EXITED에서만 일어난다).
 
 **종목명 사전(name) 폴드** — 아이템의 8번째 필드 `name`은 선택된 런의
 `input.hcj.jsonl`에 기록된 ka10027 응답 본문에서 온다(serve-time 벤더
@@ -360,10 +428,14 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
                      "event_id": "…", "event_type": "CANDIDATE_UPDATED",
                      "name": "SK하이닉스", "observed_at": "…",
                      "rank": 2, "symbol": "000660"} ],
- "history": [ {"data_quality": "OBSERVING", "direction": "UP",
-               "event_id": "…", "event_type": "CANDIDATE_ENTERED",
-               "name": "삼성전자", "observed_at": "…", "rank": 1,
-               "symbol": "005930"}, … ],
+ "history": [ {"change_type": "TOP10_EXITED", "data_quality": "OBSERVING",
+               "direction": "UP", "event_id": "…", "name": "삼성전자",
+               "observed_at": "…", "prev_rank": 8, "rank": 11,
+               "symbol": "005930"},
+              {"change_type": "TOP10_ENTERED", "data_quality": "OBSERVING",
+               "direction": "DOWN", "event_id": "…", "name": null,
+               "observed_at": "…", "prev_rank": null, "rank": 1,
+               "symbol": "011060"}, … ],
  "latest": {"data_quality": "INCOMPLETE", "event_id": "…",
             "event_type": "SUBSCRIPTION_TRUNCATED",
             "observed_at": "…"},
@@ -378,30 +450,39 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
 }
 ```
 
-- **아이템(top10·history 공용)은 화이트리스트 8 필드**: data_quality·
-  direction·event_id·event_type·**name**·observed_at·rank·symbol.
-  `name`을 뺀 7필드는 이벤트 기록에서, `name`은 위 종목명 사전에서 온다.
-  후보 전이 이외의 기록 필드(rule_id·severity·evidence_ref·…)는
-  투영되지 않는다. `CANDIDATE_EXITED` history 아이템의 `rank`는 **null**이
-  고 심볼이 사전에 없는 아이템의 `name`도 **null**이다(기록 부재,
-  0이나 빈 문자열이 아니다 — §2). 아이템 수는 최대 120(10+10+100)이고
-  필드가 기록 형상(이벤트 스키마의 enum·고정 패턴·6자리 심볼, 그리고
-  벤더가 기록한 stk_nm 문자열)으로 유계라 **응답 크기는 계약상 64 KiB를
-  넘지 않는다** — 모바일 규모의 단일 응답이다(§7). 실측(2026-11-09
-  demo-v4, 이름 120/120 부착): 30,954 바이트.
+- **top10 아이템은 화이트리스트 8 필드**: data_quality·direction·
+  event_id·event_type·**name**·observed_at·rank·symbol(`event_type`은
+  원장 기록값 그대로). **history 아이템(변화 레코드)은 화이트리스트 9
+  필드**: change_type·data_quality·direction·event_id·**name**·
+  observed_at·prev_rank·rank·symbol — `event_type` 키는 없다(변화
+  레코드는 이벤트가 아니므로). 공통 7필드는 증명 이벤트 기록에서,
+  `name`은 위 종목명 사전에서 온다. 후보 전이 이외의 기록 필드(rule_id·
+  severity·evidence_ref·…)와 원장 위치(`pos`)는 절대 투영되지 않는다.
+  `CANDIDATE_EXITED` 변화 레코드의 `rank`는 **null**이고 심볼이 사전에
+  없는 아이템의 `name`도 **null**이다(기록 부재, 0이나 빈 문자열이
+  아니다 — §2). 아이템 수는 최대 120(10+10+100)이고 history 아이템의
+  필드 수·값이 기록 형상(이벤트 스키마의 enum·고정 패턴·6자리 심볼,
+  4종 change_type, 그리고 벤더가 기록한 stk_nm 문자열)으로 유계라
+  **응답 크기는 계약상 64 KiB를 넘지 않는다** — 모바일 규모의 단일
+  응답이다(§7). 계약 스위트가 모든 시나리오에서 `len(raw) ≤ 65536`을
+  단언한다(100 링 시나리오 포함).
 - **빈 상태**: runs 루트에 디렉터리가 없으면 `runs_present:false`·
   `run:null`·나머지 전부 null/빈 배열·`status:null`. 디렉터리는
   있어도 적격 런이 없으면 `runs_present:true`에 같은 null/빈값.
   선택된 런에 커밋된 이벤트가 0개면 `run`은 채워지고 `as_of`·
   `latest`는 null, 세 목록은 빈 배열, `status.by_data_quality`는
   `{}`다(§3.1의 present-but-empty 규율과 같다).
-- **배열 순서는 §2에 대한 명시된 예외다**: `history`는 선택된 런의
-  events 파일 순서, top10 순서는 이 §의 폴드 규칙(rank 오름차순)이다.
+- **배열 순서는 §2에 대한 명시된 예외다**: `history`는 변화 레코드
+  순서(관찰 그룹 = 원장 순, 그룹 내 = 증명 이벤트의 원장 위치 순, 최근
+  100건 oldest→newest), top10 순서는 이 §의 폴드 규칙(rank 오름차순)이다.
 - **캐비앗**: (1) 이중 방향 코드는 event_gen이 UP 방향으로 한 번만
   판정하므로(중복 제거) DOWN 목록에서 누락될 수 있다. (2) `history`는
-  최근 후보 이벤트 최대 100건이다 — 피크 이벤트율에서 이 창은 몇 분
-  치고 하루 전체 이력이 아니다. 하루 이력·더 큰 창·새 쿼리 파라미터는
-  **이 §을 고치는 계약 변경** 없이는 생기지 않는다.
+  확정된 관찰 그룹의 TOP10 상태 변화 **최근 100건**이다 — 피크 변화율에서
+  이 창은 몇 배치 치이고 하루 전체 분산이 아니다. 하루 이력·더 큰
+  창·새 쿼리 파라미터는 **이 §을 고치는 계약 변경** 없이는 생기지
+  않는다. (3) 미봉인 런에서는 마지막 관찰 그룹의 변화가 아직 없다(위
+  확정 규칙) — top10이 최신이어도 `history`는 최대 1배치(300초)
+  뒤처질 수 있다.
 
 ## 4. 오류 응답 (fail-closed)
 
@@ -452,7 +533,13 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
   리스너 단언, 0.0.0.0 인자 검증 수용, 멀티캐스트·브로드캐스트·예약
   블록·비IPv4 문자열의 exit 2 거부), §3.7 종목명(ka10027 사전 fold —
   최신 승리·불량 라인·인벨로프 위반 DataFault·비성공 본문 부재 서빙,
-  name null 폴백, (path, size, mtime_ns) 캐시 히트·무효화).
+  name null 폴백, (path, size, mtime_ns) 캐시 히트·무효화), §3.7 변화
+  이력(관찰 그룹 경계 = observed_at 변화·동일 스탬프 연속 배치 병합,
+  그룹 확정 = 다음 그룹 시작 또는 봉인 마커뿐 — 미봉인 런의 마지막
+  그룹 변화 제외·봉인 후 포함, 변화 어휘 4종과 rank/prev_rank 규칙·
+  event_type 키 부재, 그룹 내 증명 이벤트 원장 위치 정렬, 방향 전환
+  두 기록, TOP10 밖 변화·동일 순위·TOP10 밖 EXITED 무기록, 100 링
+  상한, top10은 봉인 무관 last-record-wins).
 - 인터프리터 해석 순서는 collector·notify 스위트와 같다:
   `$HSCOLLECTOR_PYTHON` → `python3.13` → `uv python find 3.13`.
 - 게이트: `bash tools/run_tests.sh`에 등록된 스위트(`run bash

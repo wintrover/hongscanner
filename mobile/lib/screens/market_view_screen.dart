@@ -35,9 +35,9 @@ class MarketViewScreen extends StatelessWidget {
   }
 }
 
-/// 히스토리 tab: the retained candidate-event tail (≤100, server order:
-/// oldest→newest, CANDIDATE_* only). Same single projection as the 후보
-/// tab — a tab switch reads the store, it never refetches.
+/// 히스토리 tab: the retained TOP10 state-change records (≤100, server
+/// order: oldest→newest). Same single projection as the 후보 tab — a tab
+/// switch reads the store, it never refetches.
 class HistoryScreen extends StatelessWidget {
   const HistoryScreen({super.key});
 
@@ -115,7 +115,7 @@ class _HistoryBody extends StatelessWidget {
         padding: const EdgeInsets.all(12),
         child: _HistoryList(
           items: marketView.history,
-          emptyMessage: '후보 이벤트 기록 없음',
+          emptyMessage: '변화 기록 없음',
         ),
       ),
     );
@@ -176,6 +176,17 @@ class _Top10List extends StatelessWidget {
   }
 }
 
+/// History rank suffix: ` #prev→rank` when the previous observation
+/// group recorded a rank, ` #rank` alone when there was no prior state
+/// (prevRank null — a new candidate), and '' when rank is null
+/// (CANDIDATE_EXITED) — honest absence, never a fake 0.
+String _historyRankSuffix(MarketViewItem item) {
+  final rank = item.rank;
+  if (rank == null) return '';
+  final prevRank = item.prevRank;
+  return prevRank == null ? ' #$rank' : ' #$prevRank→$rank';
+}
+
 class _HistoryList extends StatelessWidget {
   const _HistoryList({required this.items, required this.emptyMessage});
 
@@ -204,11 +215,9 @@ class _HistoryList extends StatelessWidget {
               },
             ),
             title: Text(
-              '${item.eventType ?? '?'} · ${_itemTitle(item)}'
+              '${item.changeType ?? '?'} · ${_itemTitle(item)}'
               '${item.direction == null ? '' : ' · ${item.direction}'}'
-              // rank is absent on CANDIDATE_EXITED — honest absence,
-              // never a fake 0.
-              '${item.rank == null ? '' : ' #${item.rank}'}',
+              '${_historyRankSuffix(item)}',
             ),
             subtitle: Text(_qualityAwareSubtitle(item)),
             trailing: const Icon(Icons.chevron_right),

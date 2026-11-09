@@ -132,51 +132,170 @@ SIGNALS_LINE = {"bar_index": 0, "reason": "first_after_sub",
 
 MV_WINNER = "market-2026-11-09-b"
 
-# The winning run's fold scenario (README §3.7): a multi-generation
-# UP ranking (enter -> update -> re-rank -> exit -> re-enter), a DOWN
-# ranking, and one INCOMPLETE non-candidate event that touches only
-# by_data_quality — and, being last, latest/as_of.
-MV_UP_ENTERED_1 = event_fact(b"mv-up-e1", "CANDIDATE_ENTERED", "2026-11-09",
-                             "2026-11-09T10:00:01+09:00",
-                             "candidate-transition-v1",
-                             direction="UP", rank=1, symbol="005930")
-MV_UP_UPDATED_1 = event_fact(b"mv-up-u1", "CANDIDATE_UPDATED", "2026-11-09",
-                             "2026-11-09T10:00:02+09:00",
-                             "candidate-transition-v1",
-                             direction="UP", rank=9, symbol="005930")
-MV_UP_ENTERED_2 = event_fact(b"mv-up-e2", "CANDIDATE_ENTERED", "2026-11-09",
-                             "2026-11-09T10:00:03+09:00",
-                             "candidate-transition-v1",
-                             direction="UP", rank=2, symbol="006660")
-MV_UP_EXITED_2 = event_fact(b"mv-up-x2", "CANDIDATE_EXITED", "2026-11-09",
-                            "2026-11-09T10:00:04+09:00",
-                            "candidate-transition-v1",
-                            direction="UP", symbol="006660")
-MV_UP_REENTERED_2 = event_fact(b"mv-up-r2", "CANDIDATE_ENTERED",
-                               "2026-11-09",
-                               "2026-11-09T10:00:05+09:00",
-                               "candidate-transition-v1",
-                               direction="UP", rank=3, symbol="006660")
-MV_DOWN_ENTERED_1 = event_fact(b"mv-dn-e1", "CANDIDATE_ENTERED",
-                               "2026-11-09",
-                               "2026-11-09T10:00:06+09:00",
-                               "candidate-transition-v1",
-                               direction="DOWN", rank=1, symbol="000660")
-MV_DOWN_UPDATED_1 = event_fact(b"mv-dn-u1", "CANDIDATE_UPDATED",
-                               "2026-11-09",
-                               "2026-11-09T10:00:07+09:00",
-                               "candidate-transition-v1",
-                               direction="DOWN", rank=2, symbol="000660")
+# The winning run's change-history scenario (README §3.7): four
+# observation groups over a ~15-symbol universe, both directions.
+# Group 1 is the baseline (every candidate ENTERED — zero changes).
+# Group 2 exercises every classification: RANK_CHANGED, TOP10_ENTERED
+# from rank 11, TOP10_EXITED to rank 11, a TOP10-outside move (15 -> 14)
+# and a TOP10-outside EXIT with no record, and a DOWN TOP10 member's
+# CANDIDATE_EXITED. Groups 3A/3B are two consecutive batches stamped
+# identically — one merged group whose net effect is zero. Group 4 is a
+# direction switch (one UP TOP10 member leaves and re-enters DOWN) plus
+# the DOWN re-ranking. The winner is UNSEALED by default: group 4's
+# changes stay out of history until the committed marker exists.
+MV_T1 = "2026-11-09T10:00:01+09:00"
+MV_T2 = "2026-11-09T10:05:01+09:00"
+MV_T3 = "2026-11-09T10:10:01+09:00"   # the same-stamp merge pair
+MV_T4 = "2026-11-09T10:15:01+09:00"
+MV_T5 = "2026-11-09T10:20:01+09:00"   # the torn-tail fixture's stamp
+MV_TEND = "2026-11-09T15:30:00+09:00"  # the run's last committed event
+
+
+def mv_fact(tag, stamp, event_type, symbol, direction, rank=None):
+    """A §3.7 candidate event of the fixture universe: the recorded
+    twelve-field shape (candidate data_quality is always OBSERVING;
+    rank is absent on CANDIDATE_EXITED)."""
+    extra = {"direction": direction, "symbol": symbol}
+    if rank is not None:
+        extra["rank"] = rank
+    return event_fact(b"mv-" + tag, event_type, "2026-11-09", stamp,
+                      "candidate-transition-v1", **extra)
+
+
+# Group 1 (MV_T1) — the baseline: thirteen UP and three DOWN candidates
+# enter (batch order: the UP upserts, then the DOWN upserts).
+MV_G1_UP06 = mv_fact(b"g1-up06", MV_T1, "CANDIDATE_ENTERED", "009150",
+                     "UP", 6)
+MV_G1 = [
+    mv_fact(b"g1-up01", MV_T1, "CANDIDATE_ENTERED", "005930", "UP", 1),
+    mv_fact(b"g1-up02", MV_T1, "CANDIDATE_ENTERED", "006660", "UP", 2),
+    mv_fact(b"g1-up03", MV_T1, "CANDIDATE_ENTERED", "007070", "UP", 3),
+    mv_fact(b"g1-up04", MV_T1, "CANDIDATE_ENTERED", "008480", "UP", 4),
+    mv_fact(b"g1-up05", MV_T1, "CANDIDATE_ENTERED", "008560", "UP", 5),
+    MV_G1_UP06,
+    mv_fact(b"g1-up07", MV_T1, "CANDIDATE_ENTERED", "009540", "UP", 7),
+    mv_fact(b"g1-up08", MV_T1, "CANDIDATE_ENTERED", "010060", "UP", 8),
+    mv_fact(b"g1-up09", MV_T1, "CANDIDATE_ENTERED", "011060", "UP", 9),
+    mv_fact(b"g1-up10", MV_T1, "CANDIDATE_ENTERED", "011140", "UP", 10),
+    mv_fact(b"g1-up11", MV_T1, "CANDIDATE_ENTERED", "011780", "UP", 11),
+    mv_fact(b"g1-up12", MV_T1, "CANDIDATE_ENTERED", "012330", "UP", 12),
+    mv_fact(b"g1-up15", MV_T1, "CANDIDATE_ENTERED", "015760", "UP", 15),
+    mv_fact(b"g1-dn01", MV_T1, "CANDIDATE_ENTERED", "000660", "DOWN", 1),
+    mv_fact(b"g1-dn02", MV_T1, "CANDIDATE_ENTERED", "000810", "DOWN", 2),
+    mv_fact(b"g1-dn03", MV_T1, "CANDIDATE_ENTERED", "001440", "DOWN", 11),
+]
+
+# Group 2 (MV_T2) — one recorded batch: the UP upserts (the vendor
+# emits events only for candidates whose rank changed), the UP exit of
+# the rank-12 outside member (no record), then the DOWN exit of a TOP10
+# member (CANDIDATE_EXITED).
+MV_G2_UP05 = mv_fact(b"g2-up05", MV_T2, "CANDIDATE_UPDATED", "008560",
+                     "UP", 2)
+MV_G2_UP02 = mv_fact(b"g2-up02", MV_T2, "CANDIDATE_UPDATED", "006660",
+                     "UP", 3)
+MV_G2_UP03 = mv_fact(b"g2-up03", MV_T2, "CANDIDATE_UPDATED", "007070",
+                     "UP", 4)
+MV_G2_UP04 = mv_fact(b"g2-up04", MV_T2, "CANDIDATE_UPDATED", "008480",
+                     "UP", 5)
+MV_G2_UP11 = mv_fact(b"g2-up11", MV_T2, "CANDIDATE_UPDATED", "011780",
+                     "UP", 7)
+MV_G2_UP07 = mv_fact(b"g2-up07", MV_T2, "CANDIDATE_UPDATED", "009540",
+                     "UP", 8)
+MV_G2_UP08 = mv_fact(b"g2-up08", MV_T2, "CANDIDATE_UPDATED", "010060",
+                     "UP", 11)
+MV_G2_UP12X = mv_fact(b"g2-up12x", MV_T2, "CANDIDATE_EXITED", "012330",
+                      "UP")
+MV_G2_DN02X = mv_fact(b"g2-dn02x", MV_T2, "CANDIDATE_EXITED", "000810",
+                      "DOWN")
+MV_G2 = [MV_G2_UP05, MV_G2_UP02, MV_G2_UP03, MV_G2_UP04, MV_G2_UP11,
+         MV_G2_UP07, MV_G2_UP08,
+         mv_fact(b"g2-up15", MV_T2, "CANDIDATE_UPDATED", "015760", "UP", 14),
+         MV_G2_UP12X, MV_G2_DN02X]
+
+# Groups 3A/3B (both MV_T3) — two consecutive batches stamped
+# identically: one merged observation group whose net effect is zero
+# (ranks 1 and 2 swap, then swap back). Splitting them would record
+# changes that never happened.
+MV_G3A = [
+    mv_fact(b"g3a-up01", MV_T3, "CANDIDATE_UPDATED", "005930", "UP", 2),
+    mv_fact(b"g3a-up05", MV_T3, "CANDIDATE_UPDATED", "008560", "UP", 1),
+]
+MV_G3B_UP01 = mv_fact(b"g3b-up01", MV_T3, "CANDIDATE_UPDATED", "005930",
+                      "UP", 1)
+MV_G3B_UP05 = mv_fact(b"g3b-up05", MV_T3, "CANDIDATE_UPDATED", "008560",
+                      "UP", 2)
+MV_G3B = [MV_G3B_UP01, MV_G3B_UP05]
+
+# Group 4 (MV_T4) — a direction switch: the UP rank-9 member 011060
+# leaves UP (the members below re-rank) and re-enters DOWN at rank 1,
+# re-ranking DOWN. The two sides are two separate change records.
+MV_G4_UP10 = mv_fact(b"g4-up10", MV_T4, "CANDIDATE_UPDATED", "011140",
+                     "UP", 9)
+MV_G4_UP08 = mv_fact(b"g4-up08", MV_T4, "CANDIDATE_UPDATED", "010060",
+                     "UP", 10)
+MV_G4_UP09X = mv_fact(b"g4-up09x", MV_T4, "CANDIDATE_EXITED", "011060",
+                      "UP")
+MV_G4_DN09 = mv_fact(b"g4-dn09", MV_T4, "CANDIDATE_ENTERED", "011060",
+                     "DOWN", 1)
+MV_G4_DN01 = mv_fact(b"g4-dn01", MV_T4, "CANDIDATE_UPDATED", "000660",
+                     "DOWN", 2)
+MV_G4_DN03 = mv_fact(b"g4-dn03", MV_T4, "CANDIDATE_UPDATED", "001440",
+                     "DOWN", 3)
+MV_G4 = [MV_G4_UP10, MV_G4_UP08,
+         mv_fact(b"g4-up15", MV_T4, "CANDIDATE_UPDATED", "015760", "UP", 13),
+         MV_G4_UP09X, MV_G4_DN09, MV_G4_DN01, MV_G4_DN03]
+
+# The run's last committed event — a non-candidate INCOMPLETE record:
+# it never closes a group, and it is the as_of/latest evidence.
 MV_INCOMPLETE_SUB = event_fact(b"mv-sub", "SUBSCRIPTION_TRUNCATED",
-                               "2026-11-09",
-                               "2026-11-09T10:00:08+09:00",
+                               "2026-11-09", MV_TEND,
                                "subscription-truncated-v1",
                                severity="HIGH", data_quality="INCOMPLETE",
                                direction="UP")
 
-MV_WINNER_EVENTS = [MV_UP_ENTERED_1, MV_UP_UPDATED_1, MV_UP_ENTERED_2,
-                    MV_UP_EXITED_2, MV_UP_REENTERED_2, MV_DOWN_ENTERED_1,
-                    MV_DOWN_UPDATED_1, MV_INCOMPLETE_SUB]
+# The >100-change ring scenario: batches after group 4 that alternate
+# the UP TOP10's rank-pair assignment, so every group boundary derives
+# exactly ten RANK_CHANGED records (five pairs x two sides).
+MV_SWAP_BASE = [("005930", 1), ("008560", 2), ("006660", 3),
+                ("007070", 4), ("008480", 5), ("009150", 6),
+                ("011780", 7), ("009540", 8), ("011140", 9),
+                ("010060", 10)]
+
+
+def mv_swap_groups(count):
+    """`count` post-group-4 batches, each assigning the swapped or base
+    ranking of the ten UP TOP10 members: every group boundary derives
+    ten RANK_CHANGED records, so eleven groups exceed the 100-record
+    ring on top of the sealed scenario's fourteen."""
+    swapped = [(sym, rk + 1 if rk % 2 else rk - 1)
+               for sym, rk in MV_SWAP_BASE]
+    groups = []
+    for g in range(count):
+        stamp = "2026-11-09T10:%02d:01+09:00" % (25 + g)
+        assignment = swapped if g % 2 == 0 else MV_SWAP_BASE
+        groups.append([
+            mv_fact(("gsw%02d-%s" % (g, sym)).encode(), stamp,
+                    "CANDIDATE_UPDATED", sym, "UP", rk)
+            for sym, rk in assignment])
+    return groups
+
+
+def mv_winner_events(swap_groups=0):
+    """The winner's committed sequence: the four observation groups
+    (including the same-stamp merge pair), optionally `swap_groups`
+    ring-stressing batches, always closed by the non-candidate
+    INCOMPLETE record."""
+    events = MV_G1 + MV_G2 + MV_G3A + MV_G3B + MV_G4
+    for group in mv_swap_groups(swap_groups):
+        events += group
+    events.append(MV_INCOMPLETE_SUB)
+    return events
+
+
+# A single DOWN entry event, used only by the ineligible-run fixtures
+# and the empty suites — never folded by the selected run.
+MV_DOWN_ENTERED_1 = mv_fact(b"mv-dn-e1", MV_T1, "CANDIDATE_ENTERED",
+                            "000660", "DOWN", 1)
 
 # -- §3.7 name dictionary fixtures: ka10027 rest_resp records in the
 # winner's input.hcj.jsonl, with the recorder's envelope shape. The
@@ -244,22 +363,75 @@ def mv_item(ev, names=None):
     return item
 
 
+def mv_change(change_type, ev, rank, prev_rank, names=None):
+    """The §3.7 change record of a fixture fact: nine fields — the
+    display classification plus the evidence event's recorded values
+    (rank null on CANDIDATE_EXITED — honest absence, never 0)."""
+    return {"change_type": change_type,
+            "data_quality": ev["data_quality"],
+            "direction": ev["direction"],
+            "event_id": ev["event_id"],
+            "name": (names or {}).get(ev["symbol"]),
+            "observed_at": ev["observed_at"],
+            "prev_rank": prev_rank,
+            "rank": rank,
+            "symbol": ev["symbol"]}
+
+
+# Group 2's confirmed changes, ordered by the evidence events' ledger
+# positions: 008560's record is the earlier ledger line even though the
+# snapshot dict visits 006660 first (group-1 insertion order).
+MV_HISTORY_G2 = [
+    mv_change("RANK_CHANGED", MV_G2_UP05, 2, 5, MV_NAME_MAP),
+    mv_change("RANK_CHANGED", MV_G2_UP02, 3, 2, MV_NAME_MAP),
+    mv_change("RANK_CHANGED", MV_G2_UP03, 4, 3, MV_NAME_MAP),
+    mv_change("RANK_CHANGED", MV_G2_UP04, 5, 4, MV_NAME_MAP),
+    mv_change("TOP10_ENTERED", MV_G2_UP11, 7, 11, MV_NAME_MAP),
+    mv_change("RANK_CHANGED", MV_G2_UP07, 8, 7, MV_NAME_MAP),
+    mv_change("TOP10_EXITED", MV_G2_UP08, 11, 8, MV_NAME_MAP),
+    mv_change("CANDIDATE_EXITED", MV_G2_DN02X, None, 2, MV_NAME_MAP),
+]
+# Group 4's confirmed changes (only after the seal): the direction
+# switch of 011060 is two records — UP CANDIDATE_EXITED and DOWN
+# TOP10_ENTERED.
+MV_HISTORY_G4 = [
+    mv_change("RANK_CHANGED", MV_G4_UP10, 9, 10, MV_NAME_MAP),
+    mv_change("TOP10_ENTERED", MV_G4_UP08, 10, 11, MV_NAME_MAP),
+    mv_change("CANDIDATE_EXITED", MV_G4_UP09X, None, 9, MV_NAME_MAP),
+    mv_change("TOP10_ENTERED", MV_G4_DN09, 1, None, MV_NAME_MAP),
+    mv_change("RANK_CHANGED", MV_G4_DN01, 2, 1, MV_NAME_MAP),
+    mv_change("TOP10_ENTERED", MV_G4_DN03, 3, 11, MV_NAME_MAP),
+]
+
 MV_EXPECTED = {
-    "as_of": "2026-11-09T10:00:08+09:00",
-    "falling_top10": [mv_item(MV_DOWN_UPDATED_1, MV_NAME_MAP)],
-    "history": [mv_item(ev, MV_NAME_MAP) for ev in MV_WINNER_EVENTS
-                if ev["event_type"].startswith("CANDIDATE_")],
+    "as_of": MV_TEND,
+    "falling_top10": [mv_item(MV_G4_DN09, MV_NAME_MAP),
+                      mv_item(MV_G4_DN01, MV_NAME_MAP),
+                      mv_item(MV_G4_DN03, MV_NAME_MAP)],
+    "history": MV_HISTORY_G2,  # the unsealed run: group 4 is excluded
     "latest": {"data_quality": "INCOMPLETE",
                "event_id": MV_INCOMPLETE_SUB["event_id"],
                "event_type": "SUBSCRIPTION_TRUNCATED",
-               "observed_at": "2026-11-09T10:00:08+09:00"},
-    "rising_top10": [mv_item(MV_UP_REENTERED_2, MV_NAME_MAP),
-                     mv_item(MV_UP_UPDATED_1, MV_NAME_MAP)],
+               "observed_at": MV_TEND},
+    "rising_top10": [mv_item(MV_G3B_UP01, MV_NAME_MAP),
+                     mv_item(MV_G3B_UP05, MV_NAME_MAP),
+                     mv_item(MV_G2_UP02, MV_NAME_MAP),
+                     mv_item(MV_G2_UP03, MV_NAME_MAP),
+                     mv_item(MV_G2_UP04, MV_NAME_MAP),
+                     mv_item(MV_G1_UP06, MV_NAME_MAP),
+                     mv_item(MV_G2_UP11, MV_NAME_MAP),
+                     mv_item(MV_G2_UP07, MV_NAME_MAP),
+                     mv_item(MV_G4_UP10, MV_NAME_MAP),
+                     mv_item(MV_G4_UP08, MV_NAME_MAP)],
     "run": {"environment": "demo", "run_id": MV_WINNER,
             "session": MV_WINNER, "session_date": "2026-11-09"},
     "runs_present": True,
-    "status": {"by_data_quality": {"INCOMPLETE": 1, "OBSERVING": 7}},
+    "status": {"by_data_quality": {"INCOMPLETE": 1, "OBSERVING": 37}},
 }
+# The sealed variant: the final observation group is confirmed and its
+# changes enter the history.
+MV_EXPECTED_SEALED = dict(MV_EXPECTED,
+                          history=MV_HISTORY_G2 + MV_HISTORY_G4)
 
 
 def jsonl(*objects):
@@ -373,15 +545,18 @@ def build_main_sandbox():
     return box
 
 
-def build_market_view_sandbox():
-    """The §3.7 fixture tree: the winning eligible run (multi-generation
-    fold scenario, run_id recorded), an older same-date eligible run
-    whose dirname sorts AFTER the winner (the observed_at tie-break must
-    beat the dirname tie-break), an older-date eligible run with a NEWER
-    last observed_at (session_date outranks observed_at), and the
-    ineligible shapes: config without environment (smoke-like), config
-    with a malformed session_date, and a directory holding only a
-    subdirectory (drill-like)."""
+def build_market_view_sandbox(swap_groups=0, sealed=False):
+    """The §3.7 fixture tree: the winning eligible run (the multi-group
+    change-history scenario, run_id recorded, unsealed by default), an
+    older same-date eligible run whose dirname sorts AFTER the winner
+    (the observed_at tie-break must beat the dirname tie-break), an
+    older-date eligible run with a NEWER last observed_at (session_date
+    outranks observed_at), and the ineligible shapes: config without
+    environment (smoke-like), config with a malformed session_date, and
+    a directory holding only a subdirectory (drill-like). `sealed`
+    plants the recorder's finish() marker in the winner — the §3.7
+    group-finalization signal; `swap_groups` appends ring-stressing
+    batches after group 4."""
     box = Sandbox()
 
     def write_market_run(name, config, events, input_extra=()):
@@ -395,7 +570,16 @@ def build_market_view_sandbox():
     write_market_run(MV_WINNER,
                      {"environment": "demo", "run_id": MV_WINNER,
                       "session_date": "2026-11-09"},
-                     MV_WINNER_EVENTS, MV_WINNER_INPUT)
+                     mv_winner_events(swap_groups), MV_WINNER_INPUT)
+    if sealed:
+        # the recorder's finish() product: present exactly at the seal —
+        # the same marker the verification endpoint reports
+        box.write(os.path.join(box.runs, MV_WINNER,
+                               "input.hcj.jsonl.committed"),
+                  canonical({"run_id": MV_WINNER,
+                             "schema": "hong-scanner-commit/1",
+                             "seq": 7, "sha256": sha(b"input-mv"),
+                             "t": "2026-11-09T15:31:00+09:00"}) + b"\n")
     write_market_run("market-2026-11-09-z",
                      {"environment": "demo", "session_date": "2026-11-09"},
                      [event_fact(b"mv-old-same", "CANDIDATE_ENTERED",
@@ -844,9 +1028,10 @@ class ApiContractSuite(unittest.TestCase):
 
 
 class MarketViewSuite(unittest.TestCase):
-    """GET /mobile/market-view (README §3.7): the bounded fold
-    projection of the latest eligible market-collection run — recorded
-    facts only, ranks from the ledger, no judgment."""
+    """GET /mobile/market-view (README §3.7): the bounded fold and the
+    state-comparison change history of the latest eligible
+    market-collection run — recorded facts only, ranks from the ledger,
+    changes classified by comparing recorded snapshots, no judgment."""
 
     def setUp(self):
         self.box = build_market_view_sandbox()
@@ -858,6 +1043,25 @@ class MarketViewSuite(unittest.TestCase):
         code, _ = self.server.stop()
         self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
         self.server.assert_gone()
+
+    def _reap(self, server):
+        code, _ = server.stop()
+        self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
+        server.assert_gone()
+
+    def seal_winner(self):
+        """Plant the recorder's finish() marker — the §3.7 run seal. The
+        server re-reads the recorded files on every request, so sealing
+        needs no restart."""
+        self.box.write(
+            os.path.join(self.box.runs, MV_WINNER,
+                         "input.hcj.jsonl.committed"),
+            canonical({"run_id": MV_WINNER,
+                       "schema": "hong-scanner-commit/1", "seq": 7,
+                       "sha256": sha(b"input-mv"),
+                       "t": "2026-11-09T15:31:00+09:00"}) + b"\n")
+
+    # -- full-response contract --------------------------------------------
 
     def test_market_view_full_scenario_byte_canonical(self):
         # selection: session_date max beats the newer observed_at of the
@@ -874,17 +1078,163 @@ class MarketViewSuite(unittest.TestCase):
         # the contract's mechanical size bound (README §3.7)
         self.assertLessEqual(len(raw), 65536)
 
-    def test_market_view_history_exited_rank_is_null(self):
+    def test_market_view_unsealed_excludes_final_group(self):
+        # the run is unsealed: group 2 was confirmed by group 3's new
+        # stamp, but the final group (group 4) is unconfirmed — its
+        # changes are absent from history even though the top10 fold
+        # serves the final live state (a partial batch is never made to
+        # look complete)
         _, body, _, _ = self.server.get_json("/mobile/market-view")
-        exited = [item for item in body["history"]
-                  if item["event_type"] == "CANDIDATE_EXITED"]
-        self.assertEqual(len(exited), 1)
-        self.assertIsNone(exited[0]["rank"])  # honest absence, never 0
-        self.assertEqual(exited[0]["symbol"], "006660")
-        self.assertEqual(exited[0]["direction"], "UP")
-        self.assertTrue(all(item["rank"] is not None
-                            for item in body["history"]
-                            if item["event_type"] != "CANDIDATE_EXITED"))
+        self.assertEqual(body["history"], MV_HISTORY_G2)
+        self.assertTrue(all(c["observed_at"] != MV_T4
+                            for c in body["history"]))
+        self.assertNotIn("011060", [c["symbol"] for c in body["history"]])
+        # the live top10 is last-record-wins regardless of the seal: the
+        # direction switch IS served in falling_top10
+        self.assertEqual(body["falling_top10"][0]["symbol"], "011060")
+
+    def test_market_view_sealed_confirms_final_group(self):
+        # the finish() marker exists: the last observation group is
+        # confirmed and its changes enter the history
+        self.seal_winner()
+        status, body, raw, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, MV_EXPECTED_SEALED)
+        self.assertEqual(raw, canonical(MV_EXPECTED_SEALED) + b"\n")
+        self.assertLessEqual(len(raw), 65536)
+
+    # -- change-record shape and vocabulary ----------------------------------
+
+    def test_market_view_change_records_shape(self):
+        # every history record is the nine-field change whitelist: no
+        # event_type key (a change record is not an event), no pos, and
+        # the rank/prev_rank rules of the four-value vocabulary
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertTrue(body["history"])
+        for item in body["history"]:
+            self.assertEqual(sorted(item),
+                             ["change_type", "data_quality", "direction",
+                              "event_id", "name", "observed_at",
+                              "prev_rank", "rank", "symbol"])
+            self.assertNotIn("event_type", item)
+            self.assertIn(item["change_type"], serve.MARKET_CHANGE_TYPES)
+            if item["change_type"] == "CANDIDATE_EXITED":
+                self.assertIsNone(item["rank"])  # honest absence, never 0
+                self.assertIsInstance(item["prev_rank"], int)
+            else:
+                self.assertIsInstance(item["rank"], int)
+                self.assertGreaterEqual(item["rank"], 1)
+        for item in body["history"]:
+            kind = item["change_type"]
+            if kind == "RANK_CHANGED":
+                self.assertLessEqual(item["rank"], 10)
+                self.assertLessEqual(item["prev_rank"], 10)
+                self.assertNotEqual(item["rank"], item["prev_rank"])
+            elif kind == "TOP10_ENTERED":
+                self.assertLessEqual(item["rank"], 10)
+                self.assertTrue(item["prev_rank"] is None
+                                or item["prev_rank"] > 10)
+            elif kind == "TOP10_EXITED":
+                self.assertLessEqual(item["prev_rank"], 10)
+                self.assertGreater(item["rank"], 10)
+
+    def test_market_view_group_records_sorted_by_evidence_position(self):
+        # within one confirmed group the records are ordered by the
+        # ledger position of the evidence event — an explicit sort, not
+        # dict iteration order: the snapshot dict visits 006660 before
+        # 008560 (group-1 insertion order), but 008560's evidence record
+        # is the earlier ledger line
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual([c["event_id"] for c in body["history"]],
+                         [ev["event_id"] for ev in
+                          (MV_G2_UP05, MV_G2_UP02, MV_G2_UP03, MV_G2_UP04,
+                           MV_G2_UP11, MV_G2_UP07, MV_G2_UP08,
+                           MV_G2_DN02X)])
+
+    def test_market_view_same_stamp_batches_merge(self):
+        # groups 3A/3B share one observed_at: one merged group whose net
+        # effect is zero — no record carries the merged stamp, and no
+        # intermediate swap is ever recorded
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertTrue(all(c["observed_at"] != MV_T3
+                            for c in body["history"]))
+        self.assertEqual(body["history"], MV_HISTORY_G2)
+
+    def test_market_view_direction_switch_is_two_records(self):
+        # 011060 leaves UP and re-enters DOWN in one group: two records,
+        # one per side — no separate switching judgment
+        self.seal_winner()
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        switch = [c for c in body["history"] if c["symbol"] == "011060"]
+        self.assertEqual(len(switch), 2)
+        up_exit, down_entry = switch
+        self.assertEqual(up_exit["change_type"], "CANDIDATE_EXITED")
+        self.assertEqual(up_exit["direction"], "UP")
+        self.assertIsNone(up_exit["rank"])
+        self.assertEqual(up_exit["prev_rank"], 9)
+        self.assertEqual(up_exit["event_id"], MV_G4_UP09X["event_id"])
+        self.assertEqual(down_entry["change_type"], "TOP10_ENTERED")
+        self.assertEqual(down_entry["direction"], "DOWN")
+        self.assertEqual(down_entry["rank"], 1)
+        self.assertIsNone(down_entry["prev_rank"])
+        self.assertEqual(down_entry["event_id"], MV_G4_DN09["event_id"])
+
+    def test_market_view_no_records_for_unchanged_or_outside(self):
+        # same-rank symbols (005930 stayed rank 1 through group 2), the
+        # TOP10-outside move 015760 15 -> 14 and the TOP10-outside exit
+        # of 012330 all record nothing
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        recorded = [c["symbol"] for c in body["history"]]
+        self.assertNotIn("015760", recorded)
+        self.assertNotIn("012330", recorded)
+        g2 = [c for c in body["history"] if c["observed_at"] == MV_T2]
+        for symbol in ("005930", "009150", "011060", "011140"):
+            self.assertNotIn(symbol, [c["symbol"] for c in g2])
+
+    def test_market_view_first_group_is_baseline_zero_changes(self):
+        # group 1 (every candidate ENTERED at MV_T1) is the comparison
+        # baseline: it records zero changes — no record in any history
+        # carries its stamp
+        self.seal_winner()
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertTrue(all(c["observed_at"] != MV_T1
+                            for c in body["history"]))
+
+    def test_market_view_history_ring_keeps_last_100(self):
+        # eleven post-group-4 swap batches (110 changes) plus the sealed
+        # scenario's 14 exceed the ring: exactly the last 100 records are
+        # served — the oldest 24 (group 2, group 4 and the first swap
+        # batch) are dropped
+        box = build_market_view_sandbox(swap_groups=11, sealed=True)
+        self.addCleanup(box.cleanup)
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        status, body, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["history"]), 100)
+        first, last = body["history"][0], body["history"][-1]
+        # first kept: the second swap batch's first record (005930 back
+        # to rank 1); last kept: the final batch's last record
+        self.assertEqual(first["symbol"], "005930")
+        self.assertEqual(first["change_type"], "RANK_CHANGED")
+        self.assertEqual((first["rank"], first["prev_rank"]), (1, 2))
+        self.assertEqual(first["observed_at"],
+                         "2026-11-09T10:26:01+09:00")
+        self.assertEqual(last["symbol"], "010060")
+        self.assertEqual((last["rank"], last["prev_rank"]), (9, 10))
+        self.assertEqual(last["observed_at"],
+                         "2026-11-09T10:35:01+09:00")
+        # the dropped window: nothing but the swap RANK_CHANGEDs remain
+        self.assertEqual({c["change_type"] for c in body["history"]},
+                         {"RANK_CHANGED"})
+        self.assertNotIn("000810", [c["symbol"] for c in body["history"]])
+        # top10 is the final live state (the last swap assignment)
+        self.assertEqual([i["symbol"] for i in body["rising_top10"]],
+                         ["008560", "005930", "007070", "006660",
+                          "009150", "008480", "009540", "011780",
+                          "010060", "011140"])
+        # the ring keeps the response inside the contract's bound
+        self.assertLessEqual(len(raw), 65536)
 
     # -- §3.7 name dictionary ----------------------------------------------
 
@@ -901,29 +1251,29 @@ class MarketViewSuite(unittest.TestCase):
         self.assertNotIn("구형이름", json.dumps(body, ensure_ascii=False))
         history_names = {item["symbol"]: item["name"]
                          for item in body["history"]}
-        self.assertEqual(history_names["005930"], "삼성전자")
         self.assertEqual(history_names["006660"], "LG전자")
         # the map entry for a symbol with no event is never projected
         self.assertNotIn("179530", history_names)
 
     def test_market_view_name_null_when_not_recorded(self):
-        # 000660 appears in events but no recorded ka10027 body ever
-        # names it: name stays null (honest absence — the app falls
-        # back to the symbol), never "" or the symbol itself
+        # 011060 appears in events (the direction switch) but no
+        # recorded ka10027 body ever names it: name stays null (honest
+        # absence — the app falls back to the symbol), never "" or the
+        # symbol itself
         _, body, _, _ = self.server.get_json("/mobile/market-view")
-        self.assertEqual(body["falling_top10"][0]["symbol"], "000660")
+        self.assertEqual(body["falling_top10"][0]["symbol"], "011060")
         self.assertIsNone(body["falling_top10"][0]["name"])
-        unnamed = [item for item in body["history"]
-                   if item["symbol"] == "000660"]
-        self.assertTrue(unnamed)
-        self.assertTrue(all(item["name"] is None for item in unnamed))
+        exited = [item for item in body["history"]
+                  if item["change_type"] == "CANDIDATE_EXITED"]
+        self.assertEqual(exited[0]["symbol"], "000810")
+        self.assertIsNone(exited[0]["name"])
 
     def test_market_view_input_torn_tail_not_folded(self):
-        # a torn (non-LF) ka10027 tail naming 000660 is not committed:
+        # a torn (non-LF) ka10027 tail naming 011060 is not committed:
         # folding it would flip the name null — the response stays the
         # committed one exactly
         torn = canonical(rest_resp_record(
-            8, ka10027_body([("000660", "SK하이닉스")])))
+            8, ka10027_body([("011060", "SK텔레콤")])))
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
             f.write(torn[: len(torn) // 2])
@@ -944,7 +1294,7 @@ class MarketViewSuite(unittest.TestCase):
     def test_market_view_name_envelope_violation_is_data_fault(self):
         # body_hex is an envelope field the recorder itself guarantees
         # (hex): a committed record violating it is corruption
-        record = rest_resp_record(8, ka10027_body([("000660", "SK하이닉스")]))
+        record = rest_resp_record(8, ka10027_body([("011060", "SK텔레콤")]))
         record["raw"]["body_hex"] = "zz" + record["raw"]["body_hex"][2:]
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
@@ -958,7 +1308,7 @@ class MarketViewSuite(unittest.TestCase):
         # recorded shape — same discipline as a candidate event
         # without rank
         record = rest_resp_record(8, {
-            "pred_pre_flu_rt_upper": [{"stk_cd": "000660"}],
+            "pred_pre_flu_rt_upper": [{"stk_cd": "011060"}],
             "return_code": 0, "return_msg": "row without a name"})
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
@@ -977,11 +1327,11 @@ class MarketViewSuite(unittest.TestCase):
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
             f.write(canonical(rest_resp_record(
-                8, ka10027_body([("000660", "SK하이닉스")]))) + b"\n")
+                8, ka10027_body([("011060", "SK텔레콤")]))) + b"\n")
         status, body, _, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status, 200)
-        self.assertEqual(body["falling_top10"][0]["symbol"], "000660")
-        self.assertEqual(body["falling_top10"][0]["name"], "SK하이닉스")
+        self.assertEqual(body["falling_top10"][0]["symbol"], "011060")
+        self.assertEqual(body["falling_top10"][0]["name"], "SK텔레콤")
         status2, body2, raw2, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status2, 200)
         self.assertEqual(body2, body)
@@ -993,7 +1343,8 @@ class MarketViewSuite(unittest.TestCase):
         # observed_at — the response is exactly the committed one
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "events.hcj.jsonl"), "ab") as f:
-            f.write(canonical(MV_DOWN_ENTERED_1)[:24])
+            f.write(canonical(mv_fact(b"torn", MV_T5, "CANDIDATE_ENTERED",
+                                      "002420", "UP", 1))[:24])
         status, body, _, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status, 200)
         self.assertEqual(body, MV_EXPECTED)

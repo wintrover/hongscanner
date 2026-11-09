@@ -20,7 +20,7 @@ Future<void> pumpTallApp(WidgetTester tester, AppStore store) async {
 
 void main() {
   testWidgets(
-    '후보 tab renders both top-10 cards; 히스토리 the candidate tail',
+    '후보 tab renders both top-10 cards; 히스토리 the change history',
     (WidgetTester tester) async {
       final store = makeStore(transport: fixtureTransport());
       await store.bootstrap();
@@ -43,16 +43,16 @@ void main() {
       expect(find.text('INCOMPLETE×1, OBSERVING×3'), findsNothing);
       expect(find.textContaining('푸시'), findsNothing);
 
-      // 히스토리 tab: the retained events in server order
-      // (oldest→newest), CANDIDATE_* only.
+      // 히스토리 tab: the retained TOP10 state-change records in server
+      // order (oldest→newest), prev rank→new rank.
       await tester.tap(find.text('히스토리'));
       await tester.pumpAndSettle();
       expect(
-          find.text('CANDIDATE_ENTERED · 삼성전자 · UP #1'), findsOneWidget);
-      expect(find.text('CANDIDATE_ENTERED · SK하이닉스 · DOWN #1'),
+          find.text('TOP10_ENTERED · 삼성전자 · UP #11→7'), findsOneWidget);
+      expect(find.text('RANK_CHANGED · SK하이닉스 · DOWN #5→2'),
           findsOneWidget);
       expect(
-          find.text('CANDIDATE_UPDATED · 삼성전자 · UP #2'), findsOneWidget);
+          find.text('TOP10_EXITED · 삼성전자 · UP #8→11'), findsOneWidget);
       // The EXITED row has no name record: symbol fallback. rank is null
       // on CANDIDATE_EXITED — honest absence, never a fake 0.
       expect(find.text('CANDIDATE_EXITED · 000660 · DOWN'), findsOneWidget);
@@ -79,7 +79,7 @@ void main() {
 
     await tester.tap(find.text('히스토리'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('CANDIDATE_ENTERED · SK하이닉스 · DOWN #1'));
+    await tester.tap(find.text('RANK_CHANGED · SK하이닉스 · DOWN #5→2'));
     await tester.pumpAndSettle();
 
     expect(store.selectedEventId, evDownEnterId);
@@ -170,10 +170,10 @@ void main() {
     expect(find.text('하락 TOP 10 기록 없음'), findsOneWidget);
     await tester.tap(find.text('히스토리'));
     await tester.pumpAndSettle();
-    expect(find.text('후보 이벤트 기록 없음'), findsOneWidget);
+    expect(find.text('변화 기록 없음'), findsOneWidget);
     // Nothing recorded, so no ranked rows anywhere.
     expect(find.text('삼성전자 (rank 1)'), findsNothing);
-    expect(find.text('CANDIDATE_ENTERED · 삼성전자 · UP #1'), findsNothing);
+    expect(find.text('TOP10_ENTERED · 삼성전자 · UP #11→7'), findsNothing);
     expect(find.textContaining('#0'), findsNothing);
   });
 

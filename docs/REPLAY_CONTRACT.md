@@ -524,7 +524,12 @@ Events are produced by exactly one deterministic function,
 paths. Separate live/replay event code is contractually forbidden: a second
 judgment path would be a second definition of the facts. Delivery and
 notification code may filter, order or translate events for transport; it
-may never judge, upgrade, or rewrite them.
+may never judge, upgrade, or rewrite them. Read-only presentation
+projections may additionally derive deterministic display views by
+comparing recorded states (e.g. the market-view change history, tools/api
+README §3.7); such views are not events, mint no ids of their own, never
+enter a journal, and never flow back into a fact, an id, or a judgment
+(§13.5).
 
 ### 13.2 Record-first (write-ahead judgment)
 
