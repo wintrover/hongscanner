@@ -149,6 +149,22 @@ def embedded_return_code(return_msg):
     return int(match.group(1) or match.group(2))
 
 
+def ws_payload_bytes(raw):
+    """One websockets recv() result as the opaque bytes the forwarding
+    contract (README §3.3) requires. websockets has had no recv(decode=)
+    argument since 8.0: a text frame arrives as str, a binary frame as
+    bytes, and Kiwoom's wire is JSON text frames — so the str branch is
+    the measured path (2026-11-09 live session: recv(decode=False) raised
+    TypeError on both websockets 10.4 and 17.3, an UNVERIFIED §12 item
+    that only the live wire could measure)."""
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    if isinstance(raw, str):
+        return raw.encode("utf-8")
+    raise TypeError("ws recv() returned %s, expected str or bytes"
+                    % type(raw).__name__)
+
+
 class SidecarExit(Exception):
     """Clean shutdown with an exit code (0 normal, 3 token, 4 internal)."""
 
@@ -575,8 +591,8 @@ class Sidecar:
                     ensure_ascii=False, separators=(",", ":")))
                 while True:
                     raw = await asyncio.wait_for(
-                        ws.recv(decode=False), timeout=self.ack_timeout)
-                    data = bytes(raw)
+                        ws.recv(), timeout=self.ack_timeout)
+                    data = ws_payload_bytes(raw)
                     await self.forward(data, self.conn_gen + 1)
                     try:
                         doc = json.loads(data.decode("utf-8"))
@@ -638,8 +654,8 @@ class Sidecar:
         import websockets
         try:
             while True:
-                raw = await ws.recv(decode=False)
-                data = bytes(raw)
+                raw = await ws.recv()
+                data = ws_payload_bytes(raw)
                 await self.forward(data, gen)
                 if data.strip() == b"PING":
                     self.send_text(ws, data.decode("utf-8"))
