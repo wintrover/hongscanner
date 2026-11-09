@@ -82,7 +82,11 @@ python3.13 tools/api/serve.py \
   (존재하지 않는 --runs, 포트 범위 위반, --bind 거부), 4 = 바인드
   실패. 실패를 exit 0으로 꾸미는 경로는 없다.
 - 데이터는 요청마다 파일에서 다시 읽는다: 상태 캐시가 없고, 서버
-  재시작 없이 ledger·런 디렉터리의 갱신이 응답에 반영된다.
+  재시작 없이 ledger·런 디렉터리의 갱신이 응답에 반영된다. **유일한
+  예외는 §3.7의 종목명 사전이다**: 입력 바이트의 순수 파생(기록된
+  ka10027 본문의 stk_nm)이라 (path, size, mtime_ns) 키로 프로세스 내
+  메모이제이션된다(§3.7의 게시 조건·한계 참조). 이벤트 폴드와 응답
+  본체는 여전히 매 요청 재계산이다.
 
 ## 2. JSON 규약
 
@@ -281,11 +285,13 @@ runs 루트의 **디렉터리만**, 이름 오름차순으로:
    (수집기 자체 검증 형상)이다.
 
 config 레코드 읽기는 유계다: input.hcj.jsonl 전체(개장 중 하루 종일
-커지는 파일)는 절대 읽지 않고 **첫 16 KiB 윈도**만 읽고, 그 안의
-LF-종단 커밋 라인(비-LF 꼬리는 §0 규약대로 미커밋으로 건너뛴다)에서
+커지는 파일)는 **여기서는** 절대 읽지 않고 **첫 16 KiB 윈도**만 읽고,
+그 안의 LF-종단 커밋 라인(비-LF 꼬리는 §0 규약대로 미커밋으로 건너뛴다)에서
 첫 `kind:"config"` 레코드까지만 파싱한다. 파싱한 커밋 라인이 불량
 JSON·빈 줄이면 DataFault(§4). 창 안에 config 레코드가 없으면 그 런은
-비적격이다 — 부재는 부재로 서빙한다.
+비적격이다 — 부재는 부재로 서빙한다. **예외**: 아래의 종목명 사전 폴드는
+같은 파일을 전체 스캔한다(그 규칙과 메모이제이션이 이 절의 전체-입력
+읽기 유일 예외다).
 
 **선택(결정적 3단계)** — 적격 런들 중 (1) `session_date` 최대(사전식),
 (2) 동률이면 그 런의 `events.hcj.jsonl` **마지막 커밋 이벤트의
@@ -312,21 +318,59 @@ last-record-wins: `CANDIDATE_ENTERED`/`CANDIDATE_UPDATED`는
 data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
 정수 rank)의 커밋된 기록이 형상을 벗어나면 DataFault다.
 
+**종목명 사전(name) 폴드** — 아이템의 8번째 필드 `name`은 선택된 런의
+`input.hcj.jsonl`에 기록된 ka10027 응답 본문에서 온다(serve-time 벤더
+호출 없음 — 기록된 바이트만). 규칙:
+
+1. **스캔 범위**: 같은 파일의 config 판정(첫 16 KiB)과 달리 이 폴드가
+   input.hcj.jsonl **전체**를 라인 스트림으로 훑는다 — 이 문서의 유일한
+   전체-입력 읽기 예외다. 라인 규약은 §0와 같다: 비-LF 꼬리는
+   미커밋이라 스캔을 멈추고, 커밋된 라인이 불량 JSON·빈 줄이면
+   DataFault. 대상 레코드는 `kind:"rest_resp"`·`raw.api_id:"ka10027"`
+   둘 다 만족하는 것뿐(ka10080 등 다른 레코드는 스캔만 하고 이름
+   원천으로 안 쓴다).
+2. **레코더가 보장하는 인벨로프**(`raw` 객체·문자열 api_id·hex
+   body_hex)가 깨진 커밋 레코드는 오염이다 — DataFault, 조용한 스킵
+   없음. **본문 내용은 레코더가 보장하지 않는다**(성공·실패 응답을
+   원문 그대로 보존): 본문이 JSON 객체로 디코드되지 않거나 순위 리스트
+   키(`pred_pre_flu_rt_upper`)가 없으면 그 레코드는 이름을 기여하지
+   않는다 — 기록된 비성공 응답에는 접을 순위가 없다(부재 서빙).
+   디코드된 리스트의 각 행은 객체·문자열 `stk_cd`·문자열 `stk_nm`이어야
+   한다 — 폴드가 의존하는 기록 형상이므로 위반은 DataFault(이벤트
+   폴드의 symbol·rank 규율과 같다).
+3. **맵 규칙**: `stk_cd → stk_nm`, **파일 순서 최신 승리**. 이벤트
+   심볼이 사전에 없으면 `name: null`(기록 부재 — 앱이 심볼로
+   폴백한다). 사전의 심볼이 이벤트에 없어도 응답에 나오지 않는다.
+4. **메모이제이션**(§1의 유일한 캐시 예외): 사전은 기록 바이트의 순수
+   파생이라 프로세스 내에 캐시된다. 키는 **(path, size, mtime_ns)** —
+   실용적 무효화 키이지 암호학적 지문이 아니다(같은 size·mtime_ns를
+   회복하는 재작성은 스테일 서빙). **스캔 전후 stat이 일치할 때만
+   게시**한다: 읽는 동안 파일이 바뀌면 접힌 결과(일관된 프리픽스)는
+   서빙되지만 캐시되지 않는다. 슬롯은 1개(직전 게시분)라 선택 규칙이
+   다른 런을 고르면 재스캔한다. DataFault는 캐시되지 않는다 — 불량
+   파일은 고칠 때까지 매 요청 500이다. **개장 중 최악 비용**: 실거래
+   세션의 input.hcj.jsonl은 상시 증가해 stat이 계속 바뀌므로 캐시가
+   자주 무효화되고 요청마다 전체 스캔을 지불할 수 있다(실측 기준
+   1.4 GiB 파일 약 4~7초, 스트리밍이라 메모리는 라인 1개 수준).
+
 ```json
 {
  "as_of": "2026-11-09T13:45:58+09:00",
  "falling_top10": [ {"data_quality": "OBSERVING", "direction": "DOWN",
                      "event_id": "…", "event_type": "CANDIDATE_UPDATED",
-                     "observed_at": "…", "rank": 2, "symbol": "000660"} ],
+                     "name": "SK하이닉스", "observed_at": "…",
+                     "rank": 2, "symbol": "000660"} ],
  "history": [ {"data_quality": "OBSERVING", "direction": "UP",
                "event_id": "…", "event_type": "CANDIDATE_ENTERED",
-               "observed_at": "…", "rank": 1, "symbol": "005930"}, … ],
+               "name": "삼성전자", "observed_at": "…", "rank": 1,
+               "symbol": "005930"}, … ],
  "latest": {"data_quality": "INCOMPLETE", "event_id": "…",
             "event_type": "SUBSCRIPTION_TRUNCATED",
             "observed_at": "…"},
  "rising_top10": [ {"data_quality": "OBSERVING", "direction": "UP",
                     "event_id": "…", "event_type": "CANDIDATE_ENTERED",
-                    "observed_at": "…", "rank": 3, "symbol": "006660"}, … ],
+                    "name": "LG전자", "observed_at": "…", "rank": 3,
+                    "symbol": "006660"}, … ],
  "run": {"environment": "demo", "run_id": "fidelity-…-v4",
          "session": "fidelity-…-v4", "session_date": "2026-11-09"},
  "runs_present": true,
@@ -334,14 +378,17 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
 }
 ```
 
-- **아이템(top10·history 공용)은 화이트리스트 7 필드**: data_quality·
-  direction·event_id·event_type·observed_at·rank·symbol. 후보 전이
-  이외의 기록 필드(rule_id·severity·evidence_ref·…)는 투영되지
-  않는다. `CANDIDATE_EXITED` history 아이템의 `rank`는 **null**이다
-  (기록 부재, 0이 아니다 — §2). 아이템 수는 최대 120(10+10+100)이고
-  필드가 기록 형상(이벤트 스키마의 enum·고정 패턴·6자리 심볼)으로
-  유계라 **응답 크기는 계약상 64 KiB를 넘지 않는다** — 모바일 규모의
-  단일 응답이다(§7).
+- **아이템(top10·history 공용)은 화이트리스트 8 필드**: data_quality·
+  direction·event_id·event_type·**name**·observed_at·rank·symbol.
+  `name`을 뺀 7필드는 이벤트 기록에서, `name`은 위 종목명 사전에서 온다.
+  후보 전이 이외의 기록 필드(rule_id·severity·evidence_ref·…)는
+  투영되지 않는다. `CANDIDATE_EXITED` history 아이템의 `rank`는 **null**이
+  고 심볼이 사전에 없는 아이템의 `name`도 **null**이다(기록 부재,
+  0이나 빈 문자열이 아니다 — §2). 아이템 수는 최대 120(10+10+100)이고
+  필드가 기록 형상(이벤트 스키마의 enum·고정 패턴·6자리 심볼, 그리고
+  벤더가 기록한 stk_nm 문자열)으로 유계라 **응답 크기는 계약상 64 KiB를
+  넘지 않는다** — 모바일 규모의 단일 응답이다(§7). 실측(2026-11-09
+  demo-v4, 이름 120/120 부착): 30,954 바이트.
 - **빈 상태**: runs 루트에 디렉터리가 없으면 `runs_present:false`·
   `run:null`·나머지 전부 null/빈 배열·`status:null`. 디렉터리는
   있어도 적격 런이 없으면 `runs_present:true`에 같은 null/빈값.
@@ -403,7 +450,9 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
   비밀·은닉 필드 비노출, 기동 fail-closed(미지 --runs·포트 범위·미지
   옵션), SIGTERM 종료 코드 0, --bind 계약(127.0.0.2 기동 시 SERVE 줄과
   리스너 단언, 0.0.0.0 인자 검증 수용, 멀티캐스트·브로드캐스트·예약
-  블록·비IPv4 문자열의 exit 2 거부).
+  블록·비IPv4 문자열의 exit 2 거부), §3.7 종목명(ka10027 사전 fold —
+  최신 승리·불량 라인·인벨로프 위반 DataFault·비성공 본문 부재 서빙,
+  name null 폴백, (path, size, mtime_ns) 캐시 히트·무효화).
 - 인터프리터 해석 순서는 collector·notify 스위트와 같다:
   `$HSCOLLECTOR_PYTHON` → `python3.13` → `uv python find 3.13`.
 - 게이트: `bash tools/run_tests.sh`에 등록된 스위트(`run bash
@@ -418,6 +467,9 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1 이상
   모바일 규모의 답은 이미 계약돼 있다: §3.7의 유계 투영(아이템 수·
   필드가 유계라 응답 ≤ 64 KiB)이다. 다른 라우트의 페이지네이션은
   계속 유예다.
-- 캐시·ETag·압축 — 없다(기록 재독이 권위다).
+- 캐시·ETag·압축 — 없다(기록 재독이 권위다). **유일한 예외**: §3.7의
+  종목명 사전은 기록 바이트의 순수 파생이라 (path, size, mtime_ns) 키로
+  프로세스 내 메모이제이션된다(§1·§3.7의 게시 조건과 한계 참조). ETag·
+  압축은 여전히 없다.
 - 데몬화·systemd·자동 기동·헬스체크 인프라 — 명시적 시작만 계약이다.
 - 판정·replay·verify 실행 — 이 프로세스의 역할이 영원히 아니다.

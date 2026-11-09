@@ -2,10 +2,10 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 
 import 'api/api_client.dart';
+import 'app_routes.dart';
 import 'firebase_options.dart';
 import 'screens/app_scope.dart';
 import 'screens/auth_dialog.dart';
-import 'screens/event_detail_screen.dart';
 import 'screens/market_view_screen.dart';
 import 'services/fcm_push_service.dart';
 import 'services/push_service.dart';
@@ -56,6 +56,7 @@ class _HongScannerAppState extends State<HongScannerApp> {
       store: _store,
       child: MaterialApp(
         title: 'Hong Scanner',
+        navigatorKey: navigatorKey,
         theme: ThemeData(
           colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
         ),
@@ -84,7 +85,7 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
 
   static const _screens = <Widget>[
     MarketViewScreen(),
-    EventDetailScreen(),
+    HistoryScreen(),
   ];
 
   @override
@@ -98,6 +99,10 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
         onForegroundMessage: _showForegroundBanner,
         onUnauthorized: () => _reenterCredentials(store),
       );
+      // A cold-start tap can route before the navigator exists (the store
+      // may be bootstrapped ahead of the first frame); the deferred route
+      // flushes here, once the navigator is guaranteed to be mounted.
+      store.flushPendingEvent();
     });
   }
 
@@ -173,14 +178,14 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
         onDestinationSelected: store.selectTab,
         destinations: const [
           NavigationDestination(
-            icon: Icon(Icons.dashboard_outlined),
-            selectedIcon: Icon(Icons.dashboard),
-            label: 'Market View',
+            icon: Icon(Icons.leaderboard_outlined),
+            selectedIcon: Icon(Icons.leaderboard),
+            label: '후보',
           ),
           NavigationDestination(
-            icon: Icon(Icons.article_outlined),
-            selectedIcon: Icon(Icons.article),
-            label: 'Event Detail',
+            icon: Icon(Icons.history),
+            selectedIcon: Icon(Icons.history),
+            label: '히스토리',
           ),
         ],
       ),

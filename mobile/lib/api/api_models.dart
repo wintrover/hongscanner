@@ -109,6 +109,7 @@ class MarketViewItem {
     this.direction,
     this.eventId,
     this.eventType,
+    this.name,
     this.observedAt,
     this.rank,
     this.symbol,
@@ -119,6 +120,7 @@ class MarketViewItem {
         direction: _asString(raw['direction']),
         eventId: _asString(raw['event_id']),
         eventType: _asString(raw['event_type']),
+        name: _asString(raw['name']),
         observedAt: _asString(raw['observed_at']),
         rank: _asInt(raw['rank']),
         symbol: _asString(raw['symbol']),
@@ -128,6 +130,11 @@ class MarketViewItem {
   final String? direction;
   final String? eventId;
   final String? eventType;
+
+  /// Recorded stock name; null when the ledger has no name record —
+  /// honest absence, displayed as the symbol fallback.
+  final String? name;
+
   final String? observedAt;
 
   /// Candidate rank; null on CANDIDATE_EXITED history items — honest

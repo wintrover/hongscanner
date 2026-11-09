@@ -29,6 +29,11 @@ from urllib.error import HTTPError
 SERVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.py")
 PY = sys.executable
 
+# The module under unit test for the §3.7 name-dictionary fold (pure
+# function + memoization behavior — endpoint bytes stay black-box).
+sys.path.insert(0, os.path.dirname(SERVE))
+import serve  # noqa: E402
+
 SECRET = "SUPERSECRET-VALUE-NEVER-SERVE"
 HIDDEN_HOST = "hidden-host-internal"
 HIDDEN_EGRESS = "203.0.113.7"
@@ -173,26 +178,83 @@ MV_WINNER_EVENTS = [MV_UP_ENTERED_1, MV_UP_UPDATED_1, MV_UP_ENTERED_2,
                     MV_UP_EXITED_2, MV_UP_REENTERED_2, MV_DOWN_ENTERED_1,
                     MV_DOWN_UPDATED_1, MV_INCOMPLETE_SUB]
 
+# -- §3.7 name dictionary fixtures: ka10027 rest_resp records in the
+# winner's input.hcj.jsonl, with the recorder's envelope shape. The
+# recorded bodies exercise every fold rule: an error body without the
+# ranking list (no names — absence served), a first page whose 006660
+# name is later superseded (file order, last record wins), a ka10080
+# record (scanned, never a name source), and a symbol (000660) no
+# recorded body ever names (name null — the app falls back to the
+# symbol).
 
-def mv_item(ev):
-    """The §3.7 item whitelist of a fixture fact: seven fields, rank
-    null when the fact records none (CANDIDATE_EXITED)."""
+MV_KA10027_QUERY = {"crd_cnd": "0", "mrkt_tp": "000", "pric_cnd": "0",
+                    "sort_tp": "1", "stk_cnd": "16", "stex_tp": "1",
+                    "trde_prica_cnd": "0", "trde_qty_cnd": "0000",
+                    "updown_incls": "1"}
+
+
+def rest_resp_record(seq, body_obj, api_id="ka10027", page=1, status=200):
+    return {"kind": "rest_resp",
+            "raw": {"api_id": api_id,
+                    "body_hex": canonical(body_obj).hex(),
+                    "cont_yn": "N", "next_key": "", "page": page,
+                    "query": dict(MV_KA10027_QUERY), "status": status},
+            "seq": seq}
+
+
+def ka10027_body(rows):
+    return {"pred_pre_flu_rt_upper": [{"stk_cd": cd, "stk_nm": nm}
+                                       for cd, nm in rows],
+            "return_code": 0, "return_msg": "정상처리 되었습니다."}
+
+
+MV_ERROR_BODY = {"return_code": 5,
+                 "return_msg": "허용된 요청 개수를 초과하였습니다"}
+MV_KA10080_BODY = {"return_code": 0, "return_msg": "정상처리 되었습니다.",
+                   "stk_min_pole_chart_qry": [{"cur_prc": "+1000",
+                                               "trde_qty": "100"}]}
+
+MV_WINNER_INPUT = [
+    rest_resp_record(3, MV_ERROR_BODY, status=429),
+    rest_resp_record(4, ka10027_body([("005930", "삼성전자"),
+                                      ("006660", "구형이름")])),
+    rest_resp_record(5, MV_KA10080_BODY, api_id="ka10080"),
+    rest_resp_record(6, ka10027_body([("006660", "LG전자"),
+                                      ("179530", "애드바이오텍")]), page=2),
+    {"kind": "ws_frame", "raw": {"price": 10000, "symbol": "005930"},
+     "seq": 7},
+]
+
+# The folded dictionary the winner's input must project: latest record
+# wins for 006660, the error and ka10080 bodies contribute nothing, and
+# 000660 is never named.
+MV_NAME_MAP = {"005930": "삼성전자", "006660": "LG전자"}
+
+
+def mv_item(ev, names=None):
+    """The §3.7 item whitelist of a fixture fact: eight fields — seven
+    recorded plus `name` from the fixture's folded ka10027 dictionary
+    (None when no recorded body names the symbol — the fail-closed
+    fallback), rank null when the fact records none
+    (CANDIDATE_EXITED)."""
     item = {k: ev[k] for k in ("data_quality", "direction", "event_id",
                                "event_type", "observed_at", "symbol")}
     item["rank"] = ev.get("rank")
+    item["name"] = (names or {}).get(ev["symbol"])
     return item
 
 
 MV_EXPECTED = {
     "as_of": "2026-11-09T10:00:08+09:00",
-    "falling_top10": [mv_item(MV_DOWN_UPDATED_1)],
-    "history": [mv_item(ev) for ev in MV_WINNER_EVENTS
+    "falling_top10": [mv_item(MV_DOWN_UPDATED_1, MV_NAME_MAP)],
+    "history": [mv_item(ev, MV_NAME_MAP) for ev in MV_WINNER_EVENTS
                 if ev["event_type"].startswith("CANDIDATE_")],
     "latest": {"data_quality": "INCOMPLETE",
                "event_id": MV_INCOMPLETE_SUB["event_id"],
                "event_type": "SUBSCRIPTION_TRUNCATED",
                "observed_at": "2026-11-09T10:00:08+09:00"},
-    "rising_top10": [mv_item(MV_UP_REENTERED_2), mv_item(MV_UP_UPDATED_1)],
+    "rising_top10": [mv_item(MV_UP_REENTERED_2, MV_NAME_MAP),
+                     mv_item(MV_UP_UPDATED_1, MV_NAME_MAP)],
     "run": {"environment": "demo", "run_id": MV_WINNER,
             "session": MV_WINNER, "session_date": "2026-11-09"},
     "runs_present": True,
@@ -322,17 +384,18 @@ def build_market_view_sandbox():
     subdirectory (drill-like)."""
     box = Sandbox()
 
-    def write_market_run(name, config, events):
+    def write_market_run(name, config, events, input_extra=()):
         run_dir = box.session_dir(name)
         box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
             {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
-            {"kind": "config", "raw": config, "seq": 2}))
+            {"kind": "config", "raw": config, "seq": 2},
+            *input_extra))
         box.write(os.path.join(run_dir, "events.hcj.jsonl"), jsonl(*events))
 
     write_market_run(MV_WINNER,
                      {"environment": "demo", "run_id": MV_WINNER,
                       "session_date": "2026-11-09"},
-                     MV_WINNER_EVENTS)
+                     MV_WINNER_EVENTS, MV_WINNER_INPUT)
     write_market_run("market-2026-11-09-z",
                      {"environment": "demo", "session_date": "2026-11-09"},
                      [event_fact(b"mv-old-same", "CANDIDATE_ENTERED",
@@ -823,6 +886,107 @@ class MarketViewSuite(unittest.TestCase):
                             for item in body["history"]
                             if item["event_type"] != "CANDIDATE_EXITED"))
 
+    # -- §3.7 name dictionary ----------------------------------------------
+
+    def test_market_view_name_projection(self):
+        # names come from the recorded ka10027 bodies of the selected
+        # run only: latest record wins (006660 was renamed mid-run), an
+        # error body without the ranking list contributes nothing, and
+        # a ka10080 record is never a name source
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        names = {item["symbol"]: item["name"]
+                 for item in body["rising_top10"] + body["falling_top10"]}
+        self.assertEqual(names["005930"], "삼성전자")
+        self.assertEqual(names["006660"], "LG전자")  # supersedes 구형이름
+        self.assertNotIn("구형이름", json.dumps(body, ensure_ascii=False))
+        history_names = {item["symbol"]: item["name"]
+                         for item in body["history"]}
+        self.assertEqual(history_names["005930"], "삼성전자")
+        self.assertEqual(history_names["006660"], "LG전자")
+        # the map entry for a symbol with no event is never projected
+        self.assertNotIn("179530", history_names)
+
+    def test_market_view_name_null_when_not_recorded(self):
+        # 000660 appears in events but no recorded ka10027 body ever
+        # names it: name stays null (honest absence — the app falls
+        # back to the symbol), never "" or the symbol itself
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(body["falling_top10"][0]["symbol"], "000660")
+        self.assertIsNone(body["falling_top10"][0]["name"])
+        unnamed = [item for item in body["history"]
+                   if item["symbol"] == "000660"]
+        self.assertTrue(unnamed)
+        self.assertTrue(all(item["name"] is None for item in unnamed))
+
+    def test_market_view_input_torn_tail_not_folded(self):
+        # a torn (non-LF) ka10027 tail naming 000660 is not committed:
+        # folding it would flip the name null — the response stays the
+        # committed one exactly
+        torn = canonical(rest_resp_record(
+            8, ka10027_body([("000660", "SK하이닉스")])))
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "input.hcj.jsonl"), "ab") as f:
+            f.write(torn[: len(torn) // 2])
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, MV_EXPECTED)
+
+    def test_market_view_malformed_input_line_is_data_fault(self):
+        # a committed but malformed input line is corruption, not a
+        # skip — the name fold reads the same committed-lines rule
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "input.hcj.jsonl"), "ab") as f:
+            f.write(b"{not json}\n")
+        status, _, raw, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+
+    def test_market_view_name_envelope_violation_is_data_fault(self):
+        # body_hex is an envelope field the recorder itself guarantees
+        # (hex): a committed record violating it is corruption
+        record = rest_resp_record(8, ka10027_body([("000660", "SK하이닉스")]))
+        record["raw"]["body_hex"] = "zz" + record["raw"]["body_hex"][2:]
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "input.hcj.jsonl"), "ab") as f:
+            f.write(canonical(record) + b"\n")
+        status, _, raw, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+
+    def test_market_view_name_row_violation_is_data_fault(self):
+        # a ranking row missing stk_nm violates the fold's dependent
+        # recorded shape — same discipline as a candidate event
+        # without rank
+        record = rest_resp_record(8, {
+            "pred_pre_flu_rt_upper": [{"stk_cd": "000660"}],
+            "return_code": 0, "return_msg": "row without a name"})
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "input.hcj.jsonl"), "ab") as f:
+            f.write(canonical(record) + b"\n")
+        status, _, raw, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+
+    def test_market_view_name_rescan_on_file_change(self):
+        # the memoization key is (path, size, mtime_ns): appending a
+        # committed ka10027 record changes the file, so the next
+        # request — same server, no restart — rescans and serves the
+        # newly recorded name; the request after that is stable
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertIsNone(body["falling_top10"][0]["name"])
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "input.hcj.jsonl"), "ab") as f:
+            f.write(canonical(rest_resp_record(
+                8, ka10027_body([("000660", "SK하이닉스")]))) + b"\n")
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["falling_top10"][0]["symbol"], "000660")
+        self.assertEqual(body["falling_top10"][0]["name"], "SK하이닉스")
+        status2, body2, raw2, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, body)
+        self.assertEqual(raw2, self.server.get("/mobile/market-view")[1])
+
     def test_market_view_torn_tail_is_not_committed(self):
         # the concurrently-appending shape: a torn (non-LF) tail record
         # is not folded, not in history, and not the selection's last
@@ -914,6 +1078,143 @@ class MarketViewEmptySuite(unittest.TestCase):
                     "session_date": "2026-11-09"},
             "runs_present": True,
             "status": {"by_data_quality": {}}})
+
+
+class MarketNameFoldSuite(unittest.TestCase):
+    """Unit contract of the §3.7 name dictionary: fold_market_names
+    (pure function over recorded bytes) and the Projector's
+    (path, size, mtime_ns) memoization. These are function- and
+    cache-behavior facts the endpoint bytes cannot observe directly
+    (a rescan is byte-identical to a hit); endpoint projection stays
+    black-box in MarketViewSuite."""
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.runs = self.box.runs
+
+    def write_input(self, *records, torn=b""):
+        run_dir = self.box.session_dir("market-2026-11-09-n")
+        self.box.write(os.path.join(run_dir, "input.hcj.jsonl"),
+                       jsonl(*records) + torn)
+        return os.path.join(run_dir, "input.hcj.jsonl")
+
+    def test_fold_latest_wins_and_skips(self):
+        path = self.write_input(
+            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+            rest_resp_record(2, MV_ERROR_BODY, status=429),
+            rest_resp_record(3, ka10027_body([("005930", "삼성전자"),
+                                              ("006660", "구형이름")])),
+            rest_resp_record(4, MV_KA10080_BODY, api_id="ka10080"),
+            rest_resp_record(5, ka10027_body([("006660", "LG전자")]),
+                             page=2),
+            {"kind": "ws_frame", "raw": {"price": 1}, "seq": 6},
+            # a non-object body: recorded verbatim, no ranking to fold
+            rest_resp_record(7, {"body": "not-a-ranking"}),
+            torn=canonical(rest_resp_record(
+                8, ka10027_body([("000660", "SK하이닉스")])))
+                [:40])  # torn tail: not committed, never folded
+        self.assertEqual(serve.fold_market_names(path),
+                         {"005930": "삼성전자", "006660": "LG전자"})
+
+    def test_fold_absent_and_empty_input(self):
+        self.assertEqual(serve.fold_market_names(
+            os.path.join(self.runs, "no-such-run", "input.hcj.jsonl")), {})
+        path = self.write_input()
+        self.assertEqual(serve.fold_market_names(path), {})
+
+    def test_fold_non_json_body_contributes_nothing(self):
+        # error bodies preserved verbatim (text, empty) are legitimately
+        # recorded and carry no ranking: absence, never a fault
+        raw_body = {"kind": "rest_resp",
+                    "raw": {"api_id": "ka10027",
+                            "body_hex": b"Bad Gateway".hex(),
+                            "cont_yn": "", "next_key": "", "page": 1,
+                            "query": dict(MV_KA10027_QUERY),
+                            "status": 502}, "seq": 4}
+        path = self.write_input(
+            rest_resp_record(2, "plain 429 text", status=429),
+            rest_resp_record(3, {"return_code": 5}, status=429),
+            raw_body)
+        self.assertEqual(serve.fold_market_names(path), {})
+
+    def test_fold_malformed_committed_line_is_data_fault(self):
+        path = self.write_input(
+            rest_resp_record(2, ka10027_body([("005930", "삼성전자")])))
+        with open(path, "ab") as f:
+            f.write(b"{not json}\n")
+        with self.assertRaises(serve.DataFault):
+            serve.fold_market_names(path)
+
+    def test_fold_envelope_violations_are_data_fault(self):
+        bad_raw = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        bad_raw["raw"] = "not-an-object"
+        bad_api = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        bad_api["raw"]["api_id"] = 10027
+        bad_hex = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        bad_hex["raw"]["body_hex"] = "zz"
+        no_hex = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        del no_hex["raw"]["body_hex"]
+        for label, record in (("raw", bad_raw), ("api_id", bad_api),
+                              ("hex", bad_hex), ("no body_hex", no_hex)):
+            path = self.write_input(record)
+            with self.assertRaises(serve.DataFault, msg=label):
+                serve.fold_market_names(path)
+
+    def test_fold_row_violation_is_data_fault(self):
+        for label, rows in (("row not object", ["005930"]),
+                            ("no stk_nm", [{"stk_cd": "005930"}]),
+                            ("no stk_cd", [{"stk_nm": "삼성전자"}]),
+                            ("non-string", [{"stk_cd": 59530,
+                                             "stk_nm": "삼성전자"}])):
+            path = self.write_input(rest_resp_record(2, {
+                "pred_pre_flu_rt_upper": rows,
+                "return_code": 0, "return_msg": label}))
+            with self.assertRaises(serve.DataFault, msg=label):
+                serve.fold_market_names(path)
+
+    def test_names_cache_hit_and_invalidation(self):
+        # same (path, size, mtime_ns) -> no rescan; a committed append
+        # changes the stat -> rescan serves the new recorded name
+        path = self.write_input(
+            rest_resp_record(2, ka10027_body([("005930", "삼성전자")])))
+        projector = serve.Projector(self.runs, self.box.ledger)
+        calls = []
+        real_fold = serve.fold_market_names
+
+        def counting_fold(p):
+            calls.append(p)
+            return real_fold(p)
+        serve.fold_market_names = counting_fold
+        self.addCleanup(setattr, serve, "fold_market_names", real_fold)
+        first = projector._market_names(path)
+        self.assertEqual(first, {"005930": "삼성전자"})
+        self.assertEqual(len(calls), 1)
+        # identical stat: served from the cache, fold not re-entered
+        self.assertEqual(projector._market_names(path), first)
+        self.assertEqual(len(calls), 1)
+        # a committed append changes size: rescan, new name served
+        with open(path, "ab") as f:
+            f.write(canonical(rest_resp_record(
+                3, ka10027_body([("006660", "LG전자")]))) + b"\n")
+        second = projector._market_names(path)
+        self.assertEqual(second, {"005930": "삼성전자", "006660": "LG전자"})
+        self.assertEqual(len(calls), 2)
+
+    def test_names_cache_not_published_for_absent_file(self):
+        # a vanished input folds to {} and publishes nothing: a later
+        # re-created file must be scanned, not served stale
+        path = self.write_input(
+            rest_resp_record(2, ka10027_body([("005930", "삼성전자")])))
+        projector = serve.Projector(self.runs, self.box.ledger)
+        self.assertEqual(projector._market_names(path),
+                         {"005930": "삼성전자"})
+        os.remove(path)
+        self.assertEqual(projector._market_names(path), {})
+        self.write_input(rest_resp_record(
+            2, ka10027_body([("006660", "LG전자")])))
+        self.assertEqual(projector._market_names(path),
+                         {"006660": "LG전자"})
 
 
 class TornLedgerSuite(unittest.TestCase):

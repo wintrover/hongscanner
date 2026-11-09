@@ -94,8 +94,9 @@ final Map<String, Object?> fixtureDeliveryRecord = {
 };
 
 /// One `/mobile/market-view` item: exactly the frozen item fields. When
-/// [rank] is null the key is present with a JSON null — the contract's
-/// honest-absence shape for CANDIDATE_EXITED history items.
+/// [rank] or [name] is null the key is present with a JSON null — the
+/// contract's honest-absence shape (CANDIDATE_EXITED history rows carry no
+/// rank; a ledger without a name record carries no name).
 Map<String, Object?> fixtureMarketItem(
   String eventId, {
   required String eventType,
@@ -104,12 +105,14 @@ Map<String, Object?> fixtureMarketItem(
   int? rank,
   String symbol = '005930',
   String dataQuality = 'OBSERVING',
+  String? name,
 }) =>
     {
       'data_quality': dataQuality,
       'direction': direction,
       'event_id': eventId,
       'event_type': eventType,
+      'name': name,
       'observed_at': observedAt,
       'rank': rank,
       'symbol': symbol,
@@ -119,6 +122,8 @@ Map<String, Object?> fixtureMarketItem(
 /// renders — rising/falling top 10 in ascending rank, the retained
 /// candidate history (oldest→newest, rank null on the EXITED row), and
 /// the run/as_of context. Same synthetic world as the ledger fixtures.
+/// Stock names are the real KRX names for the synthetic symbols; the
+/// CANDIDATE_EXITED row has no name record (symbol-fallback coverage).
 final Map<String, Object?> fixtureMarketView = {
   'as_of': '2026-11-02T15:30:58+09:00',
   'falling_top10': [
@@ -127,7 +132,8 @@ final Map<String, Object?> fixtureMarketView = {
         observedAt: '2026-11-02T09:01:12+09:00',
         direction: 'DOWN',
         rank: 1,
-        symbol: '000660'),
+        symbol: '000660',
+        name: 'SK하이닉스'),
   ],
   'history': [
     fixtureMarketItem(evUpEnterId,
@@ -135,26 +141,30 @@ final Map<String, Object?> fixtureMarketView = {
         observedAt: '2026-11-02T09:00:05+09:00',
         direction: 'UP',
         rank: 1,
-        symbol: '005930'),
+        symbol: '005930',
+        name: '삼성전자'),
     fixtureMarketItem(evDownEnterId,
         eventType: 'CANDIDATE_ENTERED',
         observedAt: '2026-11-02T09:01:12+09:00',
         direction: 'DOWN',
         rank: 1,
-        symbol: '000660'),
+        symbol: '000660',
+        name: 'SK하이닉스'),
     fixtureMarketItem(evUpUpdateId,
         eventType: 'CANDIDATE_UPDATED',
         observedAt: '2026-11-02T09:02:41+09:00',
         direction: 'UP',
         rank: 2,
-        symbol: '005930'),
+        symbol: '005930',
+        name: '삼성전자'),
     fixtureMarketItem(evDownExitId,
         eventType: 'CANDIDATE_EXITED',
         observedAt: '2026-11-02T09:03:30+09:00',
         direction: 'DOWN',
         rank: null,
         symbol: '000660',
-        dataQuality: 'INCOMPLETE'),
+        dataQuality: 'INCOMPLETE',
+        name: null),
   ],
   'latest': {
     'data_quality': 'INCOMPLETE',
@@ -168,13 +178,15 @@ final Map<String, Object?> fixtureMarketView = {
         observedAt: '2026-11-02T09:00:05+09:00',
         direction: 'UP',
         rank: 1,
-        symbol: '005930'),
+        symbol: '005930',
+        name: '삼성전자'),
     fixtureMarketItem(evUpUpdateId,
         eventType: 'CANDIDATE_UPDATED',
         observedAt: '2026-11-02T09:02:41+09:00',
         direction: 'UP',
         rank: 2,
-        symbol: '005930'),
+        symbol: '005930',
+        name: '삼성전자'),
   ],
   'run': {
     'session': fixtureSession,
