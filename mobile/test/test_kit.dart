@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:hongscanner/api/api_client.dart';
-import 'package:hongscanner/api/api_models.dart';
 import 'package:hongscanner/services/credential_store.dart';
 import 'package:hongscanner/services/noop_push_service.dart';
 import 'package:hongscanner/services/push_permission.dart';
@@ -20,8 +19,8 @@ const String evDownEnterId =
     'b23d1c4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e';
 const String evUpUpdateId =
     'c3aa2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e1f2';
-const String evSessionEndId =
-    'd4bb3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e2a30';
+const String evDownExitId =
+    'e5cc3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e';
 
 const String fixtureSession = 'smoke-2026-11-02-885b009';
 
@@ -72,16 +71,18 @@ final Map<String, Object?> evUpUpdate = fixtureEvent(evUpUpdateId,
     symbol: '005930',
     severity: 'HIGH');
 
-final Map<String, Object?> evSessionEnd = fixtureEvent(evSessionEndId,
-    eventType: 'SESSION_ENDED',
-    observedAt: '2026-11-02T15:30:00+09:00',
+final Map<String, Object?> evDownExit = fixtureEvent(evDownExitId,
+    eventType: 'CANDIDATE_EXITED',
+    observedAt: '2026-11-02T09:03:30+09:00',
+    direction: 'DOWN',
+    symbol: '000660',
     dataQuality: 'INCOMPLETE');
 
 final List<Map<String, Object?>> fixtureLedgerEvents = [
   evUpEnter,
   evDownEnter,
   evUpUpdate,
-  evSessionEnd,
+  evDownExit,
 ];
 
 final Map<String, Object?> fixtureDeliveryRecord = {
@@ -92,111 +93,99 @@ final Map<String, Object?> fixtureDeliveryRecord = {
   'updated_at': '2026-11-02T09:00:06+09:00',
 };
 
-final Map<String, Object?> fixtureStatus = {
-  'delivery': {
-    'by_state': {'ACCEPTED': 1},
-    'configured': true,
-    'devices': 1,
-    'pairs': 1,
-    'present': true,
-  },
-  'events': {
-    'by_severity': {'HIGH': 1, 'INFO': 3},
-    'by_type': {
-      'CANDIDATE_ENTERED': 2,
-      'CANDIDATE_UPDATED': 1,
-      'SESSION_ENDED': 1,
-    },
-    'count': 4,
-    'latest_event': {
-      'event_id': evSessionEndId,
-      'event_type': 'SESSION_ENDED',
-      'observed_at': '2026-11-02T15:30:00+09:00',
-    },
-    'latest_session_id': '2026-11-02',
-    'ledger_present': true,
-  },
-  'sessions': {
-    'count': 1,
-    'latest': {
-      'code_commit': '885b009',
-      'run_id': 'run-2026-11-02-1',
-      'run_json_present': true,
-      'session': fixtureSession,
-      'session_date': '2026-11-02',
-      'started_at': '2026-11-02T09:00:00+09:00',
-    },
-  },
-};
-
-final Map<String, Object?> fixtureCandidates = {
-  'count': 3,
-  'events': [evUpEnter, evUpUpdate, evDownEnter],
-  'ledger_present': true,
-  'session_id': '2026-11-02',
-};
-
-final Map<String, Object?> fixtureEvents = {
-  'count': 4,
-  'delivery': {
-    evUpEnterId: [fixtureDeliveryRecord],
-  },
-  'events': fixtureLedgerEvents,
-  'ledger_present': true,
-};
-
-final Map<String, Object?> fixtureSessions = {
-  'count': 1,
-  'sessions': [
+/// One `/mobile/market-view` item: exactly the frozen item fields. When
+/// [rank] is null the key is present with a JSON null — the contract's
+/// honest-absence shape for CANDIDATE_EXITED history items.
+Map<String, Object?> fixtureMarketItem(
+  String eventId, {
+  required String eventType,
+  required String observedAt,
+  required String direction,
+  int? rank,
+  String symbol = '005930',
+  String dataQuality = 'OBSERVING',
+}) =>
     {
-      'code_commit': '885b009',
-      'run_id': 'run-2026-11-02-1',
-      'run_json_present': true,
-      'session': fixtureSession,
-      'session_date': '2026-11-02',
-      'started_at': '2026-11-02T09:00:00+09:00',
-    },
-  ],
-};
+      'data_quality': dataQuality,
+      'direction': direction,
+      'event_id': eventId,
+      'event_type': eventType,
+      'observed_at': observedAt,
+      'rank': rank,
+      'symbol': symbol,
+    };
 
-final Map<String, Object?> fixtureVerification = {
-  'checksums': {
-    'artifacts': [
-      {
-        'computed_sha256':
-            'aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11',
-        'file': 'input.hcj.jsonl',
-        'match': true,
-        'recorded_sha256':
-            'aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11',
-      },
-      {
-        'computed_sha256':
-            'bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22bb22',
-        'file': 'events.hcj.jsonl',
-        'match': false,
-        'recorded_sha256':
-            'cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33',
-      },
-    ],
-    'present': true,
+/// `/mobile/market-view` fixture: the single bounded projection the phone
+/// renders — rising/falling top 10 in ascending rank, the retained
+/// candidate history (oldest→newest, rank null on the EXITED row), and
+/// the run/as_of context. Same synthetic world as the ledger fixtures.
+final Map<String, Object?> fixtureMarketView = {
+  'as_of': '2026-11-02T15:30:58+09:00',
+  'falling_top10': [
+    fixtureMarketItem(evDownEnterId,
+        eventType: 'CANDIDATE_ENTERED',
+        observedAt: '2026-11-02T09:01:12+09:00',
+        direction: 'DOWN',
+        rank: 1,
+        symbol: '000660'),
+  ],
+  'history': [
+    fixtureMarketItem(evUpEnterId,
+        eventType: 'CANDIDATE_ENTERED',
+        observedAt: '2026-11-02T09:00:05+09:00',
+        direction: 'UP',
+        rank: 1,
+        symbol: '005930'),
+    fixtureMarketItem(evDownEnterId,
+        eventType: 'CANDIDATE_ENTERED',
+        observedAt: '2026-11-02T09:01:12+09:00',
+        direction: 'DOWN',
+        rank: 1,
+        symbol: '000660'),
+    fixtureMarketItem(evUpUpdateId,
+        eventType: 'CANDIDATE_UPDATED',
+        observedAt: '2026-11-02T09:02:41+09:00',
+        direction: 'UP',
+        rank: 2,
+        symbol: '005930'),
+    fixtureMarketItem(evDownExitId,
+        eventType: 'CANDIDATE_EXITED',
+        observedAt: '2026-11-02T09:03:30+09:00',
+        direction: 'DOWN',
+        rank: null,
+        symbol: '000660',
+        dataQuality: 'INCOMPLETE'),
+  ],
+  'latest': {
+    'data_quality': 'INCOMPLETE',
+    'event_id': evDownExitId,
+    'event_type': 'CANDIDATE_EXITED',
+    'observed_at': '2026-11-02T09:03:30+09:00',
   },
-  'code_commit': '885b009',
-  'committed_marker': {'file': 'input.hcj.jsonl.committed', 'present': true},
-  'events_file': {
-    'present': true,
-    'sha256':
-        '6a994f4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80',
+  'rising_top10': [
+    fixtureMarketItem(evUpEnterId,
+        eventType: 'CANDIDATE_ENTERED',
+        observedAt: '2026-11-02T09:00:05+09:00',
+        direction: 'UP',
+        rank: 1,
+        symbol: '005930'),
+    fixtureMarketItem(evUpUpdateId,
+        eventType: 'CANDIDATE_UPDATED',
+        observedAt: '2026-11-02T09:02:41+09:00',
+        direction: 'UP',
+        rank: 2,
+        symbol: '005930'),
+  ],
+  'run': {
+    'session': fixtureSession,
+    'session_date': '2026-11-02',
+    'run_id': 'run-2026-11-02-1',
+    'started_at': '2026-11-02T09:00:00+09:00',
   },
-  'replay_verdict': {
-    'line': 'VERDICT MATCH',
-    'recorded': true,
-    'source': 'verify.stdout',
+  'runs_present': true,
+  'status': {
+    'by_data_quality': {'INCOMPLETE': 1, 'OBSERVING': 3},
   },
-  'run_json_present': true,
-  'session': fixtureSession,
-  'session_date': '2026-11-02',
-  'session_end_recorded': true,
 };
 
 /// HCJ-canonical encoding (keys codepoint-ascending, compact, trailing LF)
@@ -260,21 +249,24 @@ TransportResponse errorJson(int status, String code, String message) =>
       body: utf8.encode('${canonicalJson({'error': {'code': code, 'message': message}})}\n'),
     );
 
-/// Fake API: routes by terminal path segment with the fixture payloads.
-/// Segments not in [extra] answer with the standard fixtures; `events/<id>`
-/// answers 404 for unknown ids, mirroring the server contract.
+/// Fake API: routes by path with the fixture payloads. `/mobile/market-view`
+/// answers the projection fixture; `events/<id>` answers 404 for unknown
+/// ids, mirroring the server contract.
 FakeTransport fixtureTransport({Map<String, TransportResponse>? extra}) {
   final overrides = extra ?? const <String, TransportResponse>{};
   return FakeTransport((uri) async {
     final override = overrides[uri.path];
     if (override != null) return override;
     final path = uri.path;
-    if (path.endsWith('/status')) return okJson(fixtureStatus);
-    if (path.endsWith('/candidates')) return okJson(fixtureCandidates);
-    if (path.endsWith('/events')) return okJson(fixtureEvents);
+    if (path.endsWith('/mobile/market-view')) return okJson(fixtureMarketView);
     if (path.contains('/events/')) {
       final id = path.split('/events/').last;
-      final known = {evUpEnterId, evDownEnterId, evUpUpdateId, evSessionEndId};
+      final known = {
+        evUpEnterId,
+        evDownEnterId,
+        evUpUpdateId,
+        evDownExitId,
+      };
       return known.contains(id)
           ? okJson({
               'delivery': id == evUpEnterId ? [fixtureDeliveryRecord] : [],
@@ -282,8 +274,6 @@ FakeTransport fixtureTransport({Map<String, TransportResponse>? extra}) {
             })
           : errorJson(404, 'not_found', 'no such event id in the ledger');
     }
-    if (path.endsWith('/sessions')) return okJson(fixtureSessions);
-    if (path.contains('/verification')) return okJson(fixtureVerification);
     return errorJson(404, 'not_found', 'unknown route');
   });
 }
@@ -396,10 +386,3 @@ AppStore makeStore({
     now: () => DateTime(2026, 11, 2, 9, 0, 0),
   );
 }
-
-/// Two-model parse helpers reused by parse tests.
-EventsResponse parseEvents(Map<String, Object?> raw) =>
-    EventsResponse.fromMap(raw);
-
-VerificationResponse parseVerification(Map<String, Object?> raw) =>
-    VerificationResponse.fromMap(raw);

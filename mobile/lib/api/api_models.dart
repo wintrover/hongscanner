@@ -11,8 +11,6 @@ String? _asString(Object? v) => v is String ? v : null;
 
 int? _asInt(Object? v) => v is int ? v : null;
 
-bool? _asBool(Object? v) => v is bool ? v : null;
-
 bool _asBoolOr(Object? v, bool fallback) => v is bool ? v : fallback;
 
 Map<String, Object?> _asMap(Object? v) =>
@@ -21,6 +19,10 @@ Map<String, Object?> _asMap(Object? v) =>
 List<Map<String, Object?>> _asMapList(Object? v) => v is List
     ? v.whereType<Map<String, Object?>>().toList()
     : const <Map<String, Object?>>[];
+
+Map<String, int>? _asIntMap(Object? v) => v is Map<String, Object?>
+    ? v.map((k, value) => MapEntry(k, _asInt(value) ?? 0))
+    : null;
 
 /// One immutable event fact (contracts/events/event.schema.json,
 /// "hong-scanner-event-fact/1"). [raw] keeps the fact bytes' fields so the
@@ -79,202 +81,6 @@ class DeliveryRecord {
   String? get updatedAt => _asString(raw['updated_at']);
 }
 
-/// run.json whitelist projection (serve.py RUN_JSON_FIELDS). Fields the
-/// API deliberately does not project (host, pid, egress_ip, ...) never
-/// appear here because they are never served.
-class SessionSummary {
-  const SessionSummary({
-    required this.session,
-    required this.runJsonPresent,
-    this.sessionDate,
-    this.runId,
-    this.startedAt,
-    this.codeCommit,
-  });
-
-  factory SessionSummary.fromMap(Map<String, Object?> raw) => SessionSummary(
-        session: _asString(raw['session']),
-        runJsonPresent: _asBoolOr(raw['run_json_present'], false),
-        sessionDate: _asString(raw['session_date']),
-        runId: _asString(raw['run_id']),
-        startedAt: _asString(raw['started_at']),
-        codeCommit: _asString(raw['code_commit']),
-      );
-
-  /// Run directory name (the recorded session identifier on disk).
-  final String? session;
-  final bool runJsonPresent;
-  final String? sessionDate;
-  final String? runId;
-  final String? startedAt;
-  final String? codeCommit;
-}
-
-/// `GET /status` response. Each sub-block preserves the contract's null
-/// semantics: e.g. `count == null` with `ledgerPresent == false` means the
-/// ledger file does not exist yet — no recorded events, not zero events.
-class StatusResponse {
-  const StatusResponse({
-    required this.sessionsCount,
-    required this.sessionsLatest,
-    required this.ledgerPresent,
-    required this.eventsCount,
-    required this.byType,
-    required this.bySeverity,
-    required this.latestSessionId,
-    required this.latestEvent,
-    required this.deliveryConfigured,
-    required this.deliveryPresent,
-    required this.byState,
-    required this.deliveryPairs,
-    required this.deliveryDevices,
-  });
-
-  factory StatusResponse.fromMap(Map<String, Object?> raw) {
-    final sessions = _asMap(raw['sessions']);
-    final events = _asMap(raw['events']);
-    final delivery = _asMap(raw['delivery']);
-    final latestEvent = _asMap(events['latest_event']);
-    final latest = _asMap(sessions['latest']);
-    return StatusResponse(
-      sessionsCount: _asInt(sessions['count']),
-      sessionsLatest: SessionSummary.fromMap(latest),
-      ledgerPresent: _asBoolOr(events['ledger_present'], false),
-      eventsCount: _asInt(events['count']),
-      byType: _asIntMap(events['by_type']),
-      bySeverity: _asIntMap(events['by_severity']),
-      latestSessionId: _asString(events['latest_session_id']),
-      latestEvent: latestEvent.isEmpty
-          ? null
-          : LatestEvent(
-              eventId: _asString(latestEvent['event_id']),
-              eventType: _asString(latestEvent['event_type']),
-              observedAt: _asString(latestEvent['observed_at']),
-            ),
-      deliveryConfigured: _asBoolOr(delivery['configured'], false),
-      deliveryPresent: _asBool(delivery['present']),
-      byState: _asIntMap(delivery['by_state']),
-      deliveryPairs: _asInt(delivery['pairs']),
-      deliveryDevices: _asInt(delivery['devices']),
-    );
-  }
-
-  final int? sessionsCount;
-  final SessionSummary sessionsLatest;
-  final bool ledgerPresent;
-  final int? eventsCount;
-  final Map<String, int>? byType;
-  final Map<String, int>? bySeverity;
-  final String? latestSessionId;
-  final LatestEvent? latestEvent;
-  final bool deliveryConfigured;
-  final bool? deliveryPresent;
-  final Map<String, int>? byState;
-  final int? deliveryPairs;
-  final int? deliveryDevices;
-}
-
-Map<String, int>? _asIntMap(Object? v) => v is Map<String, Object?>
-    ? v.map((k, value) => MapEntry(k, _asInt(value) ?? 0))
-    : null;
-
-class LatestEvent {
-  const LatestEvent({
-    this.eventId,
-    this.eventType,
-    this.observedAt,
-  });
-
-  final String? eventId;
-  final String? eventType;
-  final String? observedAt;
-}
-
-/// `GET /candidates` response: the CANDIDATE_* facts of the ledger's
-/// latest session. `events == null` means the ledger itself is absent.
-class CandidatesResponse {
-  const CandidatesResponse({
-    required this.ledgerPresent,
-    required this.sessionId,
-    required this.count,
-    required this.events,
-  });
-
-  factory CandidatesResponse.fromMap(Map<String, Object?> raw) =>
-      CandidatesResponse(
-        ledgerPresent: _asBoolOr(raw['ledger_present'], false),
-        sessionId: _asString(raw['session_id']),
-        count: _asInt(raw['count']),
-        events: _asMapList(raw['events']).map(ApiEvent.fromMap).toList(),
-      );
-
-  final bool ledgerPresent;
-
-  /// null when the ledger is absent (no recorded facts at all).
-  final String? sessionId;
-  final int? count;
-  final List<ApiEvent>? events;
-
-  /// Candidate facts grouped by judged direction. Facts without a
-  /// recorded direction are not candidates-by-direction and are skipped —
-  /// the grouping shows only what the facts themselves recorded.
-  Map<String, List<ApiEvent>> get byDirection {
-    final events = this.events ?? const <ApiEvent>[];
-    final grouped = <String, List<ApiEvent>>{};
-    for (final event in events) {
-      final direction = event.direction;
-      if (direction == null) continue;
-      grouped.putIfAbsent(direction, () => <ApiEvent>[]).add(event);
-    }
-    return grouped;
-  }
-}
-
-/// `GET /events` response. Facts and delivery records stay in two separate
-/// keys (the three-states-three-homes discipline) — the client must not
-/// merge them either. Delivery keys exist only for events that have
-/// delivery records; absence of a key is "no delivery recorded".
-class EventsResponse {
-  const EventsResponse({
-    required this.ledgerPresent,
-    required this.count,
-    required this.events,
-    required this.delivery,
-  });
-
-  factory EventsResponse.fromMap(Map<String, Object?> raw) {
-    final deliveryRaw = raw['delivery'];
-    final delivery = <String, List<DeliveryRecord>>{};
-    if (deliveryRaw is Map<String, Object?>) {
-      deliveryRaw.forEach((eventId, records) {
-        delivery[eventId] =
-            _asMapList(records).map(DeliveryRecord.fromMap).toList();
-      });
-    }
-    final hasDelivery = deliveryRaw is Map<String, Object?>;
-    return EventsResponse(
-      ledgerPresent: _asBoolOr(raw['ledger_present'], false),
-      count: _asInt(raw['count']),
-      events: _asMapList(raw['events']).map(ApiEvent.fromMap).toList(),
-      delivery: hasDelivery ? delivery : null,
-    );
-  }
-
-  final bool ledgerPresent;
-  final int? count;
-  final List<ApiEvent>? events;
-
-  /// null: delivery is not configured (or the ledger is absent) — the API
-  /// answered `delivery: null`. Empty map: configured, but no event has a
-  /// delivery record. The distinction is the contract's, so it is kept.
-  final Map<String, List<DeliveryRecord>>? delivery;
-
-  /// Last-recorded delivery states for one event, or an empty list when
-  /// the events response carried no key for it ("전달 기록 없음").
-  List<DeliveryRecord> deliveryFor(String eventId) =>
-      delivery?[eventId] ?? const <DeliveryRecord>[];
-}
-
 /// `GET /events/{event_id}` response.
 class EventDetailResponse {
   const EventDetailResponse({required this.event, required this.delivery});
@@ -292,119 +98,164 @@ class EventDetailResponse {
   final List<DeliveryRecord> delivery;
 }
 
-/// `GET /sessions` response: run directory names in ascending order.
-class SessionsResponse {
-  const SessionsResponse({
-    required this.count,
-    required this.sessions,
+/// One `/mobile/market-view` projection item: a server-ranked row of the
+/// rising/falling top 10 or an entry of the retained candidate history.
+/// The server projection is authoritative — the app never recomputes
+/// ranks or filters events into candidates, so this model is a read-only
+/// display projection, not a re-derivation.
+class MarketViewItem {
+  const MarketViewItem({
+    this.dataQuality,
+    this.direction,
+    this.eventId,
+    this.eventType,
+    this.observedAt,
+    this.rank,
+    this.symbol,
   });
 
-  factory SessionsResponse.fromMap(Map<String, Object?> raw) =>
-      SessionsResponse(
-        count: _asInt(raw['count']),
-        sessions:
-            _asMapList(raw['sessions']).map(SessionSummary.fromMap).toList(),
+  factory MarketViewItem.fromMap(Map<String, Object?> raw) => MarketViewItem(
+        dataQuality: _asString(raw['data_quality']),
+        direction: _asString(raw['direction']),
+        eventId: _asString(raw['event_id']),
+        eventType: _asString(raw['event_type']),
+        observedAt: _asString(raw['observed_at']),
+        rank: _asInt(raw['rank']),
+        symbol: _asString(raw['symbol']),
       );
 
-  final int? count;
-  final List<SessionSummary> sessions;
+  final String? dataQuality;
+  final String? direction;
+  final String? eventId;
+  final String? eventType;
+  final String? observedAt;
+
+  /// Candidate rank; null on CANDIDATE_EXITED history items — honest
+  /// absence, never rendered as 0.
+  final int? rank;
+
+  /// 6-digit KRX code.
+  final String? symbol;
 }
 
-/// One CHECKSUMS.sha256 artifact row: the recorded hash vs the sha256 the
-/// API recomputed (the contract's only allowed rederivation). A refused
-/// unsafe artifact name never carries a computed hash — [note] says so.
-class ChecksumArtifact {
-  const ChecksumArtifact({
-    required this.file,
-    required this.recordedSha256,
-    required this.computedSha256,
-    required this.match,
-    this.note,
+/// `latest` block of the market view: the newest retained candidate
+/// event's identifying fields. The projection does not rank it, so it
+/// carries no direction/rank/symbol.
+class MarketViewLatest {
+  const MarketViewLatest({
+    this.dataQuality,
+    this.eventId,
+    this.eventType,
+    this.observedAt,
   });
 
-  factory ChecksumArtifact.fromMap(Map<String, Object?> raw) =>
-      ChecksumArtifact(
-        file: _asString(raw['file']),
-        recordedSha256: _asString(raw['recorded_sha256']),
-        computedSha256: _asString(raw['computed_sha256']),
-        match: raw['match'] == true,
-        note: _asString(raw['note']),
+  factory MarketViewLatest.fromMap(Map<String, Object?> raw) =>
+      MarketViewLatest(
+        dataQuality: _asString(raw['data_quality']),
+        eventId: _asString(raw['event_id']),
+        eventType: _asString(raw['event_type']),
+        observedAt: _asString(raw['observed_at']),
       );
 
-  final String? file;
-  final String? recordedSha256;
-  final String? computedSha256;
-  final bool match;
-  final String? note;
+  final String? dataQuality;
+  final String? eventId;
+  final String? eventType;
+  final String? observedAt;
 }
 
-/// `GET /sessions/{session}/verification` response: the session's recorded
-/// verification facts. This is a list of facts, not an approval — approval
-/// authority stays GATES P12 on the server side.
-class VerificationResponse {
-  const VerificationResponse({
-    required this.session,
-    required this.runJsonPresent,
-    required this.sessionDate,
-    required this.codeCommit,
-    required this.committedMarkerFile,
-    required this.committedMarkerPresent,
-    required this.sessionEndRecorded,
-    required this.eventsFilePresent,
-    required this.eventsFileSha256,
-    required this.checksumsPresent,
-    required this.artifacts,
-    required this.verdictRecorded,
-    required this.verdictSource,
-    required this.verdictLine,
-    required this.verdictNote,
+/// `run` block of the market view: the eligible run the projection was
+/// computed from. null (or `runs_present == false`) means no eligible run
+/// was recorded — "기록 없음", never a zero-filled run.
+class MarketViewRun {
+  const MarketViewRun({
+    this.session,
+    this.sessionDate,
+    this.runId,
+    this.startedAt,
   });
 
-  factory VerificationResponse.fromMap(Map<String, Object?> raw) {
-    final marker = _asMap(raw['committed_marker']);
-    final eventsFile = _asMap(raw['events_file']);
-    final checksums = _asMap(raw['checksums']);
-    final verdict = _asMap(raw['replay_verdict']);
-    return VerificationResponse(
-      session: _asString(raw['session']),
-      runJsonPresent: _asBoolOr(raw['run_json_present'], false),
-      sessionDate: _asString(raw['session_date']),
-      codeCommit: _asString(raw['code_commit']),
-      committedMarkerFile: _asString(marker['file']),
-      committedMarkerPresent: marker['present'] == true,
-      sessionEndRecorded: raw['session_end_recorded'] == true,
-      eventsFilePresent: eventsFile['present'] == true,
-      eventsFileSha256: _asString(eventsFile['sha256']),
-      checksumsPresent: checksums['present'] == true,
-      artifacts:
-          _asMapList(checksums['artifacts']).map(ChecksumArtifact.fromMap).toList(),
-      verdictRecorded: verdict['recorded'] == true,
-      verdictSource: _asString(verdict['source']),
-      verdictLine: _asString(verdict['line']),
-      verdictNote: _asString(verdict['note']),
+  factory MarketViewRun.fromMap(Map<String, Object?> raw) => MarketViewRun(
+        session: _asString(raw['session']),
+        sessionDate: _asString(raw['session_date']),
+        runId: _asString(raw['run_id']),
+        startedAt: _asString(raw['started_at']),
+      );
+
+  final String? session;
+  final String? sessionDate;
+  final String? runId;
+  final String? startedAt;
+}
+
+/// `status` block of the market view: candidate counts by data_quality.
+/// Rendered verbatim — INCOMPLETE/UNKNOWN stay visible, never flattened
+/// to normal.
+class MarketViewStatus {
+  const MarketViewStatus({this.byDataQuality});
+
+  factory MarketViewStatus.fromMap(Map<String, Object?> raw) =>
+      MarketViewStatus(byDataQuality: _asIntMap(raw['by_data_quality']));
+
+  final Map<String, int>? byDataQuality;
+}
+
+/// `GET /mobile/market-view` response: the single bounded projection the
+/// phone renders — the rising/falling top 10 (server-ranked, ascending
+/// rank) and the retained candidate-event tail (≤100, server order:
+/// oldest→newest; CANDIDATE_* only), plus the run/as_of context. The
+/// client never reorders or refilters anything here: the server order is
+/// the display order.
+class MarketViewResponse {
+  const MarketViewResponse({
+    required this.asOf,
+    required this.history,
+    required this.latest,
+    required this.run,
+    required this.risingTop10,
+    required this.fallingTop10,
+    required this.runsPresent,
+    required this.status,
+  });
+
+  factory MarketViewResponse.fromMap(Map<String, Object?> raw) {
+    final latest = raw['latest'];
+    final run = raw['run'];
+    final status = raw['status'];
+    return MarketViewResponse(
+      asOf: _asString(raw['as_of']),
+      history:
+          _asMapList(raw['history']).map(MarketViewItem.fromMap).toList(),
+      latest: latest is Map<String, Object?>
+          ? MarketViewLatest.fromMap(latest)
+          : null,
+      run: run is Map<String, Object?> ? MarketViewRun.fromMap(run) : null,
+      risingTop10:
+          _asMapList(raw['rising_top10']).map(MarketViewItem.fromMap).toList(),
+      fallingTop10:
+          _asMapList(raw['falling_top10']).map(MarketViewItem.fromMap).toList(),
+      runsPresent: _asBoolOr(raw['runs_present'], false),
+      status:
+          status is Map<String, Object?> ? MarketViewStatus.fromMap(status) : null,
     );
   }
 
-  final String? session;
-  final bool runJsonPresent;
-  final String? sessionDate;
-  final String? codeCommit;
-  final String? committedMarkerFile;
-  final bool committedMarkerPresent;
-  final bool sessionEndRecorded;
-  final bool eventsFilePresent;
-  final String? eventsFileSha256;
-  final bool checksumsPresent;
-  final List<ChecksumArtifact> artifacts;
+  /// Projection timestamp; null when the server recorded none.
+  final String? asOf;
 
-  /// The API quotes the operator-recorded VERDICT line verbatim when one
-  /// was recorded; `verdictRecorded == false` is honest "no recorded
-  /// verdict" — the client never upgrades it to success (fail-closed).
-  final bool verdictRecorded;
-  final String? verdictSource;
-  final String? verdictLine;
-  final String? verdictNote;
+  /// Retained candidate-event tail in server order (oldest→newest), ≤100.
+  final List<MarketViewItem> history;
 
-  int get artifactsMatchCount =>
-      artifacts.where((a) => a.match).length;
+  final MarketViewLatest? latest;
+
+  /// Eligible run context; null = no eligible run recorded.
+  final MarketViewRun? run;
+
+  final List<MarketViewItem> risingTop10;
+  final List<MarketViewItem> fallingTop10;
+
+  /// False (or [run] null) means no eligible run was recorded — displayed
+  /// as "기록 없음", never as fake zeros.
+  final bool runsPresent;
+
+  final MarketViewStatus? status;
 }

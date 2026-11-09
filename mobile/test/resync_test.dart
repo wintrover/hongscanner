@@ -11,9 +11,9 @@ import 'test_kit.dart';
 /// RefreshIndicator arms at a drag of (viewport × 0.25) ÷ 1.5, so the
 /// arming threshold scales with viewport height: a tall 1200×4000 surface
 /// needs a ~650 px pull before the indicator fires, and a human-scale
-/// 300 px drag is silently cancelled. 800×1000 keeps the Timeline content
-/// visible and pull-to-refresh reachable (verified: the same 300 px drag
-/// does not resync at 4000 px but does at 1000 px).
+/// 300 px drag is silently cancelled. 800×1000 keeps the Market View
+/// content visible and pull-to-refresh reachable (verified: the same
+/// 300 px drag does not resync at 4000 px but does at 1000 px).
 Future<void> pumpApp(WidgetTester tester, AppStore store) async {
   tester.view.physicalSize = const Size(800, 1000);
   tester.view.devicePixelRatio = 1.0;
@@ -23,20 +23,23 @@ Future<void> pumpApp(WidgetTester tester, AppStore store) async {
 }
 
 /// Resync tests: startup, foreground resume, message-discard recovery,
-/// and the bounded backoff on failures.
+/// and the bounded backoff on failures — all on the single
+/// `/mobile/market-view` projection fetch.
 void main() {
-  test('startup performs exactly one sync pass', () async {
+  test('startup performs exactly one sync pass of the single projection',
+      () async {
     final transport = fixtureTransport();
     final store = makeStore(transport: transport);
     await store.bootstrap();
     expect(store.syncCount, 1);
-    final statusCalls = transport.requests
-        .where((uri) => uri.path.endsWith('/status'))
-        .length;
-    expect(statusCalls, 1);
+    expect(transport.requests.map((uri) => uri.path).toList(),
+        ['/mobile/market-view'],
+        reason: 'one bounded fetch per pass — no list endpoints, '
+            'no client-side re-derivation');
+    expect(store.marketView.phase, LoadPhase.loaded);
   });
 
-  test('all-sections failure retries with restrained backoff, stays honest',
+  test('market-view failure retries with restrained backoff, stays honest',
       () async {
     final backoffs = <Duration>[];
     final store = makeStore(
@@ -48,14 +51,13 @@ void main() {
     expect(store.syncCount, 1);
     expect(backoffs, [const Duration(seconds: 1), const Duration(seconds: 2)],
         reason: 'restrained exponential backoff, capped by max attempts');
-    expect(store.status.phase, LoadPhase.error);
-    expect(store.status.offline, isTrue);
-    expect(store.events.offline, isTrue);
-    expect(store.verification.offline, isTrue);
+    expect(store.marketView.phase, LoadPhase.error);
+    expect(store.marketView.offline, isTrue);
     expect(store.pushState.phase, PushPhase.unwired);
   });
 
-  test('a second sync pass after recovery reloads every section', () async {
+  test('a second sync pass after recovery reloads the projection',
+      () async {
     var down = true;
     final healthy = fixtureTransport();
     final transport = FakeTransport((uri) async {
@@ -64,31 +66,17 @@ void main() {
     });
     final store = makeStore(transport: transport);
     await store.bootstrap();
-    expect(store.status.phase, LoadPhase.error);
+    expect(store.marketView.phase, LoadPhase.error);
 
     down = false;
     await store.resync();
 
     expect(store.syncCount, 2);
-    expect(store.status.phase, LoadPhase.loaded);
-    expect(store.status.value?.eventsCount, 4);
-    expect(store.verification.phase, LoadPhase.loaded);
-    expect(store.selectedSession, fixtureSession);
-  });
-
-  test('partial failure keeps the failed section, loads the rest', () async {
-    final transport = fixtureTransport(extra: {
-      '/candidates': errorJson(500, 'data_fault', 'ledger line 2 is bad JSON'),
-    });
-    final store = makeStore(transport: transport);
-    await store.bootstrap();
-
-    expect(store.candidates.phase, LoadPhase.error);
-    expect(store.candidates.offline, isFalse);
-    expect(store.candidates.errorMessage, contains('data_fault'));
-    expect(store.status.phase, LoadPhase.loaded);
-    expect(store.events.phase, LoadPhase.loaded);
-    expect(store.verification.phase, LoadPhase.loaded);
+    expect(store.marketView.phase, LoadPhase.loaded);
+    expect(store.marketView.value?.run?.sessionDate, '2026-11-02');
+    expect(store.marketView.value?.risingTop10, hasLength(2));
+    expect(store.marketView.value?.fallingTop10, hasLength(1));
+    expect(store.marketView.value?.history, hasLength(4));
   });
 
   testWidgets('foreground resume (lifecycle) triggers a resync',
@@ -110,18 +98,16 @@ void main() {
     expect(transport.requests.length, greaterThan(requestsAfterBootstrap));
   });
 
-  testWidgets('pull-to-refresh on the timeline resyncs',
+  testWidgets('pull-to-refresh on the market view resyncs',
       (WidgetTester tester) async {
     final transport = fixtureTransport();
     final store = makeStore(transport: transport);
     await store.bootstrap();
     await pumpApp(tester, store);
 
-    // Switch to the Timeline tab, then pull down on its list content.
-    await tester.tap(find.text('Timeline'));
-    await tester.pumpAndSettle();
-    // A slow drag past the refresh threshold triggers the indicator;
-    // a fling is too fast and cancels it.
+    // The Market View list is the initial tab; a slow drag past the
+    // refresh threshold triggers the indicator (a fling is too fast and
+    // cancels it).
     await tester.drag(find.byType(RefreshIndicator), const Offset(0, 300));
     await tester.pump();
     await tester.pumpAndSettle();

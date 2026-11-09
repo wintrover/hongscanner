@@ -5,10 +5,8 @@ import 'api/api_client.dart';
 import 'firebase_options.dart';
 import 'screens/app_scope.dart';
 import 'screens/auth_dialog.dart';
-import 'screens/evidence_screen.dart';
 import 'screens/event_detail_screen.dart';
-import 'screens/overview_screen.dart';
-import 'screens/timeline_screen.dart';
+import 'screens/market_view_screen.dart';
 import 'services/fcm_push_service.dart';
 import 'services/push_service.dart';
 import 'state/app_store.dart';
@@ -77,11 +75,16 @@ class RootShell extends StatefulWidget {
 class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
   AppStore? _store;
 
+  /// Event ids already shown as a foreground banner, so a burst of
+  /// repeated deliveries for one event shows one banner, not a stack.
+  /// Bounded: the oldest id drops out once the history is full.
+  final Set<String> _bannerShownEventIds = <String>{};
+
+  static const int _maxBannerHistory = 64;
+
   static const _screens = <Widget>[
-    OverviewScreen(),
-    TimelineScreen(),
+    MarketViewScreen(),
     EventDetailScreen(),
-    EvidenceScreen(),
   ];
 
   @override
@@ -122,18 +125,31 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
 
   /// Foreground delivery policy: with notification+data messages the OS
   /// does not display the notification while the app is in the foreground,
-  /// so the app shows an in-app banner. Data-only payloads plus local
-  /// notification re-synthesis are forbidden by design — terminated-state
-  /// display stays with the OS notification (the official path).
+  /// so the app shows an in-app banner. Banners dedup by event_id with a
+  /// bounded history, and a new banner replaces the current one instead
+  /// of queueing behind it. Data-only payloads plus local notification
+  /// re-synthesis are forbidden by design — terminated-state display
+  /// stays with the OS notification (the official path).
   void _showForegroundBanner(PushMessage message) {
     if (!mounted) return;
+    final eventId = message.eventId;
+    if (eventId != null) {
+      if (_bannerShownEventIds.contains(eventId)) return;
+      if (_bannerShownEventIds.length >= _maxBannerHistory) {
+        // LinkedHashSet keeps insertion order: drop the oldest shown id.
+        _bannerShownEventIds.remove(_bannerShownEventIds.first);
+      }
+      _bannerShownEventIds.add(eventId);
+    }
     final label = message.eventType ?? message.eventId ?? '페이로드 없음';
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('포그라운드 알림 수신: $label'),
-        duration: const Duration(seconds: 3),
-      ),
-    );
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('포그라운드 알림 수신: $label'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
   }
 
   /// The 401 re-entry path the store calls: one credential dialog, and —
@@ -159,22 +175,12 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
           NavigationDestination(
             icon: Icon(Icons.dashboard_outlined),
             selectedIcon: Icon(Icons.dashboard),
-            label: 'Overview',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.timeline_outlined),
-            selectedIcon: Icon(Icons.timeline),
-            label: 'Timeline',
+            label: 'Market View',
           ),
           NavigationDestination(
             icon: Icon(Icons.article_outlined),
             selectedIcon: Icon(Icons.article),
             label: 'Event Detail',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.fact_check_outlined),
-            selectedIcon: Icon(Icons.fact_check),
-            label: 'Evidence',
           ),
         ],
       ),

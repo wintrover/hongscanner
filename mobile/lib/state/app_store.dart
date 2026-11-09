@@ -89,13 +89,14 @@ class PushUiState {
   }
 }
 
-/// Central app state: API sections, event selection/routing, push
-/// permission flow and resync scheduling.
+/// Central app state: the market-view projection, event
+/// selection/routing, push permission flow and resync scheduling.
 ///
-/// Honest by contract: this store never synthesizes content. Sections show
-/// what the API recorded; missing records stay "기록 없음", offline stays
-/// "오프라인", and retries are bounded with a restrained backoff so a dead
-/// server ends in a visible error state, not an eternal spinner.
+/// Honest by contract: this store never synthesizes content. The
+/// projection shows exactly what the API recorded; missing records stay
+/// "기록 없음", offline stays "오프라인", and retries are bounded with a
+/// restrained backoff so a dead server ends in a visible error state,
+/// not an eternal spinner.
 class AppStore extends ChangeNotifier {
   AppStore({
     required ApiClient apiClient,
@@ -143,15 +144,10 @@ class AppStore extends ChangeNotifier {
   /// credential values.
   Object? credentialLoadError;
 
-  Section<StatusResponse> status = const Section();
-  Section<EventsResponse> events = const Section();
-  Section<CandidatesResponse> candidates = const Section();
-  Section<SessionsResponse> sessions = const Section();
-  Section<VerificationResponse> verification = const Section();
+  Section<MarketViewResponse> marketView = const Section();
 
   String? selectedEventId;
   Section<EventDetailResponse> eventDetail = const Section();
-  String? selectedSession;
   int tabIndex = 0;
 
   PushUiState pushState = const PushUiState(phase: PushPhase.unwired);
@@ -178,7 +174,7 @@ class AppStore extends ChangeNotifier {
   /// wired; a 401 then just stays a visible error.
   Future<bool> Function()? onUnauthorized;
 
-  static const int detailTabIndex = 2;
+  static const int detailTabIndex = 1;
 
   // ---- bootstrap --------------------------------------------------------
 
@@ -383,25 +379,10 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> openSessionVerification(String session) async {
-    selectedSession = session;
-    verification = const Section.loading();
-    notifyListeners();
-    try {
-      final response = await _api.fetchVerification(session);
-      if (selectedSession != session) return;
-      verification = Section.loaded(response);
-    } on ApiClientException catch (e) {
-      if (selectedSession != session) return;
-      verification = Section.error(_describe(e), offline: e.isConnectivityProblem);
-    }
-    notifyListeners();
-  }
-
   // ---- sync -------------------------------------------------------------
 
   /// Startup, foreground resume, and FCM message-discard recovery all land
-  /// here: one full refresh of every recorded-fact section, with bounded
+  /// here: one full refresh of the market-view projection, with bounded
   /// backoff on failure.
   ///
   /// 401 contract (Basic Auth): when a pass hit a 401 and the re-entry
@@ -447,49 +428,21 @@ class AppStore extends ChangeNotifier {
     }
   }
 
-  /// One pass over all sections. Returns true when nothing failed.
+  /// One pass: the single `/mobile/market-view` projection fetch. Returns
+  /// true when nothing failed.
   Future<bool> _fetchOnce() async {
-    var ok = true;
-
-    Future<void> guard<T>(
-      Future<T> Function() fetch,
-      void Function(Section<T>) assign,
-    ) async {
-      assign(Section<T>.loading());
-      try {
-        assign(Section<T>.loaded(await fetch()));
-      } on ApiClientException catch (e) {
-        if (e.statusCode == 401) _sawUnauthorized = true;
-        assign(Section<T>.error(_describe(e), offline: e.isConnectivityProblem));
-        ok = false;
-      }
-    }
-
-    await guard(_api.fetchStatus, (s) => status = s);
-    await guard(_api.fetchEvents, (s) => events = s);
-    await guard(_api.fetchCandidates, (s) => candidates = s);
-    await guard(_api.fetchSessions, (s) => sessions = s);
-    final target =
-        status.value?.sessionsLatest.session ?? _latestSessionName();
-    if (target != null) {
-      selectedSession = target;
-      await guard(
-        () => _api.fetchVerification(target),
-        (s) => verification = s,
-      );
-    } else {
-      verification = const Section.error(
-          '최근 세션을 확인할 수 없어 검증 기록을 조회하지 않음',
-          offline: true);
+    marketView = const Section<MarketViewResponse>.loading();
+    try {
+      marketView = Section.loaded(await _api.fetchMarketView());
+    } on ApiClientException catch (e) {
+      if (e.statusCode == 401) _sawUnauthorized = true;
+      marketView =
+          Section.error(_describe(e), offline: e.isConnectivityProblem);
+      notifyListeners();
+      return false;
     }
     notifyListeners();
-    return ok;
-  }
-
-  String? _latestSessionName() {
-    final list = sessions.value?.sessions;
-    if (list == null || list.isEmpty) return null;
-    return list.last.session;
+    return true;
   }
 
   String _describe(ApiClientException e) {

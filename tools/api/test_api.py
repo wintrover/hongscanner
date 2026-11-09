@@ -123,6 +123,82 @@ BARS_LINE = {"bar_index": 0, "price": 10100, "symbol": "005930"}
 SIGNALS_LINE = {"bar_index": 0, "reason": "first_after_sub",
                 "signal": "SIGNAL_HELD", "symbol": "005930"}
 
+# -- /mobile/market-view (README §3.7) fixtures --------------------------
+
+MV_WINNER = "market-2026-11-09-b"
+
+# The winning run's fold scenario (README §3.7): a multi-generation
+# UP ranking (enter -> update -> re-rank -> exit -> re-enter), a DOWN
+# ranking, and one INCOMPLETE non-candidate event that touches only
+# by_data_quality — and, being last, latest/as_of.
+MV_UP_ENTERED_1 = event_fact(b"mv-up-e1", "CANDIDATE_ENTERED", "2026-11-09",
+                             "2026-11-09T10:00:01+09:00",
+                             "candidate-transition-v1",
+                             direction="UP", rank=1, symbol="005930")
+MV_UP_UPDATED_1 = event_fact(b"mv-up-u1", "CANDIDATE_UPDATED", "2026-11-09",
+                             "2026-11-09T10:00:02+09:00",
+                             "candidate-transition-v1",
+                             direction="UP", rank=9, symbol="005930")
+MV_UP_ENTERED_2 = event_fact(b"mv-up-e2", "CANDIDATE_ENTERED", "2026-11-09",
+                             "2026-11-09T10:00:03+09:00",
+                             "candidate-transition-v1",
+                             direction="UP", rank=2, symbol="006660")
+MV_UP_EXITED_2 = event_fact(b"mv-up-x2", "CANDIDATE_EXITED", "2026-11-09",
+                            "2026-11-09T10:00:04+09:00",
+                            "candidate-transition-v1",
+                            direction="UP", symbol="006660")
+MV_UP_REENTERED_2 = event_fact(b"mv-up-r2", "CANDIDATE_ENTERED",
+                               "2026-11-09",
+                               "2026-11-09T10:00:05+09:00",
+                               "candidate-transition-v1",
+                               direction="UP", rank=3, symbol="006660")
+MV_DOWN_ENTERED_1 = event_fact(b"mv-dn-e1", "CANDIDATE_ENTERED",
+                               "2026-11-09",
+                               "2026-11-09T10:00:06+09:00",
+                               "candidate-transition-v1",
+                               direction="DOWN", rank=1, symbol="000660")
+MV_DOWN_UPDATED_1 = event_fact(b"mv-dn-u1", "CANDIDATE_UPDATED",
+                               "2026-11-09",
+                               "2026-11-09T10:00:07+09:00",
+                               "candidate-transition-v1",
+                               direction="DOWN", rank=2, symbol="000660")
+MV_INCOMPLETE_SUB = event_fact(b"mv-sub", "SUBSCRIPTION_TRUNCATED",
+                               "2026-11-09",
+                               "2026-11-09T10:00:08+09:00",
+                               "subscription-truncated-v1",
+                               severity="HIGH", data_quality="INCOMPLETE",
+                               direction="UP")
+
+MV_WINNER_EVENTS = [MV_UP_ENTERED_1, MV_UP_UPDATED_1, MV_UP_ENTERED_2,
+                    MV_UP_EXITED_2, MV_UP_REENTERED_2, MV_DOWN_ENTERED_1,
+                    MV_DOWN_UPDATED_1, MV_INCOMPLETE_SUB]
+
+
+def mv_item(ev):
+    """The §3.7 item whitelist of a fixture fact: seven fields, rank
+    null when the fact records none (CANDIDATE_EXITED)."""
+    item = {k: ev[k] for k in ("data_quality", "direction", "event_id",
+                               "event_type", "observed_at", "symbol")}
+    item["rank"] = ev.get("rank")
+    return item
+
+
+MV_EXPECTED = {
+    "as_of": "2026-11-09T10:00:08+09:00",
+    "falling_top10": [mv_item(MV_DOWN_UPDATED_1)],
+    "history": [mv_item(ev) for ev in MV_WINNER_EVENTS
+                if ev["event_type"].startswith("CANDIDATE_")],
+    "latest": {"data_quality": "INCOMPLETE",
+               "event_id": MV_INCOMPLETE_SUB["event_id"],
+               "event_type": "SUBSCRIPTION_TRUNCATED",
+               "observed_at": "2026-11-09T10:00:08+09:00"},
+    "rising_top10": [mv_item(MV_UP_REENTERED_2), mv_item(MV_UP_UPDATED_1)],
+    "run": {"environment": "demo", "run_id": MV_WINNER,
+            "session": MV_WINNER, "session_date": "2026-11-09"},
+    "runs_present": True,
+    "status": {"by_data_quality": {"INCOMPLETE": 1, "OBSERVING": 7}},
+}
+
 
 def jsonl(*objects):
     return b"".join(canonical(o) + b"\n" for o in objects)
@@ -232,6 +308,58 @@ def build_main_sandbox():
 
     box.write(box.ledger, jsonl(EV1, EV2, EV3, EV4))
     box.write(box.delivery, jsonl(D1, D2, D3, D4))
+    return box
+
+
+def build_market_view_sandbox():
+    """The §3.7 fixture tree: the winning eligible run (multi-generation
+    fold scenario, run_id recorded), an older same-date eligible run
+    whose dirname sorts AFTER the winner (the observed_at tie-break must
+    beat the dirname tie-break), an older-date eligible run with a NEWER
+    last observed_at (session_date outranks observed_at), and the
+    ineligible shapes: config without environment (smoke-like), config
+    with a malformed session_date, and a directory holding only a
+    subdirectory (drill-like)."""
+    box = Sandbox()
+
+    def write_market_run(name, config, events):
+        run_dir = box.session_dir(name)
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+            {"kind": "config", "raw": config, "seq": 2}))
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"), jsonl(*events))
+
+    write_market_run(MV_WINNER,
+                     {"environment": "demo", "run_id": MV_WINNER,
+                      "session_date": "2026-11-09"},
+                     MV_WINNER_EVENTS)
+    write_market_run("market-2026-11-09-z",
+                     {"environment": "demo", "session_date": "2026-11-09"},
+                     [event_fact(b"mv-old-same", "CANDIDATE_ENTERED",
+                                 "2026-11-09",
+                                 "2026-11-09T09:00:00+09:00",
+                                 "candidate-transition-v1",
+                                 direction="UP", rank=1, symbol="005930")])
+    write_market_run("market-2026-11-08-y",
+                     {"environment": "demo", "run_id": "market-2026-11-08-y",
+                      "session_date": "2026-11-08"},
+                     [event_fact(b"mv-old-date", "CANDIDATE_ENTERED",
+                                 "2026-11-08",
+                                 "2026-11-09T23:59:00+09:00",
+                                 "candidate-transition-v1",
+                                 direction="UP", rank=1, symbol="005930")])
+    # smoke-like: both files present, but the config record carries no
+    # environment — the collector-only field — so it is ineligible
+    write_market_run("smoke-like-2026-11-09",
+                     {"page_cap": 10, "session_date": "2026-11-09"},
+                     [MV_DOWN_ENTERED_1])
+    # eligible files and environment, but session_date is not the
+    # collector's own validation shape
+    write_market_run("bad-date-like",
+                     {"environment": "demo", "session_date": "2026-11-9"},
+                     [MV_DOWN_ENTERED_1])
+    # drill-like: only a subdirectory, no recorded files at all
+    os.makedirs(os.path.join(box.runs, "drill-like-20261109", "sub"))
     return box
 
 
@@ -639,7 +767,8 @@ class ApiContractSuite(unittest.TestCase):
                  "/sessions/run-20261101-a/verification",
                  "/sessions/run-20261101-b/verification",
                  "/sessions/run-20261102-c/verification",
-                 "/sessions/dir-20261031-plain/verification")
+                 "/sessions/dir-20261031-plain/verification",
+                 "/mobile/market-view")
         bodies = b""
         for path in paths:
             _, body, _ = self.server.get(path)
@@ -649,6 +778,142 @@ class ApiContractSuite(unittest.TestCase):
                        self.box.root.encode(), b"secret.txt\x00",
                        b"/home/", b"password"):
             self.assertNotIn(needle, bodies, needle)
+
+
+class MarketViewSuite(unittest.TestCase):
+    """GET /mobile/market-view (README §3.7): the bounded fold
+    projection of the latest eligible market-collection run — recorded
+    facts only, ranks from the ledger, no judgment."""
+
+    def setUp(self):
+        self.box = build_market_view_sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.server = ServerProc(self.box, with_delivery=False)
+        self.addCleanup(self.reap_server)
+
+    def reap_server(self):
+        code, _ = self.server.stop()
+        self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
+        self.server.assert_gone()
+
+    def test_market_view_full_scenario_byte_canonical(self):
+        # selection: session_date max beats the newer observed_at of the
+        # 2026-11-08 run; the observed_at tie-break beats the winner's
+        # smaller dirname; smoke/bad-date/drill dirs are ineligible
+        status, body, raw, headers = self.server.get_json(
+            "/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, MV_EXPECTED)
+        # the whole body is canonical bytes: keys sorted, LF-terminated
+        self.assertEqual(raw, canonical(MV_EXPECTED) + b"\n")
+        self.assertEqual(headers["Content-Type"],
+                         "application/json; charset=utf-8")
+        # the contract's mechanical size bound (README §3.7)
+        self.assertLessEqual(len(raw), 65536)
+
+    def test_market_view_history_exited_rank_is_null(self):
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        exited = [item for item in body["history"]
+                  if item["event_type"] == "CANDIDATE_EXITED"]
+        self.assertEqual(len(exited), 1)
+        self.assertIsNone(exited[0]["rank"])  # honest absence, never 0
+        self.assertEqual(exited[0]["symbol"], "006660")
+        self.assertEqual(exited[0]["direction"], "UP")
+        self.assertTrue(all(item["rank"] is not None
+                            for item in body["history"]
+                            if item["event_type"] != "CANDIDATE_EXITED"))
+
+    def test_market_view_torn_tail_is_not_committed(self):
+        # the concurrently-appending shape: a torn (non-LF) tail record
+        # is not folded, not in history, and not the selection's last
+        # observed_at — the response is exactly the committed one
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "events.hcj.jsonl"), "ab") as f:
+            f.write(canonical(MV_DOWN_ENTERED_1)[:24])
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, MV_EXPECTED)
+
+    def test_market_view_malformed_committed_line_is_data_fault(self):
+        # a committed but malformed last line is corruption, not a skip
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "events.hcj.jsonl"), "ab") as f:
+            f.write(b"{not json}\n")
+        status, _, raw, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+
+    def test_market_view_exact_path_only(self):
+        for path in ("/mobile", "/mobile/market-view/",
+                     "/mobile/market-view/x"):
+            status, _, body, _ = self.server.get_json(path)
+            self.assertEqual(status, 404, path)
+            self.assertIn(b"not_found", body)
+
+
+class MarketViewEmptySuite(unittest.TestCase):
+    """§3.7 empty states: a runs root with no directories, directories
+    but none eligible, and a selected run with zero committed events."""
+
+    def run_with(self, box):
+        self.addCleanup(box.cleanup)
+        self.server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self.reap_server)
+
+    def reap_server(self):
+        code, _ = self.server.stop()
+        self.assertEqual(code, 0)
+        self.server.assert_gone()
+
+    def test_no_directories_projects_absent(self):
+        box = Sandbox()
+        self.run_with(box)
+        expected = {"as_of": None, "falling_top10": [], "history": [],
+                    "latest": None, "rising_top10": [], "run": None,
+                    "runs_present": False, "status": None}
+        status, body, raw, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
+
+    def test_directories_but_none_eligible(self):
+        box = Sandbox()
+        run_dir = box.session_dir("smoke-like-2026-11-09")
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "calendar", "raw": {}, "seq": 1},
+            {"kind": "config", "raw": {"session_date": "2026-11-09"},
+             "seq": 2}))
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+                  jsonl(MV_DOWN_ENTERED_1))
+        os.makedirs(os.path.join(box.runs, "drill-like", "sub"))
+        self.run_with(box)
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"as_of": None, "falling_top10": [],
+                                "history": [], "latest": None,
+                                "rising_top10": [], "run": None,
+                                "runs_present": True, "status": None})
+
+    def test_selected_run_zero_committed_events(self):
+        box = Sandbox()
+        run_dir = box.session_dir("market-2026-11-09-empty")
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "calendar", "raw": {}, "seq": 1},
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "session_date": "2026-11-09"},
+             "seq": 2}))
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"), b"")
+        self.run_with(box)
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {
+            "as_of": None, "falling_top10": [], "history": [],
+            "latest": None, "rising_top10": [],
+            "run": {"environment": "demo", "run_id": None,
+                    "session": "market-2026-11-09-empty",
+                    "session_date": "2026-11-09"},
+            "runs_present": True,
+            "status": {"by_data_quality": {}}})
 
 
 class TornLedgerSuite(unittest.TestCase):

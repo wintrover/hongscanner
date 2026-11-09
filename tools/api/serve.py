@@ -67,6 +67,23 @@ RUN_JSON_FIELDS = ("session_date", "run_id", "started_at", "code_commit")
 
 CANDIDATE_PREFIX = "CANDIDATE_"
 
+# /mobile/market-view (README §3.7): a market-collection run's identity
+# is the committed config record the collector writes into
+# input.hcj.jsonl (real collection runs have no run.json). environment
+# is a collector-only field, so smoke/fixture/drill directories are
+# ineligible by absence. The head/tail windows below bound how much of
+# these all-day-growing files is ever read.
+MARKET_ENVIRONMENTS = ("demo", "real")
+SESSION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MARKET_CONFIG_HEAD_BYTES = 16384
+MARKET_EVENTS_TAIL_BYTES = 65536
+MARKET_TOP_N = 10
+MARKET_HISTORY_N = 100
+# The §3.7 item whitelist: the projection is field-bounded so the
+# response size is mechanically capped (at most 120 items).
+MARKET_ITEM_FIELDS = ("data_quality", "direction", "event_id",
+                      "event_type", "observed_at", "rank", "symbol")
+
 
 class DataFault(Exception):
     """A recorded file is unreadable or violates its recorded shape.
@@ -164,6 +181,89 @@ def read_committed_lines(path):
                                 % (os.path.basename(path), i))
             objects.append(obj)
     return objects, True
+
+
+def read_head_config(path):
+    """The committed config record near the head of an input.hcj.jsonl —
+    the recorded identity of a real collection run. Bounded: only the
+    first MARKET_CONFIG_HEAD_BYTES are read (the file grows all day) and
+    parsing stops at the first kind:"config" record. A line counts only
+    if LF-terminated (a non-LF tail is not committed yet); a malformed
+    committed line before the config record is a DataFault — the same
+    discipline as read_committed_lines. Returns the config record's
+    `raw` object, or None when no committed config record is in the
+    window (absence is served, never guessed)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(MARKET_CONFIG_HEAD_BYTES)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DataFault("%s unreadable: %s"
+                        % (os.path.basename(path), _reason(exc)))
+    if data and not data.endswith(b"\n"):
+        data = data[:data.rfind(b"\n") + 1]
+    if not data:
+        return None
+    name = os.path.basename(path)
+    for i, raw in enumerate(data.split(b"\n")[:-1], start=1):
+        if not raw:
+            raise DataFault("%s line %d is empty" % (name, i))
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise DataFault("%s line %d is not valid UTF-8 JSON: %s"
+                            % (name, i, exc))
+        if not isinstance(obj, dict):
+            raise DataFault("%s line %d is not a JSON object" % (name, i))
+        if obj.get("kind") == "config":
+            config = obj.get("raw")
+            if not isinstance(config, dict):
+                raise DataFault("%s line %d config raw is not a JSON "
+                                "object" % (name, i))
+            return config
+    return None
+
+
+def read_last_observed_at(path):
+    """The observed_at of the LAST committed record of a JSONL file,
+    read from a bounded tail window (MARKET_EVENTS_TAIL_BYTES from the
+    end — the whole file is never read). A trailing line without LF is
+    not committed and is skipped. A malformed committed last line is a
+    DataFault. Returns None when the file is absent or has no committed
+    line — the caller ranks such a run last, it never guesses."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - MARKET_EVENTS_TAIL_BYTES))
+            data = f.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DataFault("%s unreadable: %s"
+                        % (os.path.basename(path), _reason(exc)))
+    if data and not data.endswith(b"\n"):
+        data = data[:data.rfind(b"\n") + 1]
+    if not data:
+        return None
+    name = os.path.basename(path)
+    line = data.split(b"\n")[-2]
+    if not line:
+        raise DataFault("%s last committed line is empty" % name)
+    try:
+        obj = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise DataFault("%s last committed line is not valid UTF-8 "
+                        "JSON: %s" % (name, exc))
+    if not isinstance(obj, dict):
+        raise DataFault("%s last committed line is not a JSON object"
+                        % name)
+    observed_at = obj.get("observed_at")
+    if not isinstance(observed_at, str):
+        raise DataFault("%s last committed line has no observed_at"
+                        % name)
+    return observed_at
 
 
 class Projector:
@@ -380,6 +480,128 @@ class Projector:
                 return {"event": ev, "delivery": delivery}
         return None
 
+    # ---- mobile market view (README §3.7) ---------------------------------
+
+    @staticmethod
+    def _market_item(ev, rank, pos=None):
+        """The whitelisted README §3.7 item: seven recorded fields, rank
+        null on CANDIDATE_EXITED (honest absence, never 0). `pos` rides
+        along in fold state as the ledger-order position for the
+        documented malformed-rank tie-break; it is never projected."""
+        item = {"data_quality": ev["data_quality"],
+                "direction": ev["direction"],
+                "event_id": ev["event_id"],
+                "event_type": ev["event_type"],
+                "observed_at": ev["observed_at"],
+                "rank": rank,
+                "symbol": ev["symbol"]}
+        if pos is not None:
+            item["pos"] = pos
+        return item
+
+    def market_view(self):
+        """GET /mobile/market-view (README §3.7): the bounded,
+        deterministic, read-only projection of the latest ELIGIBLE
+        market-collection run. No judgment happens here: ranks are
+        recorded facts, and this method only folds them, orders by a
+        recorded field, selects and counts. The runs root is listed once
+        per request and every identity is read from recorded bytes (the
+        committed config record), never the wall clock. Everything is a
+        local — nothing is cached between requests."""
+        names = self._session_names()
+        eligible = []
+        for name in names:
+            run_dir = os.path.join(self.runs_root, name)
+            input_path = os.path.join(run_dir, INPUT_JSONL)
+            events_path = os.path.join(run_dir, EVENTS_JSONL)
+            if not (os.path.isfile(input_path)
+                    and os.path.isfile(events_path)):
+                continue
+            config = read_head_config(input_path)
+            if config is None:
+                continue
+            environment = config.get("environment")
+            if environment not in MARKET_ENVIRONMENTS:
+                continue
+            session_date = config.get("session_date")
+            if not isinstance(session_date, str) \
+                    or SESSION_DATE_RE.match(session_date) is None:
+                continue
+            run_id = config.get("run_id")
+            eligible.append((name, environment, session_date,
+                             run_id if isinstance(run_id, str) else None,
+                             read_last_observed_at(events_path)))
+        if not eligible:
+            return {"as_of": None, "history": [], "latest": None,
+                    "run": None, "rising_top10": [], "falling_top10": [],
+                    "runs_present": bool(names), "status": None}
+        # Selection (README §3.7): max session_date, then max last
+        # committed observed_at (None ranks last), then max dirname.
+        session, environment, session_date, run_id, _ = max(
+            eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        events, _ = read_committed_lines(
+            os.path.join(self.runs_root, session, EVENTS_JSONL))
+        live = {}      # (symbol, direction) -> item + ledger position
+        history = []   # the last MARKET_HISTORY_N candidate items
+        quality = Counter()
+        for pos, ev in enumerate(events, start=1):
+            for field in ("event_id", "event_type", "observed_at",
+                          "data_quality"):
+                if not isinstance(ev.get(field), str):
+                    raise DataFault("%s record %d has no %s"
+                                    % (EVENTS_JSONL, pos, field))
+            event_type = ev["event_type"]
+            quality[ev["data_quality"]] += 1
+            if not event_type.startswith(CANDIDATE_PREFIX):
+                continue
+            if not isinstance(ev.get("symbol"), str) \
+                    or not isinstance(ev.get("direction"), str):
+                raise DataFault("%s record %d has no symbol or direction"
+                                % (EVENTS_JSONL, pos))
+            if ev["direction"] not in ("UP", "DOWN"):
+                raise DataFault("%s record %d direction is not UP or DOWN"
+                                % (EVENTS_JSONL, pos))
+            key = (ev["symbol"], ev["direction"])
+            if event_type == "CANDIDATE_EXITED":
+                live.pop(key, None)
+                rank = None
+            else:
+                rank = ev.get("rank")
+                if not isinstance(rank, int) or isinstance(rank, bool) \
+                        or rank < 1:
+                    raise DataFault("%s record %d has no rank >= 1"
+                                    % (EVENTS_JSONL, pos))
+                live[key] = self._market_item(ev, rank, pos)
+            history.append(self._market_item(ev, rank))
+            if len(history) > MARKET_HISTORY_N:
+                del history[0]
+        rising, falling = [], []
+        for direction, target in (("UP", rising), ("DOWN", falling)):
+            rows = [entry for entry in live.values()
+                    if entry["direction"] == direction]
+            # Ascending recorded rank. A dense 1..N ranking has no ties;
+            # if a malformed recorded tie ever appears, the ledger-order
+            # position of the record that last upserted the state breaks
+            # it (README §3.7 — the only documented tie rule).
+            rows.sort(key=lambda entry: (entry["rank"], entry["pos"]))
+            for entry in rows[:MARKET_TOP_N]:
+                target.append({field: entry[field]
+                               for field in MARKET_ITEM_FIELDS})
+        last = events[-1] if events else None
+        return {
+            "as_of": last["observed_at"] if last else None,
+            "history": history,
+            "latest": ({field: last[field] for field in
+                        ("data_quality", "event_id", "event_type",
+                         "observed_at")} if last else None),
+            "run": {"environment": environment, "run_id": run_id,
+                    "session": session, "session_date": session_date},
+            "rising_top10": rising,
+            "falling_top10": falling,
+            "runs_present": bool(names),
+            "status": {"by_data_quality": dict(sorted(quality.items()))},
+        }
+
     # ---- session verification --------------------------------------------
 
     @staticmethod
@@ -543,6 +765,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._verification(projector, session)
                 if body is None:
                     return self._not_found()
+            elif path == "/mobile/market-view":
+                body = projector.market_view()
             else:
                 return self._not_found()
         except DataFault as exc:

@@ -10,14 +10,14 @@ or no connection. No real market data enters the app or the repository
 
 ## Layout
 
-- `lib/main.dart` — app root, bottom-navigation shell (4 tabs),
+- `lib/main.dart` — app root, bottom-navigation shell (2 tabs),
   `defaultAppStore()` / `defaultPushService()` composition points
-- `lib/screens/` — Overview · Timeline · Event Detail · Evidence
-  (all data-driven), plus `app_scope.dart` (InheritedNotifier) and
-  shared honest-state widgets in `widgets.dart`
-- `lib/state/app_store.dart` — the single `ChangeNotifier` store:
-  API sections with per-section load state, event selection/routing,
-  push permission flow, bounded-backoff resync
+- `lib/screens/` — Market View · Event Detail (all data-driven), plus
+  `app_scope.dart` (InheritedNotifier) and shared honest-state widgets in
+  `widgets.dart`
+- `lib/state/app_store.dart` — the single `ChangeNotifier` store: the
+  market-view projection section, event selection/routing, push
+  permission flow, bounded-backoff resync
 - `lib/api/api_client.dart` · `lib/api/api_models.dart` — typed GET-only
   client matching `tools/api/README.md` (identifier validation mirrors
   the server's; `null` = "no record" is preserved, never coerced to 0)
@@ -110,35 +110,35 @@ Basic Auth), which the app supports as follows:
 
 ## Screens — recorded facts only
 
-- **Overview** — latest session/run facts, ledger summary, delivery
-  summary, verification facts, and the latest session's UP/DOWN
-  candidates (facts carry `direction`; the app only groups what was
-  recorded). Market prices are not served by the API and are not shown.
-- **Timeline** — events in ledger append order (the API never reorders;
-  the label says so). Rows show recorded fields and per-event delivery
-  records kept strictly separate from the facts.
+- **Market View** — the single `GET /mobile/market-view` projection,
+  exactly three market elements: 상승 TOP 10, 하락 TOP 10, and the
+  retained 최근 후보 이벤트 (≤100, server order oldest→newest). A run
+  header (`session_date`, `as_of`) and `status.by_data_quality` render
+  verbatim (INCOMPLETE/UNKNOWN stay visible, never flattened to normal),
+  and per-item `data_quality` shows on every row. The server projection
+  is authoritative: the app never recomputes ranks or filters events
+  into candidates, and `runs_present:false` / `run:null` renders as
+  "기록 없음" — never zero-filled rows. Market prices are not served by
+  the API and are not shown.
 - **Event Detail** — the selected fact verbatim (canonical field order),
   its `evidence_ref` (근거) highlighted, and its delivery records.
-- **Evidence** — per-session verification facts: committed marker,
-  `session_end`, CHECKSUMS rows (recorded vs recomputed hash, unsafe
-  artifact names shown as refused), `events.hcj.jsonl` sha256, and the
-  operator-recorded `VERDICT` line quoted verbatim — or "기록 안 됨".
-  This screen is a fact list, not an approval; approval authority stays
-  GATES P12 server-side.
+  Reached from Market View rows (top-10 / history) and notification
+  taps.
 
 Loading (skeleton), "기록 없음", and offline/error states are rendered
 as distinct UI states — the app never renders absence as success.
 
 ## Resync policy
 
-Fetch of `/status`, `/events`, `/candidates`, `/sessions`, and the
-latest session's `/sessions/{session}/verification` runs on startup and
-on foreground resume, with a restrained backoff (1s, 2s, capped by 3
-attempts) that ends in visible error states — never an infinite spinner.
-This is also the recovery path for missed messages: firebase_messaging
-17.x removed the `onDeletedMessages` Dart callback upstream, so FCM
-queue-discard recovery is guaranteed by the resume resync instead of a
-callback (documented delta, not a hidden behavior).
+A single fetch of `/mobile/market-view` (plus the on-demand
+`/events/{event_id}` drill-down when a row or notification is selected)
+runs on startup and on foreground resume, with a restrained backoff
+(1s, 2s, capped by 3 attempts) that ends in a visible error state —
+never an infinite spinner. This is also the recovery path for missed
+messages: firebase_messaging 17.x removed the `onDeletedMessages` Dart
+callback upstream, so FCM queue-discard recovery is guaranteed by the
+resume resync instead of a callback (documented delta, not a hidden
+behavior).
 
 ## Push flow (notification+data only)
 
@@ -153,7 +153,12 @@ notification re-synthesis are forbidden by design.
   비활성 with an explicit "다시 요청" button — no silent re-nagging.
 - **Foreground**: the OS does not display notification messages while
   the app is foregrounded; the app shows an in-app banner (chosen,
-  documented policy).
+  documented policy). Banners dedup by `event_id` (a bounded history of
+  64 shown ids — a burst of repeated deliveries for one event shows one
+  banner), and a new banner replaces the current one instead of queueing
+  behind it. The dispatcher's `min_severity` policy already bounds what
+  reaches the phone (default INFO; the operator can set HIGH/CRITICAL
+  server-side), so banner volume has two bounds.
 - **Background tap** → `onMessageOpenedApp` → data `event_id` → Event
   Detail tab with a `/events/{id}` fetch. **Cold start** →
   `getInitialMessage()`, same routing. Payloads without a usable
@@ -193,7 +198,7 @@ where `Firebase.initializeApp` has not run. Remaining live steps:
    It still fails closed (throws `StateError`) until step 3 succeeds.
 5. **Token registration** — the app has NO write path to the server.
    `FcmPushService` registers the app instance (`register()`) and the
-   Overview push card displays the delivered Firebase Installation ID
+   Market View push card displays the delivered Firebase Installation ID
    (`onRegistered`) in full, selectable for copying — no truncation.
    The operator registers it with the server-side
    `tools/notify/notify_register.py` CLI via `--token-file` (or stdin):
@@ -270,11 +275,14 @@ APK artifacts are gitignored (`/build/`) and never committed.
 ## Tests & CI
 
 - `flutter test` — the mobile suite: API client against fake transports
-  (contract shapes, null semantics, error classification), fixture-driven
-  widget tests for all four screens, permission flow (first-run ask once,
-  denial persistence, manual re-ask, unwired), stub-message tap routing
-  (cold start, background tap, foreground banner, bad payloads), and
-  resync (backoff, recovery, lifecycle resume, pull-to-refresh).
+  (market-view contract shapes, null/absence semantics, error
+  classification), fixture-driven widget tests for the market view (the
+  three elements, rank-1 row, history drill-down into Event Detail,
+  honest-absence and offline states), permission flow (first-run ask
+  once, denial persistence, manual re-ask, unwired), stub-message tap
+  routing (cold start, background tap, foreground banner, bad payloads),
+  and resync (single-fetch backoff, recovery, lifecycle resume,
+  pull-to-refresh).
 - `flutter analyze` — clean. NOTE: in this repo's non-ASCII checkout path
   `flutter analyze` crashes (LSP tool bug, exit 255); run it from an
   ASCII-path copy (`rsync -a --exclude .git mobile/ /tmp/hs-mobile-ascii/`).

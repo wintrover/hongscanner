@@ -124,8 +124,6 @@ class ApiClient {
   );
 
   static final RegExp eventIdPattern = RegExp(r'^[0-9a-f]{64}$');
-  static final RegExp sessionPattern =
-      RegExp(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$');
 
   late final Uri _base;
   final HttpTransport _transport;
@@ -215,19 +213,14 @@ class ApiClient {
     return decoded;
   }
 
-  /// `GET /status` — latest session, event and delivery summary.
-  Future<StatusResponse> fetchStatus() async =>
-      StatusResponse.fromMap(await _getJson('status', const {}));
-
-  /// `GET /candidates` — CANDIDATE_* facts of the ledger's latest session.
-  Future<CandidatesResponse> fetchCandidates() async =>
-      CandidatesResponse.fromMap(await _getJson('candidates', const {}));
-
-  /// `GET /events` — the full ledger projection with per-event delivery
-  /// records kept in their own key. [sessionId] is an exact-match filter.
-  Future<EventsResponse> fetchEvents({String? sessionId}) async =>
-      EventsResponse.fromMap(await _getJson(
-          'events', sessionId == null ? const {} : {'session_id': sessionId}));
+  /// `GET /mobile/market-view` — the single bounded projection for the
+  /// phone: rising/falling top 10, the retained candidate-event history
+  /// (≤100, oldest→newest), and the run/as_of context. The server
+  /// projection is authoritative; this client never recomputes ranks or
+  /// refilters events into candidates.
+  Future<MarketViewResponse> fetchMarketView() async =>
+      MarketViewResponse.fromMap(
+          await _getJson('mobile/market-view', const {}));
 
   /// `GET /events/{event_id}` — one fact plus its delivery records.
   /// Throws [ApiClientException] with `statusCode == 404` when the id is
@@ -239,20 +232,5 @@ class ApiClient {
     }
     return EventDetailResponse.fromMap(
         await _getJson('events/$eventId', const {}));
-  }
-
-  /// `GET /sessions` — run directory list.
-  Future<SessionsResponse> fetchSessions() async =>
-      SessionsResponse.fromMap(await _getJson('sessions', const {}));
-
-  /// `GET /sessions/{session}/verification` — recorded verification facts
-  /// for one run directory ([session] is the directory name).
-  Future<VerificationResponse> fetchVerification(String session) async {
-    if (!sessionPattern.hasMatch(session)) {
-      throw ApiClientException(
-          ApiErrorCode.invalidIdentifier, 'invalid session name');
-    }
-    return VerificationResponse.fromMap(
-        await _getJson('sessions/$session/verification', const {}));
   }
 }

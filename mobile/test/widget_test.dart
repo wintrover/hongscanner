@@ -19,60 +19,58 @@ Future<void> pumpTallApp(WidgetTester tester, AppStore store) async {
 
 void main() {
   testWidgets(
-      'all four screens render recorded fixture facts via bottom navigation',
+    'market view renders the three elements from the projection fixture',
+    (WidgetTester tester) async {
+      final store = makeStore(transport: fixtureTransport());
+      await store.bootstrap();
+      await pumpTallApp(tester, store);
+
+      // Market View is the initial tab: exactly three market elements,
+      // all from the single /mobile/market-view projection.
+      expect(find.text('상승 TOP 10'), findsOneWidget);
+      expect(find.text('하락 TOP 10'), findsOneWidget);
+      expect(find.text('최근 후보 이벤트'), findsOneWidget);
+      // Server-ranked rows, ascending rank — including a rank-1 item.
+      expect(find.text('005930 (rank 1)'), findsOneWidget);
+      expect(find.text('005930 (rank 2)'), findsOneWidget);
+      expect(find.text('000660 (rank 1)'), findsOneWidget);
+      // Retained history in server order (oldest→newest), CANDIDATE_* only.
+      expect(find.text('CANDIDATE_ENTERED · 005930 · UP #1'), findsOneWidget);
+      expect(find.text('CANDIDATE_ENTERED · 000660 · DOWN #1'), findsOneWidget);
+      expect(find.text('CANDIDATE_UPDATED · 005930 · UP #2'), findsOneWidget);
+      // rank is null on the CANDIDATE_EXITED row: honest absence — the
+      // row renders without a rank, never with a fake 0.
+      expect(find.text('CANDIDATE_EXITED · 000660 · DOWN'), findsOneWidget);
+      expect(find.textContaining('#0'), findsNothing);
+      expect(find.textContaining('(rank 0'), findsNothing);
+      // Run header facts and the verbatim data-quality status.
+      expect(find.text('2026-11-02'), findsOneWidget);
+      expect(find.text('2026-11-02T15:30:58+09:00'), findsOneWidget);
+      expect(find.text('INCOMPLETE×1, OBSERVING×3'), findsOneWidget);
+      // INCOMPLETE stays visible per item, never flattened to normal.
+      expect(find.text('2026-11-02T09:03:30+09:00 · INCOMPLETE'),
+          findsOneWidget);
+      // Push unwired state is honest about Firebase being absent.
+      expect(find.textContaining('푸시 미연결 — Firebase 미설정'), findsOneWidget);
+
+      // Event Detail tab (no selection yet).
+      await tester.tap(find.text('Event Detail'));
+      await tester.pumpAndSettle();
+      expect(find.text('이벤트 미선택'), findsOneWidget);
+
+      // Back to Market View: IndexedStack keeps state across tab switches.
+      await tester.tap(find.text('Market View'));
+      await tester.pumpAndSettle();
+      expect(find.text('상승 TOP 10'), findsOneWidget);
+    },
+  );
+
+  testWidgets('history tap routes into the event detail tab',
       (WidgetTester tester) async {
     final store = makeStore(transport: fixtureTransport());
     await store.bootstrap();
     await pumpTallApp(tester, store);
 
-    // Overview is the initial tab: recorded session/data/verification
-    // facts from the fixture API.
-    expect(find.text('세션 · 수집'), findsOneWidget);
-    expect(find.text('상승 후보 (UP)'), findsOneWidget);
-    expect(find.text('하락 후보 (DOWN)'), findsOneWidget);
-    expect(find.text('005930 (rank 1)'), findsOneWidget);
-    expect(find.text('000660 (rank 1)'), findsOneWidget);
-    expect(find.text('VERDICT MATCH'), findsOneWidget);
-    // Push unwired state is honest about Firebase being absent.
-    expect(find.textContaining('푸시 미연결 — Firebase 미설정'), findsOneWidget);
-
-    // Timeline tab: ledger order with recorded fields.
-    await tester.tap(find.text('Timeline'));
-    await tester.pumpAndSettle();
-    expect(find.text('CANDIDATE_ENTERED · 005930 · UP #1'), findsOneWidget);
-    expect(find.text('CANDIDATE_ENTERED · 000660 · DOWN #1'), findsOneWidget);
-    expect(find.text('SESSION_ENDED'), findsOneWidget);
-    expect(find.textContaining('전달: ACCEPTED'), findsOneWidget);
-    expect(find.textContaining('전달 기록 없음'), findsNWidgets(3));
-
-    // Event Detail tab (no selection yet).
-    await tester.tap(find.text('Event Detail'));
-    await tester.pumpAndSettle();
-    expect(find.text('이벤트 미선택'), findsOneWidget);
-
-    // Evidence tab: verification facts with honest session selector.
-    await tester.tap(find.text('Evidence'));
-    await tester.pumpAndSettle();
-    expect(find.text('VERDICT MATCH'), findsOneWidget);
-    expect(find.textContaining('원문 인용'), findsOneWidget);
-    // The session id renders twice by design: once on the Overview session
-    // card (최근 세션) and once as the Evidence tab's selected-session text.
-    expect(find.text(fixtureSession), findsNWidgets(2));
-
-    // Back to Overview: IndexedStack keeps state across tab switches.
-    await tester.tap(find.text('Overview'));
-    await tester.pumpAndSettle();
-    expect(find.text('세션 · 수집'), findsOneWidget);
-  });
-
-  testWidgets('timeline tap routes into the event detail tab',
-      (WidgetTester tester) async {
-    final store = makeStore(transport: fixtureTransport());
-    await store.bootstrap();
-    await pumpTallApp(tester, store);
-
-    await tester.tap(find.text('Timeline'));
-    await tester.pumpAndSettle();
     await tester.tap(find.text('CANDIDATE_ENTERED · 000660 · DOWN #1'));
     await tester.pumpAndSettle();
 
@@ -89,97 +87,34 @@ void main() {
     expect(find.text('DOWN'), findsOneWidget);
   });
 
-  testWidgets('empty ledger renders honest absence, not fake content',
+  testWidgets('no eligible run renders honest absence, not fake content',
       (WidgetTester tester) async {
     final store = makeStore(transport: fixtureTransport(extra: {
-      '/status': okJson({
-        'delivery': {
-          'by_state': null,
-          'configured': false,
-          'devices': null,
-          'pairs': null,
-          'present': null,
-        },
-        'events': {
-          'by_severity': null,
-          'by_type': null,
-          'count': null,
-          'latest_event': null,
-          'latest_session_id': null,
-          'ledger_present': false,
-        },
-        'sessions': {'count': 0, 'latest': null},
-      }),
-      '/candidates': okJson({
-        'count': null,
-        'events': null,
-        'ledger_present': false,
-        'session_id': null,
-      }),
-      '/events': okJson({
-        'count': null,
-        'delivery': null,
-        'events': null,
-        'ledger_present': false,
-      }),
-      '/sessions': okJson({'count': 0, 'sessions': []}),
-    }));
-    await store.bootstrap();
-    await pumpTallApp(tester, store);
-
-    // 데이터 card + 상승 후보 + 하락 후보 all say the ledger file is absent.
-    expect(find.text('기록 없음 — ledger 파일 없음'), findsNWidgets(3));
-    expect(find.text('전달 미구성 — 서버에 --delivery 미지정'), findsOneWidget);
-    // With no recorded session the verification section says why it did
-    // not fetch, instead of inventing an empty success.
-    expect(find.textContaining('최근 세션을 확인할 수 없어'), findsOneWidget);
-    // Nothing loaded, so no candidate rows anywhere.
-    expect(find.textContaining('(rank'), findsNothing);
-  });
-
-  testWidgets('timeline rows show recorded session_id and data_quality',
-      (WidgetTester tester) async {
-    final store = makeStore(transport: fixtureTransport());
-    await store.bootstrap();
-    await pumpTallApp(tester, store);
-
-    await tester.tap(find.text('Timeline'));
-    await tester.pumpAndSettle();
-
-    // Each row shows the fact's recorded provenance fields verbatim:
-    // session_id on all four rows, OBSERVING on the three candidate
-    // facts, INCOMPLETE on the session-end fact.
-    expect(find.textContaining('session_id: 2026-11-02'), findsNWidgets(4));
-    expect(find.textContaining('data_quality: OBSERVING'), findsNWidgets(3));
-    expect(find.textContaining('data_quality: INCOMPLETE'), findsOneWidget);
-  });
-
-  testWidgets('timeline rows keep honest ? for absent provenance fields',
-      (WidgetTester tester) async {
-    final store = makeStore(transport: fixtureTransport(extra: {
-      '/events': okJson({
-        'count': 1,
-        'delivery': null,
-        'events': [
-          <String, Object?>{
-            ...evUpEnter,
-            'data_quality': null,
-            'session_id': null,
-          }
-        ],
-        'ledger_present': true,
+      '/mobile/market-view': okJson({
+        'as_of': null,
+        'falling_top10': <Object?>[],
+        'history': <Object?>[],
+        'latest': null,
+        'rising_top10': <Object?>[],
+        'run': null,
+        'runs_present': false,
+        'status': null,
       }),
     }));
     await store.bootstrap();
     await pumpTallApp(tester, store);
 
-    await tester.tap(find.text('Timeline'));
-    await tester.pumpAndSettle();
-
-    // Absence renders as '?' like the row's other optional fields —
-    // never as an invented value.
-    expect(find.textContaining('session_id: ?'), findsOneWidget);
-    expect(find.textContaining('data_quality: ?'), findsOneWidget);
+    // runs_present:false / run:null — "no eligible run recorded" renders
+    // as 기록 없음 (session_date, as_of, 데이터 품질 rows), never as
+    // zero-filled rows.
+    expect(find.text('기록 없음'), findsNWidgets(3));
+    expect(find.text('상승 TOP 10 기록 없음'), findsOneWidget);
+    expect(find.text('하락 TOP 10 기록 없음'), findsOneWidget);
+    expect(find.text('후보 이벤트 기록 없음'), findsOneWidget);
+    // Nothing recorded, so no ranked rows anywhere.
+    expect(find.text('005930 (rank 1)'), findsNothing);
+    expect(find.text('CANDIDATE_ENTERED · 000660 · DOWN #1'), findsNothing);
+    expect(find.textContaining('#0'), findsNothing);
   });
 
   testWidgets('offline server surfaces an honest offline state with retry',
