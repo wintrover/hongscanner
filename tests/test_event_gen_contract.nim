@@ -272,6 +272,80 @@ block eventIdRule:
         idFor("CANDIDATE_ENTERED", "candidate-transition-v1", "005930", 4) ==
         idFor("CANDIDATE_ENTERED", "candidate-transition-v1", "005930", 4))
 
+# ------------------------------------------------------- run_id namespacing
+
+proc withRunId(rs: seq[Record]; runId: string): seq[Record] =
+  ## The same recorded stream, its config record carrying a run_id (the
+  ## run directory's basename — the recorder COMMITTED convention).
+  result = rs
+  var pairs: seq[HcjPair] = rs[1].raw.pairs
+  pairs.add(("run_id", hStr(runId)))
+  result[1] = Record(seq: rs[1].seq, kind: rs[1].kind, raw: hObj(pairs))
+
+block runIdNamespace:
+  # 2026-11-09 incident, reproduced: a failed same-date run and its
+  # restart judge the same tuples, so the legacy id space collides and
+  # the immutable notify ledger refuses the restart's whole batch.
+  check("incident: two same-date folds under the legacy rule are the " &
+        "same ids (the collision the ledger refused)",
+        eventsOfRecords(recs) == eventsOfRecords(recs))
+  let runA = eventsOfRecords(withRunId(recs, "fidelity-2026-11-02-a"))
+  let runB = eventsOfRecords(withRunId(recs, "fidelity-2026-11-02-b"))
+  check("run_id: every id of run A is the rule over its tuple plus the " &
+        "namespace (candidate UP at Q=4)",
+        fieldOf(runA[0], "event_id") ==
+          eventIdOf("2026-11-02", "CANDIDATE_ENTERED",
+                    "candidate-transition-v1", "005930", 4,
+                    "fidelity-2026-11-02-a") and
+        fieldOf(runA[2], "event_id") ==
+          eventIdOf("2026-11-02", "DATA_GAP_SUSPECTED", "gap-suspected-v1",
+                    "005930", 5, "fidelity-2026-11-02-a"))
+  check("run_id: runs A and B share no id — the failed run's facts and " &
+        "the restart's facts coexist in one ledger",
+        (block:
+           var ok = true
+           for la in runA:
+             for lb in runB:
+               if fieldOf(la, "event_id") == fieldOf(lb, "event_id"):
+                 ok = false
+           ok))
+  check("run_id: a namespaced id differs from the legacy id of the same tuple",
+        fieldOf(runA[0], "event_id") != fieldOf(events[0], "event_id"))
+  check("run_id: determinism — the same run_id folds to the same bytes",
+        eventsOfRecords(withRunId(recs, "fidelity-2026-11-02-a")) == runA)
+  check("run_id: the event shape is unchanged (closed field set, schema " &
+        "valid — the namespace is inside the id, never a new field)",
+        (block:
+           var bad: seq[string]
+           for l in runA:
+             bad.add(validateEventLine(l))
+           bad.len == 0))
+  let incA = eventsOfRecords(
+    withRunId(loadRecords(incompletePath), "inc-a"))
+  let incB = eventsOfRecords(
+    withRunId(loadRecords(incompletePath), "inc-b"))
+  check("run_id: the unsealed stream's SESSION_INCOMPLETE (finish path) " &
+        "is namespaced too",
+        incA.len > 0 and incB.len > 0 and
+        incA[^1] != incB[^1] and
+        fieldOf(incA[^1], "event_type") == "SESSION_INCOMPLETE" and
+        fieldOf(incA[^1], "event_id") ==
+          eventIdOf("2026-11-02", "SESSION_INCOMPLETE",
+                    "session-incomplete-v1", "*", 12, "inc-a"))
+  var refused = false
+  var msg = ""
+  try:
+    var rs = recs
+    var pairs: seq[HcjPair] = rs[1].raw.pairs
+    pairs.add(("run_id", hInt(7)))
+    rs[1] = Record(seq: rs[1].seq, kind: rs[1].kind, raw: hObj(pairs))
+    discard eventsOfRecords(rs)
+  except CatchableError as e:
+    refused = true
+    msg = e.msg
+  check("run_id: a non-string run_id is refused, never ignored",
+        refused and "config.run_id must be a string" in msg)
+
 # -------------------------------------------------------------- evidence_ref
 
 block evidenceRef:

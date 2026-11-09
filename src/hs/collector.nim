@@ -60,6 +60,10 @@ type
     profile*: string           ## kiwoomcli account alias (demo profile)
     tokenSource*: string       ## init-line token_source: "kiwoomcli" (default)
                                ## or "env" (README §5.1, the container path)
+    runId*: string             ## config.run_id (the run directory's basename,
+                               ## the recorder COMMITTED run_id convention).
+                               ## Empty = legacy stream: no run_id key is
+                               ## recorded and event ids stay legacy-shaped.
     params*: Params
     calendar*: HcjValue        ## the approved calendar snapshot (recorded as seq 1)
 
@@ -163,7 +167,8 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
                           mrktTp, trdeQtyCnd, stkCnd, crdCnd, updownIncls,
                           pricCnd, trdePricaCnd, stexTp: string;
                           params: Params; calendar: HcjValue;
-                          tokenSource = "kiwoomcli"): CollectorConfig =
+                          tokenSource = "kiwoomcli";
+                          runId = ""): CollectorConfig =
   ## Build and validate the collector configuration. The approved PH-1
   ## values are pinned here (README §5/§6.1): environment-derived
   ## endpoints, page cap 10, repoll 300 s, drain 10 s, ack timeout 10 s,
@@ -185,6 +190,15 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
   # "kiwoomcli" changes nothing for callers that do not pass the field.
   if tokenSource != "kiwoomcli" and tokenSource != "env":
     raise cerr("token_source must be kiwoomcli or env: " & tokenSource)
+  # run_id must be the run directory's basename (the recorder COMMITTED
+  # convention): no path separators, no whitespace, bounded length. Empty
+  # is the legacy pre-run_id stream and stays legacy.
+  if runId.len > 0:
+    if runId.len > 128:
+      raise cerr("run_id must be at most 128 characters")
+    for c in runId.items:
+      if c in {'/', '\\', ' ', '\t', '\n', '\r'}:
+        raise cerr("run_id must be a directory basename: " & runId)
   # The declared query scope must be inside the documented enums for both
   # directions before anything is recorded or sent.
   discard initKa10027Query(dirUp, mrktTp, trdeQtyCnd, stkCnd, crdCnd,
@@ -210,6 +224,7 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     watchdog: approvedWatchdog,
     profile: profile,
     tokenSource: tokenSource,
+    runId: runId,
     params: params,
     calendar: calendar)
 
@@ -219,45 +234,51 @@ proc queryOf(cfg: CollectorConfig; d: Direction): Ka10027Query =
 
 proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
   ## seq 1 (calendar, the approved snapshot verbatim) and seq 2 (config
-  ## with every approved PH-1 value recorded — README §6.1).
+  ## with every approved PH-1 value recorded — README §6.1). run_id is
+  ## recorded only when set: an empty runId keeps the config record — and
+  ## therefore every legacy sealed stream — byte-identical.
   discard sessionFor(cfg.calendar, cfg.sessionDate)
   let qp = cfg.queryOf(dirUp)
   let qd = cfg.queryOf(dirDown)
-  let cfgRaw = hObj(
-    ("ack_timeout_seconds", hInt(cfg.ackTimeoutSeconds)),
-    ("candidate_query", hObj(
-      ("crd_cnd", hStr(qp.crdCnd)),
-      ("mrkt_tp", hStr(qp.mrktTp)),
-      ("pric_cnd", hStr(qp.pricCnd)),
-      ("sort_tp", hStr(sortTpOf(dirUp) & "|" & sortTpOf(dirDown))),
-      ("stk_cnd", hStr(qp.stkCnd)),
-      ("stex_tp", hStr(qp.stexTp)),
-      ("trde_prica_cnd", hStr(qp.trdePricaCnd)),
-      ("trde_qty_cnd", hStr(qp.trdeQtyCnd)),
-      ("updown_incls", hStr(qp.updownIncls)))),
-    ("collector", hObj(
-      ("api_id", hStr(cfg.apiId)),
-      ("rest_domain", hStr(cfg.restDomain)),
-      ("schema", hStr(collectorConfigSchema)),
-      ("ws_endpoint", hStr(cfg.wsEndpoint)))),
-    ("drain_seconds", hInt(cfg.drainSeconds)),
-    ("environment", hStr(cfg.environment)),
-    ("market", hStr("KRX")),
-    ("page_cap", hInt(cfg.pageCap)),
-    ("params", hObj(
-      ("countermove_min_bp", hInt(cfg.params.countermoveMinBp)),
-      ("directional_trigger_bp", hInt(cfg.params.directionalTriggerBp)),
-      ("hold_on_degraded", hBool(cfg.params.holdOnDegraded)),
-      ("lookback_bars", hInt(cfg.params.lookbackBars)),
-      ("trend_min_bp", hInt(cfg.params.trendMinBp)),
-      ("warmup_bars", hInt(cfg.params.warmupBars)))),
-    ("repoll_seconds", hInt(cfg.repollSeconds)),
-    ("selection_policy", hStr(selectionPolicyId)),
-    ("session_date", hStr(cfg.sessionDate)),
-    ("subscription_caps", hObj(
+  let cfgRaw = block:
+    var pairs: seq[HcjPair] = @[
+      ("ack_timeout_seconds", hInt(cfg.ackTimeoutSeconds)),
+      ("candidate_query", hObj(
+        ("crd_cnd", hStr(qp.crdCnd)),
+        ("mrkt_tp", hStr(qp.mrktTp)),
+        ("pric_cnd", hStr(qp.pricCnd)),
+        ("sort_tp", hStr(sortTpOf(dirUp) & "|" & sortTpOf(dirDown))),
+        ("stk_cnd", hStr(qp.stkCnd)),
+        ("stex_tp", hStr(qp.stexTp)),
+        ("trde_prica_cnd", hStr(qp.trdePricaCnd)),
+        ("trde_qty_cnd", hStr(qp.trdeQtyCnd)),
+        ("updown_incls", hStr(qp.updownIncls)))),
+      ("collector", hObj(
+        ("api_id", hStr(cfg.apiId)),
+        ("rest_domain", hStr(cfg.restDomain)),
+        ("schema", hStr(collectorConfigSchema)),
+        ("ws_endpoint", hStr(cfg.wsEndpoint)))),
+      ("drain_seconds", hInt(cfg.drainSeconds)),
+      ("environment", hStr(cfg.environment)),
+      ("market", hStr("KRX")),
+      ("page_cap", hInt(cfg.pageCap)),
+      ("params", hObj(
+        ("countermove_min_bp", hInt(cfg.params.countermoveMinBp)),
+        ("directional_trigger_bp", hInt(cfg.params.directionalTriggerBp)),
+        ("hold_on_degraded", hBool(cfg.params.holdOnDegraded)),
+        ("lookback_bars", hInt(cfg.params.lookbackBars)),
+        ("trend_min_bp", hInt(cfg.params.trendMinBp)),
+        ("warmup_bars", hInt(cfg.params.warmupBars)))),
+      ("repoll_seconds", hInt(cfg.repollSeconds))]
+    if cfg.runId.len > 0:
+      pairs.add(("run_id", hStr(cfg.runId)))
+    pairs.add(("selection_policy", hStr(selectionPolicyId)))
+    pairs.add(("session_date", hStr(cfg.sessionDate)))
+    pairs.add(("subscription_caps", hObj(
       ("per_direction", hInt(maxPerDirection)),
-      ("total", hInt(maxTotalSubscriptions)))),
-    ("watchdog", hStr(cfg.watchdog)))
+      ("total", hInt(maxTotalSubscriptions)))))
+    pairs.add(("watchdog", hStr(cfg.watchdog)))
+    hObj(pairs)
   result = @[(kCalendar, cfg.calendar), (kConfig, cfgRaw)]
 
 # ---------------------------------------------------------------- wire out
