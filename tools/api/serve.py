@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hong Scanner read-only API (VS-3 PR-6).
+"""Hong Scanner read-only API (VS-3 PR-6, VS-2 opening MA20 mode).
 
 Contract: tools/api/README.md. The API serves RECORDED facts only —
 the run directories (--runs) and the append-only event ledger
@@ -8,7 +8,11 @@ nothing, replays nothing, recomputes no verdict: every response is a
 projection of recorded bytes plus the cheap rederivations the contract
 names (sha256 comparison against a recorded CHECKSUMS.sha256, presence
 of recorded markers and operator-recorded verify output). Running the
-Nim verify binary is outside this process's scope, always.
+Nim verify binary is outside this process's scope, always. The one
+display classification beyond the fold is the §3.7 opening MA20 mode:
+a time-window filter over a recorded observed_at plus an
+integer-only comparison of recorded prices against recorded close
+sums — recorded values in, tags out, never a market judgment.
 
 Security boundaries (README §5):
   - binds 127.0.0.1 by default; --bind takes a concrete IPv4 unicast
@@ -39,6 +43,8 @@ import signal
 import sys
 import threading
 from collections import Counter
+from datetime import datetime, timedelta, timezone
+from functools import cmp_to_key
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -52,6 +58,23 @@ CHECKSUM_LINE_RE = re.compile(r"^([0-9a-f]{64})  (.+)$")
 # Untrusted artifact names from a recorded CHECKSUMS.sha256: a single
 # safe path component only. Anything else is refused, never opened.
 SAFE_ARTIFACT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+# The event schema's own observed_at shape (numeric offset, KST form in
+# every recorded stamp): the opening-mode window predicate parses the
+# recorded stamp only, never the wall clock.
+OBSERVED_AT_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"[+-][0-9]{2}:[0-9]{2}$")
+# The ka10027 cur_prc shape: a signed KRW integer (the sign is the
+# day's move direction; the fold strips it).
+SIGNED_PRICE_RE = re.compile(r"^[+-][0-9]+$")
+# The ka10081 close shape: an unsigned integer string.
+DAY_CLOSE_RE = re.compile(r"^[0-9]+$")
+# The ka10081 daily-row dt shape: YYYYMMDD.
+BAR_DT_RE = re.compile(r"^[0-9]{8}$")
+# Korea Standard Time: the recorded observed_at stamps are converted to
+# this zone for the window predicate — a pure string-to-moment
+# conversion, the wall clock is never read.
+KST = timezone(timedelta(hours=9))
 
 RUN_JSON = "run.json"
 INPUT_JSONL = "input.hcj.jsonl"
@@ -79,15 +102,36 @@ MARKET_CONFIG_HEAD_BYTES = 16384
 MARKET_EVENTS_TAIL_BYTES = 65536
 MARKET_TOP_N = 10
 MARKET_HISTORY_N = 100
-# The stock-name dictionary (README §3.7): the only folded vendor body
-# values are the ka10027 ranking rows' stk_nm, keyed by stk_cd.
+# The stock-name dictionary (README §3.7): the folded vendor body
+# values of the ka10027 ranking rows are the names, keyed by stk_cd —
+# and the same rows' cur_prc values are the per-chain-pair prices.
 MARKET_NAME_API = "ka10027"
 MARKET_NAME_LIST_KEY = "pred_pre_flu_rt_upper"
+# The ka10027 query sort_tp values (the collector's own request enum):
+# "1" ranks the rising leg, "3" the falling leg — the chain-pair
+# decomposition's recorded signal.
+MARKET_SORT_RISING = "1"
+MARKET_SORT_FALLING = "3"
+# The MA20 source (README §3.7): the ka10081 daily-bar bodies recorded
+# in the same input.hcj.jsonl. The fold's dependent row shape is dt
+# (YYYYMMDD, descending) and cur_prc (an unsigned close integer); the
+# symbol comes from the recorded query's stk_cd, the ka10080 chart
+# scope's convention.
+MARKET_MA20_API = "ka10081"
+MARKET_MA20_LIST_KEY = "stk_dt_pole_chart_qry"
+MARKET_MA20_DAYS = 20
+# The VS-2 opening window (README §3.7): a half-open interval over the
+# time-of-day of the reference group's RECORDED observed_at (KST) —
+# [09:00:00, 09:30:00). Never the wall clock.
+OPENING_WINDOW_START = "09:00:00"
+OPENING_WINDOW_END = "09:30:00"
 # The §3.7 item whitelist: the projection is field-bounded so the
-# response size is mechanically capped (at most 120 items).
+# response size is mechanically capped (at most 120 items). ma20_tag is
+# the opening mode's display classification ("ABOVE"/"BELOW" inside the
+# window, null outside) — a recorded-value comparison, not a judgment.
 MARKET_ITEM_FIELDS = ("data_quality", "direction", "event_id",
-                      "event_type", "name", "observed_at", "rank",
-                      "symbol")
+                      "event_type", "ma20_tag", "name", "observed_at",
+                      "rank", "symbol")
 # The §3.7 change-history vocabulary: the display-only classification
 # of one TOP10 state change between CONFIRMED observation groups. Not
 # event types — the ledger's event_type is projected verbatim only in
@@ -285,29 +329,65 @@ def read_last_observed_at(path):
     return observed_at
 
 
-def fold_market_names(path):
-    """symbol -> stock name from the ka10027 rest_resp bodies recorded in
-    one input.hcj.jsonl (README §3.7). File order, last record wins.
-    This is the one documented whole-input scan: unlike the config head
-    (16 KiB) it walks every committed line, so callers memoize it (the
-    Projector's (path, size, mtime_ns) cache) and the walk streams one
-    line at a time — a market-day input is gigabytes, never one read.
-    Line discipline is the committed-lines rule: a trailing line without
-    LF is not committed and stops the walk; a malformed committed line
-    is a DataFault. A rest_resp envelope the recorder itself guarantees
-    (raw object, string api_id, hex body_hex) faulting that guarantee is
-    corruption, also a DataFault. The body content is NOT guaranteed
-    (the recorder preserves every response verbatim, successful or not):
-    a body that does not decode to a JSON object carrying the ranking
-    list simply contributes no names — a recorded non-success response
-    carries no ranking to fold. Rows inside a decoded list are the
-    fold's dependent shape: every row must be an object with string
-    stk_cd and stk_nm, or it is a DataFault."""
+def fold_market_projection(path, session_date):
+    """The §3.7 market fold of one input.hcj.jsonl — one streaming scan,
+    three pure derivations of recorded bytes: the ka10027 name
+    dictionary, the ka10027 chain-pair price snapshots and the ka10081
+    MA20 close sums. Returns (names, snapshots, ma20): names is symbol
+    -> stock name (file order, last record wins); snapshots is the list
+    of {symbol: price} maps, one per completed ka10027 chain-pair in
+    file order; ma20 is symbol -> the integer sum of the last
+    MARKET_MA20_DAYS completed daily closes, absent for symbols with
+    fewer than twenty completed recorded rows.
+
+    Line discipline is the committed-lines rule: a trailing line
+    without LF is not committed and stops the walk; a malformed
+    committed line is a DataFault. A rest_resp envelope the recorder
+    itself guarantees (raw object, string api_id, hex body_hex)
+    faulting that guarantee is corruption, also a DataFault. The body
+    content is NOT guaranteed (the recorder preserves every response
+    verbatim, successful or not): a body that does not decode to a
+    JSON object carrying its list key simply contributes nothing — a
+    recorded non-success response carries no ranking and no bars.
+    Rows and query fields the folds depend on are the dependent
+    recorded shape: a ka10027 ranking row must be an object with
+    string stk_cd, string stk_nm and a SIGNED_PRICE_RE cur_prc; a
+    ka10027 query must carry the recorded sort_tp (MARKET_SORT_RISING
+    or MARKET_SORT_FALLING), an integer page >= 1 and a string
+    cont_yn; a ka10081 row must be an object with a BAR_DT_RE dt and a
+    DAY_CLOSE_RE cur_prc; a ka10081 query must carry a string stk_cd.
+    Violations are DataFaults — the event fold's symbol/rank
+    discipline.
+
+    The chain-pair rule (rest_resp records carry no timestamp: record
+    order is time order): ka10027 records group into chains — a chain
+    ends when cont_yn leaves "Y", and a new chain starts on a sort_tp
+    change or a page-1 record (an interrupted chain is dropped, its
+    prices never enter a snapshot). Chains pair rising -> falling in
+    file order: a completed falling chain closes the pair and appends
+    the union of both chains' prices (falling rows win a same-symbol
+    collision) as one snapshot; a falling chain completing with no
+    pending rising chain contributes its own prices alone. The ka10081
+    fold keeps, per symbol, the first MARKET_MA20_DAYS distinct rows
+    with dt < session_date in file order (rows are dt-descending, the
+    session's in-progress bar carries dt == session_date and is never
+    summed); the session_date is the selected run's own recorded
+    config value, validated here before any row is folded."""
     names = {}
+    snapshots = []
+    ma20 = {}
+    if not isinstance(session_date, str) \
+            or SESSION_DATE_RE.match(session_date) is None:
+        raise DataFault("%s MA20 fold session_date is not the recorded "
+                        "YYYY-MM-DD shape" % INPUT_JSONL)
+    session_digits = session_date.replace("-", "")
+    chain = None         # [sort_tp, prices] of the chain being read
+    pair_rising = None   # the completed rising chain's prices
+    bars = {}            # symbol -> [dts seen, close sum, row count]
     try:
         f = open(path, "rb")
     except FileNotFoundError:
-        return names
+        return names, snapshots, ma20
     except OSError as exc:
         raise DataFault("%s unreadable: %s"
                         % (os.path.basename(path), _reason(exc)))
@@ -336,33 +416,232 @@ def fold_market_names(path):
             if not isinstance(api_id, str):
                 raise DataFault("%s line %d rest_resp has no api_id"
                                 % (name, i))
-            if api_id != MARKET_NAME_API:
-                continue
-            body_hex = rec.get("body_hex")
-            if not isinstance(body_hex, str):
-                raise DataFault("%s line %d rest_resp has no body_hex"
-                                % (name, i))
-            try:
-                body = bytes.fromhex(body_hex)
-            except ValueError:
-                raise DataFault("%s line %d body_hex is not hex" % (name, i))
-            try:
-                doc = json.loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                continue
-            if not isinstance(doc, dict):
-                continue
-            rows = doc.get(MARKET_NAME_LIST_KEY)
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                if not isinstance(row, dict) \
-                        or not isinstance(row.get("stk_cd"), str) \
-                        or not isinstance(row.get("stk_nm"), str):
-                    raise DataFault("%s line %d ranking row has no stk_cd "
+            if api_id == MARKET_NAME_API:
+                query = rec.get("query")
+                if not isinstance(query, dict):
+                    raise DataFault("%s line %d rest_resp has no query"
+                                    % (name, i))
+                sort_tp = query.get("sort_tp")
+                if sort_tp not in (MARKET_SORT_RISING, MARKET_SORT_FALLING):
+                    raise DataFault("%s line %d ka10027 query sort_tp is not "
+                                    "the recorded 1 or 3" % (name, i))
+                page = rec.get("page")
+                if not isinstance(page, int) or isinstance(page, bool) \
+                        or page < 1:
+                    raise DataFault("%s line %d rest_resp page is not >= 1"
+                                    % (name, i))
+                cont_yn = rec.get("cont_yn")
+                if not isinstance(cont_yn, str):
+                    raise DataFault("%s line %d rest_resp has no cont_yn"
+                                    % (name, i))
+                body_hex = rec.get("body_hex")
+                if not isinstance(body_hex, str):
+                    raise DataFault("%s line %d rest_resp has no body_hex"
+                                    % (name, i))
+                try:
+                    body = bytes.fromhex(body_hex)
+                except ValueError:
+                    raise DataFault("%s line %d body_hex is not hex"
+                                    % (name, i))
+                prices = {}
+                try:
+                    doc = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    doc = None
+                if isinstance(doc, dict):
+                    rows = doc.get(MARKET_NAME_LIST_KEY)
+                    if isinstance(rows, list):
+                        for row in rows:
+                            if not isinstance(row, dict) \
+                                    or not isinstance(row.get("stk_cd"), str) \
+                                    or not isinstance(row.get("stk_nm"), str):
+                                raise DataFault(
+                                    "%s line %d ranking row has no stk_cd "
                                     "or stk_nm" % (name, i))
-                names[row["stk_cd"]] = row["stk_nm"]
-    return names
+                            cur_prc = row.get("cur_prc")
+                            if not isinstance(cur_prc, str) \
+                                    or SIGNED_PRICE_RE.match(cur_prc) is None:
+                                raise DataFault(
+                                    "%s line %d ranking row cur_prc is not "
+                                    "a signed integer price" % (name, i))
+                            names[row["stk_cd"]] = row["stk_nm"]
+                            prices[row["stk_cd"]] = int(cur_prc[1:])
+                if chain is not None and (chain[0] != sort_tp or page == 1):
+                    chain = None  # interrupted chain: dropped, never a
+                                  # snapshot
+                if chain is None:
+                    chain = [sort_tp, {}]
+                chain[1].update(prices)
+                if cont_yn != "Y":
+                    if chain[0] == MARKET_SORT_RISING:
+                        pair_rising = chain[1]
+                    else:
+                        snapshot = dict(pair_rising) \
+                            if pair_rising is not None else {}
+                        snapshot.update(chain[1])
+                        snapshots.append(snapshot)
+                        pair_rising = None
+                    chain = None
+            elif api_id == MARKET_MA20_API:
+                query = rec.get("query")
+                if not isinstance(query, dict):
+                    raise DataFault("%s line %d rest_resp has no query"
+                                    % (name, i))
+                symbol = query.get("stk_cd")
+                if not isinstance(symbol, str):
+                    raise DataFault("%s line %d ka10081 query has no stk_cd"
+                                    % (name, i))
+                body_hex = rec.get("body_hex")
+                if not isinstance(body_hex, str):
+                    raise DataFault("%s line %d rest_resp has no body_hex"
+                                    % (name, i))
+                try:
+                    body = bytes.fromhex(body_hex)
+                except ValueError:
+                    raise DataFault("%s line %d body_hex is not hex"
+                                    % (name, i))
+                try:
+                    doc = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    doc = None
+                if isinstance(doc, dict):
+                    rows = doc.get(MARKET_MA20_LIST_KEY)
+                    if isinstance(rows, list):
+                        entry = bars.get(symbol)
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                raise DataFault("%s line %d daily row is not "
+                                                "a JSON object" % (name, i))
+                            dt = row.get("dt")
+                            if not isinstance(dt, str) \
+                                    or BAR_DT_RE.match(dt) is None:
+                                raise DataFault("%s line %d daily row dt is "
+                                                "not YYYYMMDD" % (name, i))
+                            cur_prc = row.get("cur_prc")
+                            if not isinstance(cur_prc, str) \
+                                    or DAY_CLOSE_RE.match(cur_prc) is None:
+                                raise DataFault(
+                                    "%s line %d daily row cur_prc is not an "
+                                    "unsigned integer close" % (name, i))
+                            if dt >= session_digits:
+                                continue  # the session's in-progress bar
+                            if entry is None:
+                                entry = [set(), 0, 0]
+                                bars[symbol] = entry
+                            if dt in entry[0] or entry[2] >= MARKET_MA20_DAYS:
+                                continue  # an older or already-counted day
+                            entry[0].add(dt)
+                            entry[1] += int(cur_prc)
+                            entry[2] += 1
+    for symbol, entry in bars.items():
+        if entry[2] >= MARKET_MA20_DAYS:
+            ma20[symbol] = entry[1]
+    return names, snapshots, ma20
+
+
+def _ma20_distance_order(entries, above):
+    """One MA20-mode list in its contract order: by the relative distance
+    from MA20, G = 20·P/Σ − 1, compared as the integer cross product
+    20·P₁·ΣC₂ vs 20·P₂·ΣC₁ — no float anywhere (Python integers are
+    exact, the cross product never divides). Descending G for the
+    above-list (furthest above MA20 first), ascending for the
+    below-list (furthest below first); a tie breaks on the symbol's
+    codepoint order. `entries` are (price, close_sum, symbol, item)."""
+    def compare(left, right):
+        cross_left = 20 * left[0] * right[1]
+        cross_right = 20 * right[0] * left[1]
+        if cross_left != cross_right:
+            if above:
+                return -1 if cross_left > cross_right else 1
+            return -1 if cross_left < cross_right else 1
+        if left[2] != right[2]:
+            return -1 if left[2] < right[2] else 1
+        return 0
+    entries.sort(key=cmp_to_key(compare))
+    return entries
+
+
+def opening_market_top10(confirmed, snapshots, ma20):
+    """The VS-2 opening MA20 projection (README §3.7): the top10 lists
+    reconstituted from the recorded prices of the reference group's
+    chain-pair against the recorded 20-day close sums — a display-only
+    classification of recorded values (recorded price vs recorded
+    average), never a market judgment. Returns ("core", [], []) when
+    the projection does not apply — no confirmed observation group, or
+    the reference group's recorded observed_at time-of-day (KST) is
+    outside the half-open window [OPENING_WINDOW_START,
+    OPENING_WINDOW_END); the recorded predicate only, never the wall
+    clock — and ("opening_ma20", rising, falling) otherwise. A
+    correspondence failure raises DataFault (fail-closed).
+
+    `confirmed` is the event fold's capture of the last CONFIRMED
+    observation group: (1-based group index, observed_at stamp, the
+    per-symbol candidate state at the group's confirmation — the
+    last-upserted item per symbol, deduplicated over UP/DOWN — and the
+    symbols the group's batch upserted). The chain-pair
+    correspondence: the group's upserted symbols must be a subset of
+    one snapshot's symbols, the candidate mappings being snapshot
+    index = group index + offset for offset 0, +1, -1 in that order
+    (the same-index mapping is the measured correspondence; the
+    subset check re-establishes the offset per run, fail-closed). An
+    EXITED symbol is never part of the check — it left the chain-pair
+    by definition. A state symbol missing from the mapped snapshot
+    (no recorded price) or from the ma20 map (no twenty recorded
+    closes) is honestly excluded from both lists, and so is a price
+    exactly at the average — never a fallback to the core
+    classification.
+
+    Classification: 20·P vs ΣC (P = the recorded current price of the
+    mapped snapshot, ΣC = the recorded 20-close sum): above → the
+    rising list, below → the falling list. Each list is ordered by
+    _ma20_distance_order and cut to MARKET_TOP_N. The projected items
+    are the recorded candidate state verbatim — only the placement and
+    the ma20_tag are the mode's."""
+    if confirmed is None:
+        return "core", [], []
+    index, stamp, state, upserts = confirmed
+    if OBSERVED_AT_RE.match(stamp) is None:
+        raise DataFault("%s observed_at is not the canonical timestamp "
+                        "shape" % EVENTS_JSONL)
+    try:
+        moment = datetime.fromisoformat(stamp)
+    except ValueError:
+        raise DataFault("%s observed_at is not a calendar moment"
+                        % EVENTS_JSONL)
+    clock = moment.astimezone(KST).strftime("%H:%M:%S")
+    if not (OPENING_WINDOW_START <= clock < OPENING_WINDOW_END):
+        return "core", [], []
+    snapshot = None
+    for offset in (0, 1, -1):
+        candidate = index + offset - 1
+        if 0 <= candidate < len(snapshots) \
+                and upserts <= set(snapshots[candidate]):
+            snapshot = snapshots[candidate]
+            break
+    if snapshot is None:
+        raise DataFault("%s chain-pair correspondence failed: observation "
+                        "group %d upsert symbols are in no chain-pair "
+                        "snapshot (offsets 0/+1/-1)"
+                        % (INPUT_JSONL, index))
+    above, below = [], []
+    for symbol, item in state.items():
+        price = snapshot.get(symbol)
+        close_sum = ma20.get(symbol)
+        if price is None or close_sum is None:
+            continue  # honest exclusion: no recorded price / closes
+        if 20 * price > close_sum:
+            above.append((price, close_sum, symbol, item))
+        elif 20 * price < close_sum:
+            below.append((price, close_sum, symbol, item))
+    rising, falling = [], []
+    for entries, is_above, target in ((above, True, rising),
+                                      (below, False, falling)):
+        for price, close_sum, symbol, item in \
+                _ma20_distance_order(entries, is_above)[:MARKET_TOP_N]:
+            item["ma20_tag"] = "ABOVE" if is_above else "BELOW"
+            target.append({field: item[field]
+                           for field in MARKET_ITEM_FIELDS})
+    return "opening_ma20", rising, falling
 
 
 class Projector:
@@ -375,11 +654,12 @@ class Projector:
         self.ledger_path = ledger_path
         self.delivery_path = delivery_path
         self._runs_real = os.path.realpath(runs_root)
-        # The §3.7 name-dictionary memoization: one entry, the last
-        # published (path, size, mtime_ns) -> names fold. ThreadingHTTPServer
-        # serves concurrent requests, so the slot is guarded by one lock.
-        self._names_lock = threading.Lock()
-        self._names_entry = None
+        # The §3.7 market-fold memoization: one entry, the last
+        # published (path, size, mtime_ns) -> (names, snapshots, ma20)
+        # fold. ThreadingHTTPServer serves concurrent requests, so the
+        # slot is guarded by one lock.
+        self._fold_lock = threading.Lock()
+        self._fold_entry = None
 
     # ---- run directories -------------------------------------------------
 
@@ -586,55 +866,61 @@ class Projector:
 
     # ---- mobile market view (README §3.7) ---------------------------------
 
-    def _market_names(self, path):
-        """The memoized symbol -> name dictionary for one input.hcj.jsonl:
-        a pure derivation of recorded bytes, so unlike the per-request
-        event fold it is cached in-process. The key is the practical
-        invalidation triple (path, size, mtime_ns) — not a cryptographic
-        fingerprint: a rewrite restoring the same size and mtime_ns would
-        be served stale. A scan is published only when the file's stat
-        matches before and after the read (a file changing mid-scan is
-        served as its consistent prefix, never cached). A DataFault is
-        never cached — a corrupt file faults on every request until it
-        is fixed. The slot holds one entry: a different selected run
+    def _market_projection(self, path, session_date):
+        """The memoized §3.7 market fold for one input.hcj.jsonl: a pure
+        derivation of recorded bytes (the ka10027 names and prices, the
+        ka10081 close sums), so unlike the per-request event fold it is
+        cached in-process. The key is the practical invalidation triple
+        (path, size, mtime_ns) — not a cryptographic fingerprint: a
+        rewrite restoring the same size and mtime_ns would be served
+        stale. The session_date of the fold is the selected run's own
+        config value, a function of the same path, so the triple pins
+        it too. A scan is published only when the file's stat matches
+        before and after the read (a file changing mid-scan is served
+        as its consistent prefix, never cached). A DataFault is never
+        cached — a corrupt file faults on every request until it is
+        fixed. The slot holds one entry: a different selected run
         rescans."""
         try:
             before = os.stat(path)
         except FileNotFoundError:
-            return {}
+            return {}, [], {}
         except OSError as exc:
             raise DataFault("%s unreadable: %s"
                             % (os.path.basename(path), _reason(exc)))
-        with self._names_lock:
-            entry = self._names_entry
+        with self._fold_lock:
+            entry = self._fold_entry
         if entry is not None and entry[:3] == (path, before.st_size,
                                                before.st_mtime_ns):
-            return entry[3]
-        names = fold_market_names(path)
+            return entry[3], entry[4], entry[5]
+        names, snapshots, ma20 = fold_market_projection(path, session_date)
         try:
             after = os.stat(path)
         except OSError:
-            return names
+            return names, snapshots, ma20
         if (after.st_size, after.st_mtime_ns) \
                 == (before.st_size, before.st_mtime_ns):
-            with self._names_lock:
-                self._names_entry = (path, before.st_size,
-                                     before.st_mtime_ns, names)
-        return names
+            with self._fold_lock:
+                self._fold_entry = (path, before.st_size,
+                                    before.st_mtime_ns, names, snapshots,
+                                    ma20)
+        return names, snapshots, ma20
 
     @staticmethod
     def _market_item(ev, rank, names, pos=None):
-        """The whitelisted README §3.7 item: eight fields, seven recorded
-        plus `name` — the recorded ka10027 stock name for the fact's
-        symbol, null when the recorded bodies never named it (honest
-        absence, the app falls back to the symbol). rank is null on
-        CANDIDATE_EXITED. `pos` rides along in fold state as the
-        ledger-order position for the documented malformed-rank
-        tie-break; it is never projected."""
+        """The whitelisted README §3.7 item: nine fields — seven recorded,
+        `name` (the recorded ka10027 stock name for the fact's symbol,
+        null when the recorded bodies never named it — honest absence,
+        the app falls back to the symbol) and `ma20_tag` (the opening
+        mode's display classification, null until the mode sets it).
+        rank is null on CANDIDATE_EXITED. `pos` rides along in fold
+        state as the ledger-order position for the documented
+        malformed-rank tie-break; it is never projected."""
         item = {"data_quality": ev["data_quality"],
                 "direction": ev["direction"],
                 "event_id": ev["event_id"],
                 "event_type": ev["event_type"],
+                "ma20_tag": None,
                 "name": names.get(ev["symbol"]),
                 "observed_at": ev["observed_at"],
                 "rank": rank,
@@ -676,11 +962,16 @@ class Projector:
         by the contract's state-comparison projection — recorded
         snapshots are compared, so every value in a change record is a
         recorded value and the classification follows the §3.7
-        vocabulary. The runs root is listed once per request and every
-        identity is read from recorded bytes (the committed config
-        record), never the wall clock. The event fold and the response
-        stay per-request locals; the one cached object is the derived
-        name dictionary (§3.7, _market_names)."""
+        vocabulary. The VS-2 opening MA20 mode is one more recorded
+        projection on the same fold: when the reference group's
+        recorded observed_at falls in the opening window, the top10
+        lists are reconstituted by opening_market_top10 from recorded
+        prices against recorded close sums (§3.7). The runs root is
+        listed once per request and every identity is read from
+        recorded bytes (the committed config record), never the wall
+        clock. The event fold and the response stay per-request
+        locals; the one cached object is the derived market fold
+        (§3.7, _market_projection)."""
         names = self._session_names()
         eligible = []
         for name in names:
@@ -706,15 +997,16 @@ class Projector:
                              read_last_observed_at(events_path)))
         if not eligible:
             return {"as_of": None, "history": [], "latest": None,
-                    "run": None, "rising_top10": [], "falling_top10": [],
-                    "runs_present": bool(names), "status": None}
+                    "mode": "core", "run": None, "rising_top10": [],
+                    "falling_top10": [], "runs_present": bool(names),
+                    "status": None}
         # Selection (README §3.7): max session_date, then max last
         # committed observed_at (None ranks last), then max dirname.
         session, environment, session_date, run_id, _ = max(
             eligible, key=lambda run: (run[2], run[4] or "", run[0]))
         run_dir = os.path.join(self.runs_root, session)
-        stock_names = self._market_names(
-            os.path.join(run_dir, INPUT_JSONL))
+        stock_names, snapshots, ma20 = self._market_projection(
+            os.path.join(run_dir, INPUT_JSONL), session_date)
         events, _ = read_committed_lines(
             os.path.join(run_dir, EVENTS_JSONL))
         # The seal (README §3.7): the recorder's finish() marker — the
@@ -735,6 +1027,13 @@ class Projector:
         #                   (event, ledger position): the evidence a
         #                   CANDIDATE_EXITED change record cites
         group_stamp = None  # observed_at of the current observation group
+        group_index = 0     # 1-based ledger-order index of that group
+        group_upserts = set()  # symbols the current group's batch
+        #                       upserted (ENTERED/UPDATED) — the opening
+        #                       mode's correspondence evidence
+        confirmed = None  # (group_index, stamp, per-symbol state,
+        #                  upserts) of the last CONFIRMED observation
+        #                  group — the opening mode's reference group
 
         def confirm_group():
             """The §3.7 state-comparison projection: derive the TOP10
@@ -742,8 +1041,20 @@ class Projector:
             comparing the previous confirmed snapshot with the live
             state. The classification follows MARKET_CHANGE_TYPES; every
             projected value is recorded. The first group (no snapshot)
-            is the baseline and records zero changes."""
-            nonlocal prev_snapshot
+            is the baseline and records zero changes. The group is also
+            captured as the opening mode's reference candidate: its
+            per-symbol candidate state (deduplicated over UP/DOWN — the
+            item whose upsert holds the greatest ledger position
+            represents a dual-direction symbol) and the symbols its
+            batch upserted."""
+            nonlocal prev_snapshot, confirmed
+            per_symbol = {}
+            for entry in live.values():
+                current = per_symbol.get(entry["symbol"])
+                if current is None or entry["pos"] > current["pos"]:
+                    per_symbol[entry["symbol"]] = entry
+            confirmed = (group_index, group_stamp, per_symbol,
+                         set(group_upserts))
             recorded = []  # (evidence position, change record)
             if prev_snapshot is not None:
                 # The current TOP10 per direction: the same rule the
@@ -829,13 +1140,16 @@ class Projector:
                 raise DataFault("%s record %d direction is not UP or DOWN"
                                 % (EVENTS_JSONL, pos))
             key = (ev["symbol"], ev["direction"])
-            if group_stamp is not None and ev["observed_at"] != group_stamp:
+            if group_stamp is None or ev["observed_at"] != group_stamp:
                 # A different observed_at opens the next observation
                 # group, so the previous group's recorded batch is
                 # complete: confirm it. Same-stamp consecutive batches
                 # merge into one group (fail-safe: no false exits).
-                confirm_group()
-                group_exits = {}
+                if group_stamp is not None:
+                    confirm_group()
+                    group_exits = {}
+                    group_upserts = set()
+                group_index += 1
             group_stamp = ev["observed_at"]
             if event_type == "CANDIDATE_EXITED":
                 group_exits[key] = (ev, pos)
@@ -847,24 +1161,31 @@ class Projector:
                     raise DataFault("%s record %d has no rank >= 1"
                                     % (EVENTS_JSONL, pos))
                 live[key] = self._market_item(ev, rank, stock_names, pos)
+                group_upserts.add(ev["symbol"])
         # End of file: only the seal confirms the final group — after
         # the seal the recorder appends no candidate event (the only
         # post-seal append is SESSION_ENDED, not a candidate), so the
         # group's batch can no longer be partial.
         if group_stamp is not None and sealed:
             confirm_group()
-        rising, falling = [], []
-        for direction, target in (("UP", rising), ("DOWN", falling)):
-            rows = [entry for entry in live.values()
-                    if entry["direction"] == direction]
-            # Ascending recorded rank. A dense 1..N ranking has no ties;
-            # if a malformed recorded tie ever appears, the ledger-order
-            # position of the record that last upserted the state breaks
-            # it (README §3.7 — the only documented tie rule).
-            rows.sort(key=lambda entry: (entry["rank"], entry["pos"]))
-            for entry in rows[:MARKET_TOP_N]:
-                target.append({field: entry[field]
-                               for field in MARKET_ITEM_FIELDS})
+        mode, opening_rising, opening_falling = opening_market_top10(
+            confirmed, snapshots, ma20)
+        if mode == "opening_ma20":
+            rising, falling = opening_rising, opening_falling
+        else:
+            rising, falling = [], []
+            for direction, target in (("UP", rising), ("DOWN", falling)):
+                rows = [entry for entry in live.values()
+                        if entry["direction"] == direction]
+                # Ascending recorded rank. A dense 1..N ranking has no
+                # ties; if a malformed recorded tie ever appears, the
+                # ledger-order position of the record that last upserted
+                # the state breaks it (README §3.7 — the only documented
+                # tie rule).
+                rows.sort(key=lambda entry: (entry["rank"], entry["pos"]))
+                for entry in rows[:MARKET_TOP_N]:
+                    target.append({field: entry[field]
+                                   for field in MARKET_ITEM_FIELDS})
         last = events[-1] if events else None
         return {
             "as_of": last["observed_at"] if last else None,
@@ -872,6 +1193,7 @@ class Projector:
             "latest": ({field: last[field] for field in
                         ("data_quality", "event_id", "event_type",
                          "observed_at")} if last else None),
+            "mode": mode,
             "run": {"environment": environment, "run_id": run_id,
                     "session": session, "session_date": session_date},
             "rising_top10": rising,

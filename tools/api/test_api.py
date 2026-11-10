@@ -9,7 +9,13 @@ The suite starts and reaps every server process it spawns and asserts
 each one exits cleanly (SIGTERM -> exit 0, no residue). A malformed
 response byte, a leaked path/secret, or a surviving process fails the
 suite. Fail-closed: no assertion reports a pass on absence of evidence.
-"""
+
+The §3.7 market view is covered twice: MarketViewSuite holds the core
+fold and change-history contract, MarketViewOpeningSuite the VS-2
+opening MA20 mode (the recorded window predicate, the chain-pair
+correspondence offsets, the integer cross-product order, the honest
+exclusions and the DataFault shapes), and MarketFoldSuite the pure
+fold_market_projection unit and its memoization."""
 
 import hashlib
 import json
@@ -312,18 +318,28 @@ MV_KA10027_QUERY = {"crd_cnd": "0", "mrkt_tp": "000", "pric_cnd": "0",
                     "updown_incls": "1"}
 
 
-def rest_resp_record(seq, body_obj, api_id="ka10027", page=1, status=200):
+def rest_resp_record(seq, body_obj, api_id="ka10027", page=1, status=200,
+                     cont_yn="N", sort_tp=None, query=None):
     return {"kind": "rest_resp",
             "raw": {"api_id": api_id,
                     "body_hex": canonical(body_obj).hex(),
-                    "cont_yn": "N", "next_key": "", "page": page,
-                    "query": dict(MV_KA10027_QUERY), "status": status},
+                    "cont_yn": cont_yn, "next_key": "", "page": page,
+                    "query": dict(query if query is not None
+                                  else MV_KA10027_QUERY
+                                  if sort_tp is None
+                                  else dict(MV_KA10027_QUERY,
+                                            sort_tp=sort_tp)),
+                    "status": status},
             "seq": seq}
 
 
 def ka10027_body(rows):
-    return {"pred_pre_flu_rt_upper": [{"stk_cd": cd, "stk_nm": nm}
-                                       for cd, nm in rows],
+    """A recorded ka10027 ranking body. Rows are (symbol, name, price)
+    triples — cur_prc is the recorded signed KRW integer the price fold
+    depends on."""
+    return {"pred_pre_flu_rt_upper": [{"cur_prc": "+%d" % price,
+                                       "stk_cd": cd, "stk_nm": nm}
+                                      for cd, nm, price in rows],
             "return_code": 0, "return_msg": "정상처리 되었습니다."}
 
 
@@ -335,11 +351,12 @@ MV_KA10080_BODY = {"return_code": 0, "return_msg": "정상처리 되었습니다
 
 MV_WINNER_INPUT = [
     rest_resp_record(3, MV_ERROR_BODY, status=429),
-    rest_resp_record(4, ka10027_body([("005930", "삼성전자"),
-                                      ("006660", "구형이름")])),
+    rest_resp_record(4, ka10027_body([("005930", "삼성전자", 75000),
+                                      ("006660", "구형이름", 45000)])),
     rest_resp_record(5, MV_KA10080_BODY, api_id="ka10080"),
-    rest_resp_record(6, ka10027_body([("006660", "LG전자"),
-                                      ("179530", "애드바이오텍")]), page=2),
+    rest_resp_record(6, ka10027_body([("006660", "LG전자", 45000),
+                                      ("179530", "애드바이오텍", 80000)]),
+                     page=2),
     {"kind": "ws_frame", "raw": {"price": 10000, "symbol": "005930"},
      "seq": 7},
 ]
@@ -351,13 +368,14 @@ MV_NAME_MAP = {"005930": "삼성전자", "006660": "LG전자"}
 
 
 def mv_item(ev, names=None):
-    """The §3.7 item whitelist of a fixture fact: eight fields — seven
+    """The §3.7 item whitelist of a fixture fact: nine fields — seven
     recorded plus `name` from the fixture's folded ka10027 dictionary
     (None when no recorded body names the symbol — the fail-closed
-    fallback), rank null when the fact records none
-    (CANDIDATE_EXITED)."""
+    fallback) and `ma20_tag` (null outside the opening mode), rank null
+    when the fact records none (CANDIDATE_EXITED)."""
     item = {k: ev[k] for k in ("data_quality", "direction", "event_id",
                                "event_type", "observed_at", "symbol")}
+    item["ma20_tag"] = None
     item["rank"] = ev.get("rank")
     item["name"] = (names or {}).get(ev["symbol"])
     return item
@@ -413,6 +431,7 @@ MV_EXPECTED = {
                "event_id": MV_INCOMPLETE_SUB["event_id"],
                "event_type": "SUBSCRIPTION_TRUNCATED",
                "observed_at": MV_TEND},
+    "mode": "core",  # the winner's groups are all 10:00+ stamps
     "rising_top10": [mv_item(MV_G3B_UP01, MV_NAME_MAP),
                      mv_item(MV_G3B_UP05, MV_NAME_MAP),
                      mv_item(MV_G2_UP02, MV_NAME_MAP),
@@ -432,6 +451,280 @@ MV_EXPECTED = {
 # changes enter the history.
 MV_EXPECTED_SEALED = dict(MV_EXPECTED,
                           history=MV_HISTORY_G2 + MV_HISTORY_G4)
+
+
+# -- §3.7 VS-2 opening MA20 mode fixtures (README §3.7) ------------------
+#
+# A separate 2026-11-10 run: three observation groups — the 08:50
+# baseline, the reference group whose RECORDED observed_at decides the
+# window (its stamp is a fixture parameter), and an unsealed 10:05
+# group that exists only to CONFIRM the reference group (the last
+# CONFIRMED group is the mode's reference, never the unconfirmed tail)
+# — plus an INCOMPLETE non-candidate tail record. The input carries
+# three ka10027 chain-pair snapshots and per-symbol ka10081 daily bars.
+# The reference group's upserts are {011060, 006660} (017960's EXITED
+# symbol is never part of the correspondence check and no snapshot
+# carries it): snapshot 2 carries both upserts (offset 0), snapshots 1
+# and 3 carry trap prices that would classify differently — the served
+# lists can only come from the snapshot the mode actually mapped.
+# 006660 is dual-direction (UP in group 1, DOWN in group 2): the
+# per-symbol candidate state dedups it to the later DOWN upsert.
+
+OM_WINNER = "opening-2026-11-10-a"
+OM_SESSION_DATE = "2026-11-10"
+OM_T1 = "2026-11-10T08:50:00+09:00"
+OM_T3 = "2026-11-10T10:05:00+09:00"
+OM_TEND = "2026-11-10T10:06:00+09:00"
+OM_REF_STAMP = "2026-11-10T09:10:00+09:00"
+
+OM_NAMES = {"000660": "SK하이닉스", "001440": "삼성카드",
+            "005930": "삼성전자", "006660": "LG전자",
+            "008480": "신풍제약", "009150": "삼성전기",
+            "011060": "SK텔레콤", "012330": "현대모비스",
+            "015760": "한국전력"}
+
+
+def om_fact(tag, stamp, event_type, symbol, direction, rank=None):
+    extra = {"direction": direction, "symbol": symbol}
+    if rank is not None:
+        extra["rank"] = rank
+    return event_fact(b"om-" + tag, event_type, OM_SESSION_DATE, stamp,
+                      "candidate-transition-v1", **extra)
+
+
+# Group 1 (OM_T1) — the baseline: the whole universe enters (UP batch,
+# then DOWN batch). Twelve candidates; zero change records.
+OM_G1 = [
+    om_fact(b"g1-up01", OM_T1, "CANDIDATE_ENTERED", "005930", "UP", 1),
+    om_fact(b"g1-up02", OM_T1, "CANDIDATE_ENTERED", "006660", "UP", 2),
+    om_fact(b"g1-up03", OM_T1, "CANDIDATE_ENTERED", "012330", "UP", 6),
+    om_fact(b"g1-up04", OM_T1, "CANDIDATE_ENTERED", "015760", "UP", 7),
+    om_fact(b"g1-up05", OM_T1, "CANDIDATE_ENTERED", "002420", "UP", 10),
+    om_fact(b"g1-up06", OM_T1, "CANDIDATE_ENTERED", "005490", "UP", 11),
+    om_fact(b"g1-dn01", OM_T1, "CANDIDATE_ENTERED", "000660", "DOWN", 1),
+    om_fact(b"g1-dn02", OM_T1, "CANDIDATE_ENTERED", "009150", "DOWN", 4),
+    om_fact(b"g1-dn03", OM_T1, "CANDIDATE_ENTERED", "008480", "DOWN", 8),
+    om_fact(b"g1-dn04", OM_T1, "CANDIDATE_ENTERED", "001440", "DOWN", 9),
+    om_fact(b"g1-dn05", OM_T1, "CANDIDATE_ENTERED", "003490", "DOWN", 12),
+    om_fact(b"g1-dn06", OM_T1, "CANDIDATE_ENTERED", "017960", "DOWN", 5),
+]
+OM_G1_BY_SYMBOL = {ev["symbol"]: ev for ev in OM_G1}
+
+
+# Group 2 (the reference group) — three facts whose stamps are the
+# window parameter: a DOWN exit of the group-1 rank-5 member (017960),
+# and the two upserts the correspondence check is about.
+def om_g2_017960x(stamp):
+    return om_fact(b"g2-dn01x", stamp, "CANDIDATE_EXITED", "017960", "DOWN")
+
+
+def om_g2_011060(stamp):
+    return om_fact(b"g2-dn02", stamp, "CANDIDATE_ENTERED", "011060",
+                   "DOWN", 3)
+
+
+def om_g2_006660(stamp):
+    return om_fact(b"g2-dn03", stamp, "CANDIDATE_ENTERED", "006660",
+                   "DOWN", 7)
+
+
+# Group 3 (OM_T3, unsealed) — one same-rank update: it only opens the
+# group that confirms group 2; its own changes are never derived.
+OM_G3_005930 = om_fact(b"g3-up01", OM_T3, "CANDIDATE_UPDATED", "005930",
+                       "UP", 1)
+
+# The run's last committed event — a non-candidate INCOMPLETE record
+# (data_quality is served verbatim; the mode is orthogonal to it).
+OM_TAIL = event_fact(b"om-sub", "SUBSCRIPTION_TRUNCATED",
+                     OM_SESSION_DATE, OM_TEND, "subscription-truncated-v1",
+                     severity="HIGH", data_quality="INCOMPLETE",
+                     direction="UP")
+
+
+def om_winner_events(ref_stamp):
+    return OM_G1 + [om_g2_017960x(ref_stamp), om_g2_011060(ref_stamp),
+                    om_g2_006660(ref_stamp), OM_G3_005930, OM_TAIL]
+
+
+# The ka10027 rows of the three chain-pair snapshots (prices are the
+# signed cur_prc values the fold strips):
+#   snapshot 1 (offset -1): 005930 +50000, 000660 +60000, 011060 +90000
+#   snapshot 2 (offset  0): 005930 +75000, 000660 +120000, 009150 +30000,
+#                           012330 +50000, 015760 +50000, 011060 +17000,
+#                           008480 +20000, 006660 +45000, 001440 +10000
+#   snapshot 3 (offset +1): 005930 +40000, 012330 +20000, 006660 +99000
+# 003490 has bars but never a snapshot price; 002420 and 005490 have no
+# usable closes (no record, and only nineteen completed days).
+def om_rows(*pairs):
+    return [(symbol, OM_NAMES[symbol], price) for symbol, price in pairs]
+
+
+def om_chain(seq, sort_tp, rows, page=1, cont_yn="N"):
+    return rest_resp_record(seq, ka10027_body(rows), sort_tp=sort_tp,
+                            page=page, cont_yn=cont_yn)
+
+
+# The ka10081 daily bars: uniform closes so each symbol's twenty-close
+# sum is 20 x close. The first row is the session's in-progress bar
+# (dt == session_date, never summed).
+OM_MA20_CLOSES = {"000660": 100000, "001440": 10000, "003490": 30000,
+                  "005930": 70000, "006660": 50000, "008480": 22500,
+                  "009150": 25000, "011060": 20000, "012330": 45000,
+                  "015760": 47500}
+
+
+def om_dts(count):
+    dts = ["20261109", "20261106", "20261105", "20261104", "20261103",
+           "20261102", "20261030", "20261029", "20261028", "20261027",
+           "20261026", "20261023", "20261022", "20261021", "20261020",
+           "20261019", "20261016", "20261015", "20261014", "20261013"]
+    return dts[:count]
+
+
+def ka10081_row(dt, close):
+    return {"acml_trde_qty": "1000000", "cur_prc": str(close), "dt": dt,
+            "flr_tp": "01", "high_prc": str(close + 500),
+            "low_prc": str(close - 500), "open_prc": str(close - 200),
+            "trde_amt": "100000000", "trde_qty": "50000",
+            "trde_tp": "001", "updn_prc": "+100", "updn_rate": "+0.50"}
+
+
+def ka10081_record(seq, symbol, close, completed=20):
+    rows = [ka10081_row("20261110", close + 123)]  # the in-progress bar
+    rows += [ka10081_row(dt, close) for dt in om_dts(completed)]
+    return rest_resp_record(
+        seq, {"return_code": 0, "return_msg": "정상처리 되었습니다.",
+              "stk_dt_pole_chart_qry": rows},
+        api_id="ka10081",
+        query={"base_dt": "", "stk_cd": symbol, "tick_kind": "2"})
+
+
+def om_winner_input(variant):
+    """The winner's recorded rest_resp sequence. `variant` moves the
+    reference group's upsert symbols between chain-pair snapshots:
+    "0" keeps both in snapshot 2 (offset 0, the measured default),
+    "+1" only in snapshot 3, "-1" only in snapshot 1, "none" in no
+    snapshot at all (the correspondence failure — DataFault)."""
+    s1_falling = om_rows(("011060", 90000))
+    if variant == "-1":
+        s1_falling += om_rows(("006660", 30000))
+    s2_falling1 = om_rows(("008480", 20000))
+    if variant == "0":
+        s2_falling1 += om_rows(("011060", 17000))
+    s3_falling = om_rows(("006660", 99000))
+    if variant == "+1":
+        s3_falling += om_rows(("011060", 99000))
+    records = [
+        # pair 1: snapshot 1 (the offset -1 trap prices)
+        om_chain(3, "1", om_rows(("005930", 50000), ("000660", 60000))),
+        om_chain(4, "3", s1_falling),
+        # pair 2: snapshot 2 — the reference chain-pair, two pages per
+        # leg (page 1 continues, page 2 completes)
+        om_chain(5, "1", om_rows(("005930", 75000), ("000660", 120000),
+                                 ("009150", 30000)), cont_yn="Y"),
+        om_chain(6, "1", om_rows(("012330", 50000), ("015760", 50000)),
+                 page=2),
+        om_chain(7, "3", s2_falling1, cont_yn="Y"),
+        om_chain(8, "3", om_rows(("006660", 45000), ("001440", 10000)),
+                 page=2),
+        # pair 3: snapshot 3 (the offset +1 trap prices)
+        om_chain(9, "1", om_rows(("005930", 40000), ("012330", 20000))),
+        om_chain(10, "3", s3_falling),
+    ]
+    seq = 11
+    for symbol in sorted(OM_MA20_CLOSES):
+        records.append(ka10081_record(seq, symbol, OM_MA20_CLOSES[symbol]))
+        seq += 1
+    records.append(ka10081_record(seq, "005490", 10000, completed=19))
+    return records
+
+
+def om_item(ev, ma20_tag):
+    """The §3.7 opening-mode item of a fixture fact: the nine-field
+    whitelist, ma20_tag set by the mode, every other value the fact's
+    own recorded value."""
+    item = {k: ev[k] for k in ("data_quality", "direction", "event_id",
+                               "event_type", "observed_at", "symbol")}
+    item["ma20_tag"] = ma20_tag
+    item["name"] = OM_NAMES.get(ev["symbol"])
+    item["rank"] = ev.get("rank")
+    return item
+
+
+def om_expected(ref_stamp, rising, falling):
+    history = [
+        mv_change("CANDIDATE_EXITED", om_g2_017960x(ref_stamp), None, 5,
+                  OM_NAMES),
+        mv_change("TOP10_ENTERED", om_g2_011060(ref_stamp), 3, None,
+                  OM_NAMES),
+        mv_change("TOP10_ENTERED", om_g2_006660(ref_stamp), 7, None,
+                  OM_NAMES),
+    ]
+    return {
+        "as_of": OM_TEND,
+        "falling_top10": falling,
+        "history": history,
+        "latest": {"data_quality": "INCOMPLETE",
+                   "event_id": OM_TAIL["event_id"],
+                   "event_type": "SUBSCRIPTION_TRUNCATED",
+                   "observed_at": OM_TEND},
+        "mode": "opening_ma20",
+        "run": {"environment": "demo", "run_id": OM_WINNER,
+                "session": OM_WINNER, "session_date": OM_SESSION_DATE},
+        "rising_top10": rising,
+        "runs_present": True,
+        "status": {"by_data_quality": {"INCOMPLETE": 1, "OBSERVING": 16}},
+    }
+
+
+def om_expected_bodies(ref_stamp):
+    """The three correspondence variants' expected bodies (offset 0
+    reads snapshot 2, +1 snapshot 3, -1 snapshot 1 — the trap prices
+    differ per snapshot, so each variant's lists are distinct)."""
+    g1 = OM_G1_BY_SYMBOL
+    zero = om_expected(
+        ref_stamp,
+        [om_item(g1["000660"], "ABOVE"), om_item(g1["009150"], "ABOVE"),
+         om_item(g1["012330"], "ABOVE"), om_item(g1["005930"], "ABOVE"),
+         om_item(g1["015760"], "ABOVE")],
+        [om_item(om_g2_011060(ref_stamp), "BELOW"),
+         om_item(g1["008480"], "BELOW"),
+         om_item(om_g2_006660(ref_stamp), "BELOW")])
+    plus_one = om_expected(
+        ref_stamp,
+        [om_item(om_g2_011060(ref_stamp), "ABOVE"),
+         om_item(om_g2_006660(ref_stamp), "ABOVE")],
+        [om_item(g1["012330"], "BELOW"), om_item(g1["005930"], "BELOW")])
+    minus_one = om_expected(
+        ref_stamp,
+        [om_item(om_g2_011060(ref_stamp), "ABOVE")],
+        [om_item(g1["000660"], "BELOW"),
+         om_item(om_g2_006660(ref_stamp), "BELOW"),
+         om_item(g1["005930"], "BELOW")])
+    return zero, plus_one, minus_one
+
+
+def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0"):
+    """The §3.7 opening-mode fixture tree: the eligible winner run and
+    one smoke-like ineligible directory (runs_present stays true while
+    selection has exactly one eligible run)."""
+    box = Sandbox()
+    run_dir = box.session_dir(OM_WINNER)
+    box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+        {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+        {"kind": "config", "raw": {"environment": "demo",
+                                   "run_id": OM_WINNER,
+                                   "session_date": OM_SESSION_DATE},
+         "seq": 2},
+        *om_winner_input(variant)))
+    box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+              jsonl(*om_winner_events(ref_stamp)))
+    smoke = box.session_dir("smoke-like-2026-11-10")
+    box.write(os.path.join(smoke, "input.hcj.jsonl"), jsonl(
+        {"kind": "config", "raw": {"session_date": OM_SESSION_DATE},
+         "seq": 1}))
+    box.write(os.path.join(smoke, "events.hcj.jsonl"), b"")
+    return box
 
 
 def jsonl(*objects):
@@ -1273,7 +1566,7 @@ class MarketViewSuite(unittest.TestCase):
         # folding it would flip the name null — the response stays the
         # committed one exactly
         torn = canonical(rest_resp_record(
-            8, ka10027_body([("011060", "SK텔레콤")])))
+            8, ka10027_body([("011060", "SK텔레콤", 17000)])))
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
             f.write(torn[: len(torn) // 2])
@@ -1294,7 +1587,8 @@ class MarketViewSuite(unittest.TestCase):
     def test_market_view_name_envelope_violation_is_data_fault(self):
         # body_hex is an envelope field the recorder itself guarantees
         # (hex): a committed record violating it is corruption
-        record = rest_resp_record(8, ka10027_body([("011060", "SK텔레콤")]))
+        record = rest_resp_record(8, ka10027_body([("011060", "SK텔레콤",
+                                                    17000)]))
         record["raw"]["body_hex"] = "zz" + record["raw"]["body_hex"][2:]
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
@@ -1327,7 +1621,7 @@ class MarketViewSuite(unittest.TestCase):
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
             f.write(canonical(rest_resp_record(
-                8, ka10027_body([("011060", "SK텔레콤")]))) + b"\n")
+                8, ka10027_body([("011060", "SK텔레콤", 17000)]))) + b"\n")
         status, body, _, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status, 200)
         self.assertEqual(body["falling_top10"][0]["symbol"], "011060")
@@ -1384,8 +1678,8 @@ class MarketViewEmptySuite(unittest.TestCase):
         box = Sandbox()
         self.run_with(box)
         expected = {"as_of": None, "falling_top10": [], "history": [],
-                    "latest": None, "rising_top10": [], "run": None,
-                    "runs_present": False, "status": None}
+                    "latest": None, "mode": "core", "rising_top10": [],
+                    "run": None, "runs_present": False, "status": None}
         status, body, raw, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
@@ -1406,8 +1700,9 @@ class MarketViewEmptySuite(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {"as_of": None, "falling_top10": [],
                                 "history": [], "latest": None,
-                                "rising_top10": [], "run": None,
-                                "runs_present": True, "status": None})
+                                "mode": "core", "rising_top10": [],
+                                "run": None, "runs_present": True,
+                                "status": None})
 
     def test_selected_run_zero_committed_events(self):
         box = Sandbox()
@@ -1423,7 +1718,7 @@ class MarketViewEmptySuite(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {
             "as_of": None, "falling_top10": [], "history": [],
-            "latest": None, "rising_top10": [],
+            "latest": None, "mode": "core", "rising_top10": [],
             "run": {"environment": "demo", "run_id": None,
                     "session": "market-2026-11-09-empty",
                     "session_date": "2026-11-09"},
@@ -1431,13 +1726,237 @@ class MarketViewEmptySuite(unittest.TestCase):
             "status": {"by_data_quality": {}}})
 
 
-class MarketNameFoldSuite(unittest.TestCase):
-    """Unit contract of the §3.7 name dictionary: fold_market_names
-    (pure function over recorded bytes) and the Projector's
-    (path, size, mtime_ns) memoization. These are function- and
-    cache-behavior facts the endpoint bytes cannot observe directly
-    (a rescan is byte-identical to a hit); endpoint projection stays
-    black-box in MarketViewSuite."""
+class MarketViewOpeningSuite(unittest.TestCase):
+    """GET /mobile/market-view (README §3.7, VS-2): the opening MA20
+    mode. The window predicate reads the reference group's RECORDED
+    observed_at (converted to KST, never the wall clock); inside
+    [09:00:00, 09:30:00) the top10 lists are reconstituted from the
+    recorded chain-pair prices of that group's snapshot against the
+    recorded twenty-day close sums — the integer cross product, no
+    float. Rank, event_id and direction stay the state item's own
+    recorded values; the mode's only decisions are placement and
+    ma20_tag. Outside the window the response is the core
+    last-record-wins assembly (mode "core")."""
+
+    def setUp(self):
+        self.box = build_opening_sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.server = ServerProc(self.box, with_delivery=False)
+        self.addCleanup(self.reap_server)
+
+    def reap_server(self):
+        code, _ = self.server.stop()
+        self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
+        self.server.assert_gone()
+
+    def _reap(self, server):
+        code, _ = server.stop()
+        self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
+        server.assert_gone()
+
+    def opening_server(self, ref_stamp=OM_REF_STAMP, variant="0"):
+        box = build_opening_sandbox(ref_stamp, variant)
+        self.addCleanup(box.cleanup)
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        return server
+
+    @staticmethod
+    def symbols(body, key):
+        return [item["symbol"] for item in body[key]]
+
+    # -- full-response contract --------------------------------------------
+
+    def test_opening_mode_full_scenario_byte_canonical(self):
+        expected, _, _ = om_expected_bodies(OM_REF_STAMP)
+        status, body, raw, headers = self.server.get_json(
+            "/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
+        self.assertEqual(headers["Content-Type"],
+                         "application/json; charset=utf-8")
+        # the contract's mechanical size bound (README §3.7)
+        self.assertLessEqual(len(raw), 65536)
+        # every top10 item is the nine-field whitelist and no item is
+        # ever served with a null tag inside the mode
+        for item in body["rising_top10"] + body["falling_top10"]:
+            self.assertEqual(sorted(item),
+                             ["data_quality", "direction", "event_id",
+                              "event_type", "ma20_tag", "name",
+                              "observed_at", "rank", "symbol"])
+            self.assertIn(item["ma20_tag"], ("ABOVE", "BELOW"))
+
+    def test_opening_mode_consecutive_requests_identical(self):
+        # determinism through the memoized fold: two consecutive
+        # requests serve identical bytes (a cache hit is byte-identical
+        # to a rescan, and never a different answer)
+        raw1 = self.server.get("/mobile/market-view")[1]
+        raw2 = self.server.get("/mobile/market-view")[1]
+        self.assertEqual(raw1, raw2)
+
+    # -- recorded fields stay verbatim --------------------------------------
+
+    def test_opening_mode_recorded_fields_stay_verbatim(self):
+        # the mode never re-judges: the dual-direction 006660 is ONE
+        # item (the later DOWN upsert wins the per-symbol dedup of the
+        # two ranking legs) with its recorded DOWN rank and the
+        # group-2 event id; UP and DOWN mix freely across the two lists
+        # because classification is price-vs-MA20, not direction
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        both = body["rising_top10"] + body["falling_top10"]
+        self.assertEqual([i["symbol"] for i in both].count("006660"), 1)
+        item = next(i for i in both if i["symbol"] == "006660")
+        self.assertEqual(item["direction"], "DOWN")
+        self.assertEqual(item["rank"], 7)
+        self.assertEqual(item["event_id"],
+                         om_g2_006660(OM_REF_STAMP)["event_id"])
+        self.assertEqual(item["observed_at"], OM_REF_STAMP)
+        # 000660's own recorded DOWN rank 1 rides along in the RISING
+        # list: the placement is the mode's, the fields are recorded
+        rising = {i["symbol"]: i for i in body["rising_top10"]}
+        self.assertEqual(rising["000660"]["rank"], 1)
+        self.assertEqual(rising["000660"]["direction"], "DOWN")
+        self.assertEqual(rising["000660"]["event_id"],
+                         OM_G1_BY_SYMBOL["000660"]["event_id"])
+
+    def test_opening_mode_order_ties_and_cross_product(self):
+        # above: descending distance from MA20 — 000660 and 009150
+        # share +0.2, the symbol codepoint breaks the tie; 012330
+        # before 015760 is the integer cross product 20·P₁·ΣC₂ vs
+        # 20·P₂·ΣC₁ (equal P, the larger close sum is further above).
+        # below: ascending distance (furthest below first)
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(self.symbols(body, "rising_top10"),
+                         ["000660", "009150", "012330", "005930", "015760"])
+        self.assertEqual(self.symbols(body, "falling_top10"),
+                         ["011060", "008480", "006660"])
+        self.assertTrue(all(i["ma20_tag"] == "ABOVE"
+                            for i in body["rising_top10"]))
+        self.assertTrue(all(i["ma20_tag"] == "BELOW"
+                            for i in body["falling_top10"]))
+
+    def test_opening_mode_excludes_unclassifiable_symbols(self):
+        # honest exclusion, never a fallback to the core lists: 001440
+        # sits exactly at MA20 (20·P == ΣC — neither side), 003490 has
+        # closes but no price in the mapped snapshot, 002420 has no
+        # ka10081 record, 005490 only nineteen completed days; 017960
+        # left the reference group (EXITED) and no snapshot carries it
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        served = {i["symbol"] for i in body["rising_top10"]
+                  + body["falling_top10"]}
+        for symbol in ("001440", "003490", "002420", "005490", "017960"):
+            self.assertNotIn(symbol, served)
+
+    # -- the chain-pair correspondence --------------------------------------
+
+    def test_opening_mode_offset_zero_is_the_default(self):
+        # snapshots 1 and 3 carry trap prices that would flip the
+        # classification (005930 +50000/+40000 would be BELOW, 011060
+        # +90000 and 006660 +99000 would be ABOVE): the served tags can
+        # only come from snapshot 2 — the same-index correspondence
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        rising = {i["symbol"]: i for i in body["rising_top10"]}
+        falling = {i["symbol"]: i for i in body["falling_top10"]}
+        self.assertEqual(rising["005930"]["ma20_tag"], "ABOVE")
+        self.assertEqual(rising["009150"]["ma20_tag"], "ABOVE")
+        self.assertEqual(falling["011060"]["ma20_tag"], "BELOW")
+        self.assertEqual(falling["006660"]["ma20_tag"], "BELOW")
+
+    def test_opening_mode_offset_plus_one(self):
+        # snapshot 2 lacks 011060, snapshot 3 carries both upserts: the
+        # +1 mapping holds and snapshot 3's (trap) prices are served
+        server = self.opening_server(variant="+1")
+        _, expected, _ = om_expected_bodies(OM_REF_STAMP)
+        status, body, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
+
+    def test_opening_mode_offset_minus_one(self):
+        # neither snapshot 2 nor 3 carries 011060, snapshot 1 carries
+        # both upserts: the -1 mapping holds and snapshot 1's prices
+        # are served
+        server = self.opening_server(variant="-1")
+        _, _, expected = om_expected_bodies(OM_REF_STAMP)
+        status, body, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
+
+    def test_opening_mode_all_offsets_fail_is_data_fault(self):
+        # no snapshot's symbol set covers the reference group's
+        # upserts: the recorded backing for the mode is incomplete and
+        # the endpoint fails closed — never a core fallback
+        server = self.opening_server(variant="none")
+        status, _, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+
+    # -- the window -------------------------------------------------------
+
+    def test_opening_mode_window_boundaries(self):
+        # the half-open window over the reference group's recorded KST
+        # time-of-day: 09:00:00 in, 09:30:00 out. Outside it the core
+        # last-record-wins assembly is served with null ma20_tag
+        for stamp, mode in (("2026-11-10T08:59:59+09:00", "core"),
+                            ("2026-11-10T09:00:00+09:00", "opening_ma20"),
+                            ("2026-11-10T09:29:59+09:00", "opening_ma20"),
+                            ("2026-11-10T09:30:00+09:00", "core")):
+            server = self.opening_server(ref_stamp=stamp)
+            status, body, _, _ = server.get_json("/mobile/market-view")
+            self.assertEqual(status, 200, stamp)
+            self.assertEqual(body["mode"], mode, stamp)
+            if mode == "opening_ma20":
+                # the reference group is the last CONFIRMED group: the
+                # unsealed 10:05 group never takes over
+                self.assertEqual(self.symbols(body, "rising_top10"),
+                                 ["000660", "009150", "012330", "005930",
+                                  "015760"], stamp)
+                self.assertEqual(self.symbols(body, "falling_top10"),
+                                 ["011060", "008480", "006660"], stamp)
+                stamps = {i["observed_at"] for i in body["rising_top10"]
+                          + body["falling_top10"]}
+                self.assertEqual(stamps, {stamp, OM_T1})
+            else:
+                self.assertEqual(self.symbols(body, "rising_top10"),
+                                 ["005930", "006660", "012330", "015760",
+                                  "002420", "005490"], stamp)
+                self.assertEqual(self.symbols(body, "falling_top10"),
+                                 ["000660", "011060", "009150", "006660",
+                                  "008480", "001440", "003490"], stamp)
+                self.assertTrue(all(i["ma20_tag"] is None for i
+                                    in body["rising_top10"]
+                                    + body["falling_top10"]), stamp)
+
+    def test_opening_mode_stamp_zone_is_converted(self):
+        # the window predicate converts the recorded stamp to KST:
+        # 00:20+00:00 is 09:20 KST — inside the window
+        server = self.opening_server(ref_stamp="2026-11-10T00:20:00+00:00")
+        status, body, _, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "opening_ma20")
+        self.assertEqual(self.symbols(body, "falling_top10"),
+                         ["011060", "008480", "006660"])
+
+    def test_opening_mode_stamp_shape_violation_is_data_fault(self):
+        # the reference group's stamp is not the event schema's offset
+        # shape: the predicate never guesses, it fails closed
+        server = self.opening_server(ref_stamp="2026-11-10T09:10:00")
+        status, _, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+
+
+class MarketFoldSuite(unittest.TestCase):
+    """Unit contract of the §3.7 market fold: fold_market_projection
+    (the pure function over one input.hcj.jsonl's recorded bytes — the
+    ka10027 name dictionary, the ka10027 chain-pair price snapshots and
+    the ka10081 twenty-close sums) and the Projector's (path, size,
+    mtime_ns) memoization. These are function- and cache-behavior facts
+    the endpoint bytes cannot observe directly (a rescan is
+    byte-identical to a hit); endpoint projection stays black-box in
+    MarketViewSuite and MarketViewOpeningSuite."""
 
     def setUp(self):
         self.box = Sandbox()
@@ -1450,29 +1969,35 @@ class MarketNameFoldSuite(unittest.TestCase):
                        jsonl(*records) + torn)
         return os.path.join(run_dir, "input.hcj.jsonl")
 
+    # -- the name dictionary -----------------------------------------------
+
     def test_fold_latest_wins_and_skips(self):
         path = self.write_input(
             {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
             rest_resp_record(2, MV_ERROR_BODY, status=429),
-            rest_resp_record(3, ka10027_body([("005930", "삼성전자"),
-                                              ("006660", "구형이름")])),
+            rest_resp_record(3, ka10027_body([("005930", "삼성전자", 75000),
+                                              ("006660", "구형이름", 45000)])),
             rest_resp_record(4, MV_KA10080_BODY, api_id="ka10080"),
-            rest_resp_record(5, ka10027_body([("006660", "LG전자")]),
+            rest_resp_record(5, ka10027_body([("006660", "LG전자", 45000)]),
                              page=2),
             {"kind": "ws_frame", "raw": {"price": 1}, "seq": 6},
             # a non-object body: recorded verbatim, no ranking to fold
             rest_resp_record(7, {"body": "not-a-ranking"}),
             torn=canonical(rest_resp_record(
-                8, ka10027_body([("000660", "SK하이닉스")])))
+                8, ka10027_body([("000660", "SK하이닉스", 120000)])))
                 [:40])  # torn tail: not committed, never folded
-        self.assertEqual(serve.fold_market_names(path),
-                         {"005930": "삼성전자", "006660": "LG전자"})
+        # no falling leg ever completes: zero snapshots, no bars
+        self.assertEqual(serve.fold_market_projection(path, "2026-11-09"),
+                         ({"005930": "삼성전자", "006660": "LG전자"},
+                          [], {}))
 
     def test_fold_absent_and_empty_input(self):
-        self.assertEqual(serve.fold_market_names(
-            os.path.join(self.runs, "no-such-run", "input.hcj.jsonl")), {})
+        self.assertEqual(serve.fold_market_projection(
+            os.path.join(self.runs, "no-such-run", "input.hcj.jsonl"),
+            "2026-11-09"), ({}, [], {}))
         path = self.write_input()
-        self.assertEqual(serve.fold_market_names(path), {})
+        self.assertEqual(serve.fold_market_projection(path, "2026-11-09"),
+                         ({}, [], {}))
 
     def test_fold_non_json_body_contributes_nothing(self):
         # error bodies preserved verbatim (text, empty) are legitimately
@@ -1487,85 +2012,214 @@ class MarketNameFoldSuite(unittest.TestCase):
             rest_resp_record(2, "plain 429 text", status=429),
             rest_resp_record(3, {"return_code": 5}, status=429),
             raw_body)
-        self.assertEqual(serve.fold_market_names(path), {})
+        self.assertEqual(serve.fold_market_projection(path, "2026-11-09"),
+                         ({}, [], {}))
 
     def test_fold_malformed_committed_line_is_data_fault(self):
         path = self.write_input(
-            rest_resp_record(2, ka10027_body([("005930", "삼성전자")])))
+            rest_resp_record(2, ka10027_body([("005930", "삼성전자", 75000)])))
         with open(path, "ab") as f:
             f.write(b"{not json}\n")
         with self.assertRaises(serve.DataFault):
-            serve.fold_market_names(path)
+            serve.fold_market_projection(path, "2026-11-09")
 
     def test_fold_envelope_violations_are_data_fault(self):
-        bad_raw = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        bad_raw = rest_resp_record(2, ka10027_body([("005930", "삼성전자",
+                                                     75000)]))
         bad_raw["raw"] = "not-an-object"
-        bad_api = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        bad_api = rest_resp_record(2, ka10027_body([("005930", "삼성전자",
+                                                     75000)]))
         bad_api["raw"]["api_id"] = 10027
-        bad_hex = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        bad_hex = rest_resp_record(2, ka10027_body([("005930", "삼성전자",
+                                                     75000)]))
         bad_hex["raw"]["body_hex"] = "zz"
-        no_hex = rest_resp_record(2, ka10027_body([("005930", "삼성전자")]))
+        no_hex = rest_resp_record(2, ka10027_body([("005930", "삼성전자",
+                                                    75000)]))
         del no_hex["raw"]["body_hex"]
         for label, record in (("raw", bad_raw), ("api_id", bad_api),
                               ("hex", bad_hex), ("no body_hex", no_hex)):
             path = self.write_input(record)
             with self.assertRaises(serve.DataFault, msg=label):
-                serve.fold_market_names(path)
+                serve.fold_market_projection(path, "2026-11-09")
 
-    def test_fold_row_violation_is_data_fault(self):
-        for label, rows in (("row not object", ["005930"]),
-                            ("no stk_nm", [{"stk_cd": "005930"}]),
-                            ("no stk_cd", [{"stk_nm": "삼성전자"}]),
-                            ("non-string", [{"stk_cd": 59530,
-                                             "stk_nm": "삼성전자"}])):
+    def test_fold_ka10027_row_violation_is_data_fault(self):
+        for label, rows in (
+                ("row not object", ["005930"]),
+                ("no stk_nm", [{"cur_prc": "+1000", "stk_cd": "005930"}]),
+                ("no stk_cd", [{"cur_prc": "+1000", "stk_nm": "삼성전자"}]),
+                ("no cur_prc", [{"stk_cd": "005930", "stk_nm": "삼성전자"}]),
+                ("unsigned cur_prc",
+                 [{"cur_prc": "1000", "stk_cd": "005930",
+                   "stk_nm": "삼성전자"}]),
+                ("non-string cur_prc",
+                 [{"cur_prc": 1000, "stk_cd": "005930",
+                   "stk_nm": "삼성전자"}]),
+                ("non-string", [{"cur_prc": "+1000", "stk_cd": 59530,
+                                 "stk_nm": "삼성전자"}])):
             path = self.write_input(rest_resp_record(2, {
                 "pred_pre_flu_rt_upper": rows,
                 "return_code": 0, "return_msg": label}))
             with self.assertRaises(serve.DataFault, msg=label):
-                serve.fold_market_names(path)
+                serve.fold_market_projection(path, "2026-11-09")
 
-    def test_names_cache_hit_and_invalidation(self):
+    def test_fold_ka10027_query_violation_is_data_fault(self):
+        for label, kwargs in (("sort_tp", {"sort_tp": "2"}),
+                              ("page", {"page": 0}),
+                              ("cont_yn", {"cont_yn": 1})):
+            path = self.write_input(
+                rest_resp_record(2, ka10027_body(om_rows(("005930", 75000))),
+                                 **kwargs))
+            with self.assertRaises(serve.DataFault, msg=label):
+                serve.fold_market_projection(path, "2026-11-09")
+
+    # -- the chain-pair snapshots -------------------------------------------
+
+    def test_fold_chain_pairs_form_snapshots(self):
+        # a rising leg over two pages and a falling leg over two pages
+        # merge into ONE snapshot (union; a same-symbol collision is
+        # won by the falling row); the next completed pair appends the
+        # next snapshot
+        path = self.write_input(
+            om_chain(2, "1", om_rows(("005930", 75000),
+                                     ("000660", 120000)), cont_yn="Y"),
+            om_chain(3, "1", om_rows(("009150", 30000)), page=2),
+            om_chain(4, "3", om_rows(("005930", 74000)), cont_yn="Y"),
+            om_chain(5, "3", om_rows(("011060", 17000)), page=2),
+            om_chain(6, "1", om_rows(("012330", 50000))),
+            om_chain(7, "3", om_rows(("012330", 49000))))
+        _, snapshots, _ = serve.fold_market_projection(path, "2026-11-10")
+        self.assertEqual(snapshots, [
+            {"005930": 74000, "000660": 120000, "009150": 30000,
+             "011060": 17000},
+            {"012330": 49000}])
+
+    def test_fold_interrupted_chain_is_dropped(self):
+        # a page-1 restart abandons the chain being read: its prices
+        # never enter a snapshot — only the restarted, completed chain
+        # pairs with the falling leg
+        path = self.write_input(
+            om_chain(2, "1", om_rows(("005930", 75000)), cont_yn="Y"),
+            om_chain(3, "1", om_rows(("000660", 120000)), cont_yn="Y"),
+            om_chain(4, "1", om_rows(("012330", 50000)), page=2),
+            om_chain(5, "3", om_rows(("011060", 17000))))
+        _, snapshots, _ = serve.fold_market_projection(path, "2026-11-10")
+        self.assertEqual(snapshots,
+                         [{"000660": 120000, "012330": 50000,
+                           "011060": 17000}])
+
+    def test_fold_falling_chain_without_rising_is_own_snapshot(self):
+        # a completed falling leg with no pending rising leg is a
+        # snapshot of its own — consecutive falling legs are two
+        # snapshots
+        path = self.write_input(
+            om_chain(2, "3", om_rows(("011060", 17000))),
+            om_chain(3, "3", om_rows(("008480", 20000))))
+        _, snapshots, _ = serve.fold_market_projection(path, "2026-11-10")
+        self.assertEqual(snapshots, [{"011060": 17000},
+                                     {"008480": 20000}])
+
+    # -- the ka10081 close sums ---------------------------------------------
+
+    def test_fold_ka10081_sums_completed_closes(self):
+        # the session's in-progress bar (dt == session_date) is never
+        # summed; nineteen completed days make no twenty-close sum
+        path = self.write_input(
+            ka10081_record(2, "005930", 70000),
+            ka10081_record(3, "005490", 10000, completed=19))
+        _, _, ma20 = serve.fold_market_projection(path, "2026-11-10")
+        self.assertEqual(ma20, {"005930": 1400000})
+
+    def test_fold_ka10081_caps_twenty_and_dedups_days(self):
+        # a twenty-first completed day and a repeated dt are both
+        # skipped: the sum is exactly the first twenty distinct days
+        rows = [ka10081_row("20261110", 88888)]  # the in-progress bar
+        dts = om_dts(20)
+        rows += [ka10081_row(dt, 1000) for dt in dts]
+        rows.append(ka10081_row(dts[0], 9999))      # the same day twice
+        rows.append(ka10081_row("20261012", 9999))  # a 21st older day
+        record = rest_resp_record(
+            2, {"return_code": 0, "return_msg": "정상처리 되었습니다.",
+                "stk_dt_pole_chart_qry": rows},
+            api_id="ka10081",
+            query={"base_dt": "", "stk_cd": "005930", "tick_kind": "2"})
+        path = self.write_input(record)
+        _, _, ma20 = serve.fold_market_projection(path, "2026-11-10")
+        self.assertEqual(ma20, {"005930": 20000})
+
+    def test_fold_ka10081_violation_is_data_fault(self):
+        for label, row, query in (
+                ("dt not YYYYMMDD",
+                 {"cur_prc": "1000", "dt": "2026-1-09"},
+                 {"stk_cd": "005930"}),
+                ("signed cur_prc",
+                 {"cur_prc": "+1000", "dt": "20261109"},
+                 {"stk_cd": "005930"}),
+                ("no query stk_cd",
+                 {"cur_prc": "1000", "dt": "20261109"}, {})):
+            path = self.write_input(rest_resp_record(
+                2, {"return_code": 0, "return_msg": label,
+                    "stk_dt_pole_chart_qry": [row]},
+                api_id="ka10081", query=query))
+            with self.assertRaises(serve.DataFault, msg=label):
+                serve.fold_market_projection(path, "2026-11-10")
+
+    def test_fold_session_date_shape_is_validated(self):
+        # the fold validates the selected run's own recorded session
+        # date before any row is folded
+        path = self.write_input(
+            ka10081_record(2, "005930", 70000))
+        for bad in ("2026-11-9", "20261110", 20261110):
+            with self.assertRaises(serve.DataFault):
+                serve.fold_market_projection(path, bad)
+
+    # -- memoization -------------------------------------------------------
+
+    def test_fold_cache_hit_and_invalidation(self):
         # same (path, size, mtime_ns) -> no rescan; a committed append
         # changes the stat -> rescan serves the new recorded name
         path = self.write_input(
-            rest_resp_record(2, ka10027_body([("005930", "삼성전자")])))
+            om_chain(2, "1", om_rows(("005930", 75000))))
         projector = serve.Projector(self.runs, self.box.ledger)
         calls = []
-        real_fold = serve.fold_market_names
+        real_fold = serve.fold_market_projection
 
-        def counting_fold(p):
-            calls.append(p)
-            return real_fold(p)
-        serve.fold_market_names = counting_fold
-        self.addCleanup(setattr, serve, "fold_market_names", real_fold)
-        first = projector._market_names(path)
-        self.assertEqual(first, {"005930": "삼성전자"})
+        def counting_fold(p, session_date):
+            calls.append((p, session_date))
+            return real_fold(p, session_date)
+        serve.fold_market_projection = counting_fold
+        self.addCleanup(setattr, serve, "fold_market_projection",
+                        real_fold)
+        first = projector._market_projection(path, "2026-11-09")
+        self.assertEqual(first, ({"005930": "삼성전자"}, [], {}))
         self.assertEqual(len(calls), 1)
         # identical stat: served from the cache, fold not re-entered
-        self.assertEqual(projector._market_names(path), first)
+        self.assertEqual(projector._market_projection(path, "2026-11-09"),
+                         first)
         self.assertEqual(len(calls), 1)
         # a committed append changes size: rescan, new name served
         with open(path, "ab") as f:
-            f.write(canonical(rest_resp_record(
-                3, ka10027_body([("006660", "LG전자")]))) + b"\n")
-        second = projector._market_names(path)
-        self.assertEqual(second, {"005930": "삼성전자", "006660": "LG전자"})
+            f.write(canonical(om_chain(3, "1",
+                                       om_rows(("006660", 45000)))) + b"\n")
+        second = projector._market_projection(path, "2026-11-09")
+        self.assertEqual(second[0], {"005930": "삼성전자",
+                                     "006660": "LG전자"})
         self.assertEqual(len(calls), 2)
 
-    def test_names_cache_not_published_for_absent_file(self):
+    def test_fold_cache_not_published_for_absent_file(self):
         # a vanished input folds to {} and publishes nothing: a later
         # re-created file must be scanned, not served stale
         path = self.write_input(
-            rest_resp_record(2, ka10027_body([("005930", "삼성전자")])))
+            om_chain(2, "1", om_rows(("005930", 75000))))
         projector = serve.Projector(self.runs, self.box.ledger)
-        self.assertEqual(projector._market_names(path),
-                         {"005930": "삼성전자"})
+        self.assertEqual(projector._market_projection(path, "2026-11-09"),
+                         ({"005930": "삼성전자"}, [], {}))
         os.remove(path)
-        self.assertEqual(projector._market_names(path), {})
-        self.write_input(rest_resp_record(
-            2, ka10027_body([("006660", "LG전자")])))
-        self.assertEqual(projector._market_names(path),
-                         {"006660": "LG전자"})
+        self.assertEqual(projector._market_projection(path, "2026-11-09"),
+                         ({}, [], {}))
+        self.write_input(om_chain(2, "1", om_rows(("006660", 45000))))
+        self.assertEqual(
+            projector._market_projection(path, "2026-11-09")[0],
+            {"006660": "LG전자"})
 
 
 class TornLedgerSuite(unittest.TestCase):
