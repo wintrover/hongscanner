@@ -107,6 +107,7 @@ proc dirKinds(dirs: seq[Directive]): seq[string] =
                of dkReg: "reg"
                of dkRemove: "remove"
                of dkRestReq: "rest_req"
+               of dkDailyReq: "daily_req"
                of dkRefreshToken: "refresh_token"
                of dkDisarm: "disarm"
                of dkWaitDrain: "wait_drain"
@@ -312,9 +313,10 @@ block collectorInitialSelection:
         recs[1].raw.get("symbol").kind == hkNull)
   check("initial: the REG directive carries exactly the selected 100+100 " &
         "in vendor order",
-        dirs.dirKinds() == @["reg"] and dirs[0].data.len == 1 and
+        dirs.dirKinds() == @["reg", "daily_req"] and dirs[0].data.len == 1 and
         dirs[0].data[0].typ == "0B" and
-        dirs[0].data[0].codes == ups[0 ..< 100] & downs[0 ..< 100])
+        dirs[0].data[0].codes == ups[0 ..< 100] & downs[0 ..< 100] and
+        dirs[1].daily.stkCd == ups[0])
   check("initial: candPending itself holds the selection — every later " &
         "compose path sees the selected sets",
         c.candPending.up == ups[0 ..< 100] and
@@ -360,7 +362,7 @@ block scopeExclusionLive:
         "scope_excluded_count=0" in detailToken(recs[2].raw))
   check("scope: the REG carries only candidate-shaped codes — the ELW " &
         "never reaches composition",
-        dirs.dirKinds() == @["reg"] and dirs[0].data[0].codes ==
+        dirs.dirKinds() == @["reg", "daily_req"] and dirs[0].data[0].codes ==
           codesOf(149, 100000)[0 ..< 100] & downs[0 ..< 100])
 
 # ----------------------------------------------- collector: below the cap
@@ -431,7 +433,7 @@ block truncatedAndSelection:
         "direction=up" notin detailToken(recs[2].raw))
   check("truncated leg: the REG carries the 3 up candidates and the " &
         "first 100 down codes",
-        dirs.dirKinds() == @["reg"] and dirs[0].data[0].codes ==
+        dirs.dirKinds() == @["reg", "daily_req"] and dirs[0].data[0].codes ==
           codesOf(3, 100000) & downs[0 ..< 100] and
         c.awaiting == awCandReg and not c.incomplete)
 

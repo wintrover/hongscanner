@@ -111,6 +111,22 @@ REST_PATH = "/api/dostk/rkinfo"
 CHART_REST_PATH = "/api/dostk/chart"
 CHART_API_ID = "ka10080"
 CHART_PARAM_FIELDS = ["stk_cd", "tic_scope", "upd_stkpc_tp"]
+# ka10081 주식일봉차트조회요청 (mock-measured 2026-11-10, agent-59 capture
+# preserved at /tmp/hs-ka10081/; not in the official spec JSON): one
+# daily-chart page per command — the declared capture scope is a single
+# page (the recent 20+ completed trading days fit inside one 600-row
+# page), so this command carries no cont-yn/next-key continuation and
+# page is always 1. Same endpoint as ka10080; all three params are
+# REQUIRED by the measured vendor (an omitted field answers HTTP 200 +
+# body return_code 2 — the core owns that verdict).
+DAILY_API_ID = "ka10081"
+DAILY_PARAM_FIELDS = ["stk_cd", "base_dt", "upd_stkpc_tp"]
+# Measured transport retry (mock): a sub-1 s repeat draws HTTP 429 (body
+# return_code 5, 유량=1) and recovers after a 1 s wait; the shared 1.5 s
+# REST pacing measured zero hits. One bounded retry after a 1 s wait —
+# the final response, whatever it is, is reported once and the core owns
+# the verdict (a second consecutive failure is the reported skip fact).
+DAILY_RETRY_429_WAIT = 1.0
 # base_dt is the documented OPTIONAL request field: present (non-empty
 # string) it is sent verbatim; absent or empty it is omitted from the body.
 TOKEN_BUFFER_SECONDS = 600
@@ -887,6 +903,96 @@ class Sidecar:
                          "cont_yn": cont, "next_key": key,
                          "body_hex": body.hex()})
 
+    # ---------------------------------------------------- ka10081 daily REST
+
+    def do_daily(self, params):
+        """One ka10081 daily chart request on the caller's executor thread
+        (README §2.8) — the do_chart pattern with the measured transport
+        retry: the shared _pace_rest spacing applies to every attempt, the
+        request scope (params) is sent verbatim, and the response is
+        reported raw exactly like do_rest/do_chart. The one bounded retry
+        is transport-level: HTTP 429 (the measured rate limit, body
+        return_code 5) waits 1 s and retries once; the final response,
+        whatever it is, is returned and the core owns the verdict."""
+        attempts = 0
+        while True:
+            self._pace_rest()
+            data = json.dumps(params, ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json;charset=utf-8",
+                "api-id": DAILY_API_ID,
+                "authorization": ("%s %s" % (self.token_type,
+                                             self.token)).strip(),
+            }
+            req = urllib.request.Request(
+                self.rest_domain + CHART_REST_PATH, data=data,
+                headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return (resp.status, resp.headers.get("cont-yn") or "",
+                            resp.headers.get("next-key") or "", resp.read())
+            except urllib.error.HTTPError as e:
+                # An HTTP response with an error status is still a response:
+                # the core owns the verdict (429 included — after the one
+                # bounded retry).
+                try:
+                    body = e.read()
+                    cont = e.headers.get("cont-yn") or ""
+                    key = e.headers.get("next-key") or ""
+                except Exception:
+                    body, cont, key = b"", "", ""
+                if e.code == 429 and attempts == 0:
+                    attempts = 1
+                    time.sleep(DAILY_RETRY_429_WAIT)
+                    continue
+                return e.code, cont, key, body
+            except Exception as exc:
+                raise RestError("transport failed: " + type(exc).__name__)
+
+    def _daily_params(self, cmd):
+        """Validate the daily command's declared scope (transport shape
+        only, README §2.8): api_id pinned to the approved daily API, the
+        three measured required params as non-empty strings. The scope's
+        VALUE authority (the pinned upd_stkpc_tp "1", the YYYYMMDD base_dt
+        form) is the Nim core's vendor_input layer, never this process."""
+        if cmd.get("api_id") != DAILY_API_ID:
+            raise SidecarExit(4, "daily api_id must be " + DAILY_API_ID)
+        params = cmd.get("params")
+        if not isinstance(params, dict):
+            raise SidecarExit(4, "daily command needs a params object")
+        for key in DAILY_PARAM_FIELDS:
+            value = params.get(key)
+            if not isinstance(value, str) or not value:
+                raise SidecarExit(
+                    4, "daily params.%s must be a non-empty string" % key)
+        return dict(params)
+
+    async def handle_daily(self, cmd):
+        params = self._daily_params(cmd)
+        # The declared capture scope is a single page: this command has no
+        # cont-yn/next-key fields at all and page is exactly 1.
+        if isinstance(cmd.get("page"), bool) or \
+           not isinstance(cmd.get("page"), int) or cmd["page"] != 1:
+            raise SidecarExit(4, "daily command page must be 1 (the "
+                                 "declared capture scope is a single page)")
+        loop = asyncio.get_running_loop()
+        try:
+            status, cont, key, body = await loop.run_in_executor(
+                None, self.do_daily, params)
+        except RestError as exc:
+            # The req discriminator names the failed transport as a daily
+            # request (README §3.6): a ka10027 poll page can be in flight
+            # at the same time, and the core must attribute the failure to
+            # the right capture path.
+            self.emit({"ev": "error", "what": "rest", "req": "daily",
+                             "detail": exc.args[0]})
+            return
+        self.emit({"ev": "rest_daily", "api_id": DAILY_API_ID,
+                         "page": 1, "status": status,
+                         "cont_yn": cont, "next_key": key,
+                         "body_hex": body.hex()})
+
     # -------------------------------------------------------- commands
 
     async def handle(self, cmd):
@@ -924,6 +1030,8 @@ class Sidecar:
             await self.handle_rest(cmd)
         elif ctype == "chart_req":
             await self.handle_chart(cmd)
+        elif ctype == "daily_req":
+            await self.handle_daily(cmd)
         elif ctype == "refresh_token":
             try:
                 self.acquire_token(force=True)

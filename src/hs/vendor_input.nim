@@ -27,6 +27,27 @@
 ##   high_pric low_pric pred_pre pred_pre_sig acc_trde_qty); cur_prc is
 ##   부호가 포함된 숫자 (원), cntr_tm is 체결시간 YYYYMMDDHHmmss. The
 ##   mock domain is https://mockapi.kiwoom.com (KRX only).
+##   ka10081 주식일봉차트조회요청 — POST /api/dostk/chart (same path as
+##   ka10080), JSON. MEASURED on the mock server 2026-11-10 (agent-59
+##   capture preserved at /tmp/hs-ka10081/): ka10081 is NOT in the official
+##   spec JSON — every shape below is mock-measured, real environment
+##   UNVERIFIED. Request body (String, all three REQUIRED — the vendor
+##   answers a missing field with HTTP 200 + return_code 2): stk_cd,
+##   base_dt (YYYYMMDD; current or past dates), upd_stkpc_tp (0 or 1; both
+##   measured accepted — the 0/1 value difference itself is UNMEASURED,
+##   mock upd_rt is 0.00 in both modes). Response body: return_code,
+##   return_msg, stk_cd (echo of the request) and stk_dt_pole_chart_qry
+##   (LIST) of rows with 12 String fields (cur_prc trde_qty trde_prica dt
+##   open_pric high_pric low_pric pred_pre pred_pre_sig trde_tern_rt
+##   upd_stkpc_tp upd_rt); dt is YYYYMMDD, rows newest-first (the first
+##   row is the base_dt day's in-progress bar), 600 rows per page, and
+##   the page legitimately carries cont-yn=Y + next-key (the vendor offers
+##   continuation) — but the recent-20+-completed-trading-days need is
+##   inside one page, so the declared capture scope never continues.
+##   cur_prc (close) is UNSIGNED here, unlike ka10027's signed cur_prc:
+##   per-TR sign conventions differ. Rate limit: TR 1/s — a sub-1 s
+##   repeat draws HTTP 429 (body return_code 5), recovers after 1 s, and
+##   1.5 s pacing measured zero hits.
 ##   business errors arrive as HTTP 200 with return_code != 0; the official
 ##     example also tolerates an absent return_code (a client-side choice).
 ##   continuation: response headers cont-yn ("Y" while more data) + next-key;
@@ -142,6 +163,11 @@ type
     paginated*: bool         ## explicit subset: only these TRs repeat pages
     listKey*: string         ## response body key holding the row list
     rowFields*: seq[string]  ## documented row fields, documented order
+    extraBodyKeys*: seq[string]  ## measured non-generic top-level body keys
+                                 ## (e.g. ka10081's stk_cd echo); the generic
+                                 ## three (list key, return_code, return_msg)
+                                 ## are always allowed, everything else stays
+                                 ## a schema failure
 
   Direction* = enum
     dirUp    ## sort_tp "1" (상승률)
@@ -167,6 +193,15 @@ type
     ticScope*: string
     updStkpcTp*: string
     baseDt*: string
+
+  Ka10081Query* = object
+    ## The declared request scope of one ka10081 daily chart query: one
+    ## symbol's daily bars, one page. All three fields are REQUIRED by the
+    ## measured vendor contract (unlike ka10080's optional base_dt); the
+    ## acceptance path pins upd_stkpc_tp to the declared capture scope.
+    stkCd*: string
+    baseDt*: string
+    updStkpcTp*: string
 
   PageChain* = object
     ## Ordered pages answering one ka10027 query. Physical order is the
@@ -225,9 +260,27 @@ const
     "cur_prc", "trde_qty", "cntr_tm", "open_pric", "high_pric", "low_pric",
     "pred_pre", "pred_pre_sig", "acc_trde_qty"]
 
+  ka10081ApiId* = "ka10081"
+  ka10081Path* = "/api/dostk/chart"
+  ka10081ListKey* = "stk_dt_pole_chart_qry"
+  ka10081RowFields* = [
+    "cur_prc", "trde_qty", "trde_prica", "dt", "open_pric", "high_pric",
+    "low_pric", "pred_pre", "pred_pre_sig", "trde_tern_rt", "upd_stkpc_tp",
+    "upd_rt"]
+
   ## Request enums, verbatim from the official ka10080 field descriptions.
   ka10080TicScopeValues* = ["1", "3", "5", "10", "15", "30", "45", "60"]
   ka10080UpdStkpcTpValues* = ["0", "1"]
+
+  ## Request enum, measured on the mock server 2026-11-10
+  ## (/tmp/hs-ka10081/): both ka10081 upd_stkpc_tp values are accepted.
+  ka10081UpdStkpcTpValues* = ["0", "1"]
+
+  ## Measured response echo keys: a ka10081 success body repeats the
+  ## requested stk_cd at the top level (ka10080/ka10027 bodies carry no
+  ## such key). Declared per spec so the generic body-key check accepts
+  ## exactly what the measured vendor emits.
+  ka10081BodyEchoKeys* = ["stk_cd"]
 
   ## Request enums, verbatim from the official ka10027 field descriptions.
   ka10027MrktTpValues* = ["000", "001", "101"]
@@ -274,6 +327,21 @@ let
     paginated: true,
     listKey: ka10080ListKey,
     rowFields: @ka10080RowFields)
+
+  ## ka10081 is declared non-paginated: the vendor offers cont-yn/next-key
+  ## continuation, but the declared capture scope is a single page (the
+  ## recent-20+-completed-days need is inside one 600-row page) and a
+  ## measured success page legitimately carries cont-yn=Y. The paginated
+  ## chain rules therefore do NOT apply to it at all — the ka10081 audit
+  ## (rest_resp.nim) enforces the single-page scope itself; validateChainPages
+  ## never sees this spec.
+  ka10081Spec* = TrSpec(
+    apiId: ka10081ApiId,
+    path: ka10081Path,
+    paginated: false,
+    listKey: ka10081ListKey,
+    rowFields: @ka10081RowFields,
+    extraBodyKeys: @ka10081BodyEchoKeys)
 
 proc verr(f: VendorFailure; msg: string): ref VendorInputError =
   let e = newException(VendorInputError, msg)
@@ -447,6 +515,33 @@ proc ka10080RequestBody*(q: Ka10080Query): HcjValue =
       ("tic_scope", hStr(q.ticScope)),
       ("upd_stkpc_tp", hStr(q.updStkpcTp)))
 
+proc validateKa10081Query*(q: Ka10081Query) =
+  ## The measured request fields (mock, 2026-11-10, /tmp/hs-ka10081/):
+  ## stk_cd is a free string (the measured vendor pins no enum), upd_stkpc_tp
+  ## must be a measured enum value, and base_dt is REQUIRED — unlike
+  ## ka10080's optional field — in the measured YYYYMMDD form (8 digits).
+  if q.stkCd.len == 0:
+    raise verr(vfContract, "ka10081 stk_cd must not be empty")
+  requireIn("upd_stkpc_tp", q.updStkpcTp, ka10081UpdStkpcTpValues)
+  if not (q.baseDt.len == 8 and allDigits(q.baseDt)):
+    raise verr(vfContract,
+               "ka10081 base_dt is not the measured YYYYMMDD form: " &
+               q.baseDt)
+
+proc initKa10081Query*(stkCd, baseDt, updStkpcTp: string): Ka10081Query =
+  result = Ka10081Query(stkCd: stkCd, baseDt: baseDt, updStkpcTp: updStkpcTp)
+  validateKa10081Query(result)
+
+proc ka10081RequestBody*(q: Ka10081Query): HcjValue =
+  ## The measured request body fields — all three required. No
+  ## authorization header is produced here: authentication is out of scope
+  ## for this module.
+  validateKa10081Query(q)
+  hObj(
+    ("base_dt", hStr(q.baseDt)),
+    ("stk_cd", hStr(q.stkCd)),
+    ("upd_stkpc_tp", hStr(q.updStkpcTp)))
+
 proc continuationHeaders*(prev: RawHttpResp): tuple[contYn, nextKey: string] =
   ## cont-yn/next-key values for the next request, per spec: set both only
   ## when the previous response header said Y.
@@ -528,7 +623,8 @@ proc parsePageRows*(spec: TrSpec; resp: RawHttpResp): seq[HcjValue] =
                "errors arrive as 200 + return_code; anything else is fail-closed)")
   let doc = parseBodyDoc(resp)
   for p in doc.pairs:
-    if not (p.k == spec.listKey or p.k == "return_code" or p.k == "return_msg"):
+    if not (p.k == spec.listKey or p.k == "return_code" or p.k == "return_msg" or
+            inStrs(p.k, spec.extraBodyKeys)):
       raise verr(vfContract,
                  "response body key outside the documented schema: " & p.k)
   let rc = doc.getOpt("return_code")

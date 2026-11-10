@@ -16,6 +16,14 @@
 ##   - candidate derivation from the preserved REST bytes via
 ##     vendor_input.upDownCandidates (KRX, one query per direction,
 ##     declared page cap; any chain failure is fail-closed);
+##   - the once-per-session ka10081 daily sweep (VS-1, REPLAY_CONTRACT
+##     §12.9): right after the initial pair's derivation and selection the
+##     universe (the pair's ka10027 row stk_cd union, rank order, deduped)
+##     is swept one daily_req at a time; only an affirmed response becomes
+##     a rest_resp record (a failed capture is the daily_capture_failed
+##     gap and the symbol is skipped — fail-closed per symbol, never per
+##     session), each symbol is requested exactly once, and a re-poll
+##     round never extends the universe;
 ##   - the deterministic subscription selection between derivation and
 ##     REG composition (sub_input.selectTopPerDirection, policy
 ##     selectionPolicyId): each direction's first 100 candidates in
@@ -68,17 +76,18 @@ type
     calendar*: HcjValue        ## the approved calendar snapshot (recorded as seq 1)
 
   DirectiveKind* = enum
-    dkConnect, dkReg, dkRemove, dkRestReq, dkRefreshToken, dkDisarm,
-    dkWaitDrain, dkStop
+    dkConnect, dkReg, dkRemove, dkRestReq, dkDailyReq, dkRefreshToken,
+    dkDisarm, dkWaitDrain, dkStop
 
   Directive* = object
     kind*: DirectiveKind
     gen*: int                  ## reg/remove subscription generation
     data*: seq[SubRegItem]     ## reg/remove
     direction*: Direction      ## rest_req
-    page*: int                 ## rest_req
+    page*: int                 ## rest_req / daily_req
     contYn*: string            ## rest_req
     nextKey*: string           ## rest_req
+    daily*: Ka10081Query       ## daily_req (the declared ka10081 scope)
 
   Awaiting* = enum
     awNone, awMarketReg, awCandReg, awSwapRemove, awSwapReg, awTeardownRemove
@@ -117,6 +126,12 @@ type
     closeValues*: seq[string]        ## distinct observed 215 values, in order
     quarantine*: int
     quarantineNotes*: seq[string]
+    dailyUniverse*: seq[string]  ## the once-per-session ka10081 sweep universe
+                                 ## (initial pair's ka10027 row stk_cds, first
+                                 ## appearance order, deduped)
+    dailyCursor*: int            ## index of the next universe symbol to request
+    dailyPending*: string        ## stk_cd of the in-flight daily request (""
+                                 ## = none)
     wsCount*: int
     wsSincePoll*: int
     parseFailures*: int
@@ -339,6 +354,10 @@ proc directiveLine*(d: Directive): string =
            of dirDown: "down")),
       ("next_key", hStr(d.nextKey)), ("page", hInt(d.page)),
       ("type", hStr("rest_req"))))
+  of dkDailyReq:
+    canonical(hObj(("api_id", hStr(ka10081ApiId)),
+      ("page", hInt(d.page)), ("params", ka10081RequestBody(d.daily)),
+      ("type", hStr("daily_req"))))
   of dkRefreshToken:
     canonical(hObj(("type", hStr("refresh_token"))))
   of dkDisarm:
@@ -552,6 +571,83 @@ proc restRespRecord(c: Collector; direction: Direction; page: int;
       ("updown_incls", hStr(q.updownIncls)))),
     ("status", hInt(resp.status))))
 
+proc dailyQueryOf*(cfg: CollectorConfig; stkCd: string): Ka10081Query =
+  ## The declared ka10081 capture scope for one symbol: base_dt is the
+  ## session date in the measured YYYYMMDD form (the response's first row
+  ## is that day's in-progress bar, real-time updated), upd_stkpc_tp is
+  ## the pinned declared capture scope. One page only: the
+  ## recent-20+-completed-trading-days need is inside one 600-row page, so
+  ## no continuation is ever requested.
+  initKa10081Query(stkCd, cfg.sessionDate.replace("-", ""),
+                   declaredDailyUpdStkpcTp)
+
+proc dailyUniverseOf(c: Collector; upPages, downPages: seq[RawHttpResp];
+                     upTruncated, downTruncated: bool): seq[string] =
+  ## The ka10081 sweep universe: the union of the initial pair's ka10027
+  ## row stk_cds — ALL rows, in vendor appearance order (the rank order),
+  ## deduped at first appearance: the up leg was queried first, then the
+  ## down leg's first-seen codes. Out-of-shape codes (the rows the
+  ## derivation partitioned into upExcluded/downExcluded) are included:
+  ## each is a legitimate query symbol and its capture outcome is judged
+  ## per symbol, fail-closed. Built exactly once, at the initial pair's
+  ## completion.
+  for chain in [
+      PageChain(query: c.cfg.queryOf(dirUp), pages: upPages),
+      PageChain(query: c.cfg.queryOf(dirDown), pages: downPages)]:
+    let trunc = if chain.query.direction == dirUp: upTruncated
+                else: downTruncated
+    for cd in chainSymbols(ka10027Spec, chain, c.cfg.pageCap, trunc):
+      if cd notin result:
+        result.add(cd)
+
+proc dailyRespRecord(c: Collector; stkCd: string; resp: RawHttpResp): RecOut =
+  ## One rest_resp record of the daily sweep (rest_resp.nim ka10081 schema:
+  ## declared scope + page + preserved response). Recorded only AFTER the
+  ## response affirmed success (parsePageRows) — the stream's rest_resp
+  ## acceptance path rejects any non-affirming attempt on replay, and the
+  ## per-symbol skip policy (fail-closed, the session continues) must not
+  ## turn one symbol's failed capture into a whole-stream REJECT: a failed
+  ## capture is the daily_capture_failed gap record, never a rest_resp
+  ## record.
+  let q = c.cfg.dailyQueryOf(stkCd)
+  (kRestResp, hObj(
+    ("api_id", hStr(resp.apiId)),
+    ("body_hex", hStr(payloadHexOfBytes(resp.body))),
+    ("cont_yn", hStr(resp.contYn)),
+    ("next_key", hStr(resp.nextKey)),
+    ("page", hInt(1)),
+    ("query", hObj(
+      ("base_dt", hStr(q.baseDt)),
+      ("stk_cd", hStr(q.stkCd)),
+      ("upd_stkpc_tp", hStr(q.updStkpcTp)))),
+    ("status", hInt(resp.status))))
+
+proc dailyStep(c: var Collector): seq[Directive] =
+  ## Issue the next daily_req of the once-per-session sweep, if one remains
+  ## and the session is still in a capturable state: one request in flight
+  ## at a time, each universe symbol exactly once (no re-issue on re-poll —
+  ## a symbol that appears only in a later poll round stays uncaptured and
+  ## is excluded downstream), and nothing new after the close evidence or
+  ## outside the active phases (teardown/drain/end issue nothing).
+  if c.dailyPending.len > 0: return @[]
+  if c.dailyCursor >= c.dailyUniverse.len: return @[]
+  if c.closeSeen: return @[]
+  if c.phase != phCandidateReg and c.phase != phStreaming: return @[]
+  c.dailyPending = c.dailyUniverse[c.dailyCursor]
+  inc c.dailyCursor
+  @[Directive(kind: dkDailyReq, page: 1,
+              daily: c.cfg.dailyQueryOf(c.dailyPending))]
+
+proc dailySkipRecord(stkCd, detail, t: string): RecOut =
+  ## The honest skip: the symbol's daily capture failed (affirmation or
+  ## transport) — it is excluded from this session's daily-bar evidence,
+  ## never marked captured, and the session continues (fail-closed per
+  ## symbol, not per session).
+  gapRecord(stkCd, "daily_capture_failed",
+    "ka10081 daily capture failed (stk_cd " & stkCd & "): " & detail &
+    " — the symbol is skipped, excluded from this session's daily-bar " &
+    "evidence, never marked captured", t)
+
 proc maybeTeardown(c: var Collector; records: var seq[RecOut];
                    t: string): seq[Directive]
 
@@ -735,11 +831,21 @@ proc chainAdvance(c: var Collector; records: var seq[RecOut];
   if finished.purpose == cpInitial:
     c.candPending = cand
     c.candidatesKnown = true
+    # The once-per-session ka10081 daily sweep (VS-1, REPLAY_CONTRACT §12.9):
+    # the universe is the initial pair's row stk_cd union in rank order —
+    # built here, exactly once; a re-poll round never extends it (a symbol
+    # that appears only later stays uncaptured, excluded downstream).
+    c.dailyUniverse = dailyUniverseOf(c, upPages, downPages,
+                                      finished.firstTruncated, truncated)
+    c.dailyCursor = 0
+    c.dailyPending = ""
     let data = composeRegData(cand.up, cand.down)
     result.add(c.issueReg(records, data, t))
     c.awaiting = awCandReg
     c.awaitingGen = c.subGen
     c.phase = phCandidateReg
+    for d in c.dailyStep():
+      result.add(d)
     return
   # poll: swap only when the sets differ.
   if not c.candidatesKnown or not sameCand(cand, c.candidates):
@@ -931,6 +1037,47 @@ proc handleEvent*(c: var Collector; line: string;
     records.add(c.restRespRecord(direction, page, resp))
     c.chain.pages.add(resp)
     result = c.chainAdvance(records, resp, t)
+  of "rest_daily":
+    # One ka10081 daily response (README §3.8): the declared scope was
+    # issued by this core (dkDailyReq), so the pending symbol attributes
+    # the event — the request parameters are never repeated on the wire.
+    let apiId = strE(ev, "api_id")
+    if apiId != ka10081ApiId:
+      raise cerr("rest_daily event api_id must be " & ka10081ApiId & ": " &
+                 apiId)
+    let page = intE(ev, "page")
+    if page != 1:
+      raise cerr("rest_daily event page must be 1 (the declared capture " &
+                 "scope is one page): " & $page)
+    if c.dailyPending.len == 0:
+      raise cerr("unsolicited rest_daily event (no daily request in flight)")
+    let contYn = strE(ev, "cont_yn")
+    if contYn != "Y" and contYn != "N" and contYn != "":
+      raise cerr("rest_daily event cont_yn is not Y|N|\"\": " & contYn)
+    var resp: RawHttpResp
+    try:
+      resp = httpResp(ka10081ApiId, intE(ev, "status"), contYn,
+                      strE(ev, "next_key"),
+                      payloadFromHex(0, strE(ev, "body_hex")))
+    except SubInputError as e:
+      raise cerr("rest_daily event body_hex rejected: " & e.msg)
+    except VendorInputError as e:
+      raise cerr("rest_daily event response rejected: " & e.msg)
+    let sym = c.dailyPending
+    # The capture verdict precedes the record (the ka10081 divergence from
+    # the ka10027 record-first rule, REPLAY_CONTRACT §12.9): only an
+    # affirmed response becomes a rest_resp record — the acceptance path
+    # rejects any non-affirming attempt on replay, and the approved
+    # per-symbol skip policy must not reject the whole sealed stream. A
+    # failed capture is the honest gap and the symbol is skipped.
+    try:
+      discard parsePageRows(ka10081Spec, resp)
+      records.add(c.dailyRespRecord(sym, resp))
+    except VendorInputError as e:
+      records.add(dailySkipRecord(sym, e.msg, t))
+    c.dailyPending = ""
+    for d in c.dailyStep():
+      result.add(d)
   of "timer":
     let kind = strE(ev, "kind")
     case kind
@@ -978,16 +1125,30 @@ proc handleEvent*(c: var Collector; line: string;
     let detail = if ev.has("detail"): strE(ev, "detail") else: ""
     case what
     of "rest":
-      records.add(gapRecord("", "rest_transport",
-        (if c.chain.purpose == cpInitial: "initial"
-         elif c.chain.purpose == cpPoll: "poll"
-         else: "standalone") & " REST transport failure: " & detail, t))
-      let purpose = c.chain.purpose
-      c.chain = RestChain(purpose: cpNone, direction: dirUp)
-      if purpose == cpInitial:
-        result = c.goIncomplete(records, t,
-          "the initial candidate chain failed at the transport layer: " &
-          detail & " — the session's candidate derivation never completed")
+      if ev.has("req") and strE(ev, "req") == "daily":
+        # The failed transport was a daily_req (README §2.8/§3.6): the
+        # symbol is skipped (fail-closed per symbol — the session
+        # continues) and the sweep advances.
+        if c.dailyPending.len == 0:
+          raise cerr("daily REST transport failure reported with no daily " &
+                     "request in flight")
+        let sym = c.dailyPending
+        records.add(dailySkipRecord(sym,
+          "REST transport failure: " & detail, t))
+        c.dailyPending = ""
+        for d in c.dailyStep():
+          result.add(d)
+      else:
+        records.add(gapRecord("", "rest_transport",
+          (if c.chain.purpose == cpInitial: "initial"
+           elif c.chain.purpose == cpPoll: "poll"
+           else: "standalone") & " REST transport failure: " & detail, t))
+        let purpose = c.chain.purpose
+        c.chain = RestChain(purpose: cpNone, direction: dirUp)
+        if purpose == cpInitial:
+          result = c.goIncomplete(records, t,
+            "the initial candidate chain failed at the transport layer: " &
+            detail & " — the session's candidate derivation never completed")
     of "token":
       result = c.goIncomplete(records, t,
         "token refresh failed: " & detail &

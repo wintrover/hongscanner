@@ -137,6 +137,7 @@ proc dirKinds(dirs: seq[Directive]): seq[string] =
                of dkReg: "reg"
                of dkRemove: "remove"
                of dkRestReq: "rest_req"
+               of dkDailyReq: "daily_req"
                of dkRefreshToken: "refresh_token"
                of dkDisarm: "disarm"
                of dkWaitDrain: "wait_drain"
@@ -314,7 +315,8 @@ block normalSession:
                                restBody(@["000660"])))
   check("the down chain completes the derivation and REGs the 0B set",
         recs.kinds() == @["rest_resp", "sub"] and
-        dirs.dirKinds() == @["reg"] and dirs[0].gen == 2)
+        dirs.dirKinds() == @["reg", "daily_req"] and dirs[0].gen == 2 and
+        dirs[1].page == 1 and dirs[1].daily.stkCd == "005930")
   check("the 0s channel is structurally excluded from the 0B REG",
         dirs[0].data.dataOf() == @["0B:005930,000660"])
 
@@ -684,11 +686,208 @@ block truncation:
     (recs2, dirs2) = c2.step(evRest("down", page, 200, "Y", "k" & $page,
                                      restBody(@["0006" & align($page, 2, '0')])))
   check("a truncated INITIAL down chain records the gap, derives the " &
-        "declared subset and issues the candidate REG",
+        "declared subset and issues the candidate REG (plus the sweep's " &
+        "first daily_req — VS-1: the universe is non-empty)",
         recs2.kinds() == @["rest_resp", "gap", "sub"] and
         recs2[1].raw.get("what").strVal == "rest_truncated" and
-        dirs2.dirKinds() == @["reg"] and c2.awaiting == awCandReg and
+        dirs2.dirKinds() == @["reg", "daily_req"] and
+        dirs2[1].daily.stkCd == "005901" and c2.awaiting == awCandReg and
         c2.candidatesKnown and not c2.incomplete)
+
+# --------------------------------------------- ka10081 daily sweep (VS-1)
+
+block dailySweep:
+  ## REPLAY_CONTRACT §12.9: right after the initial pair's derivation and
+  ## selection the ka10027 row universe is swept once with daily_req — one
+  ## request in flight at a time, each symbol exactly once, an affirmed
+  ## response recorded as a rest_resp record, a failed capture as the
+  ## daily_capture_failed gap (fail-closed per symbol, never per session).
+  proc evRestDaily(status: int; body: string; contYn = "Y";
+                   nextKey = "A0059302024052200010000"; t = ts): string =
+    ev("rest_daily", t,
+       ("api_id", hStr(ka10081ApiId)), ("body_hex", hStr(hexOf(body))),
+       ("cont_yn", hStr(contYn)), ("next_key", hStr(nextKey)),
+       ("page", hInt(1)), ("status", hInt(status)))
+
+  proc dailyBody(stkCd: string; dts: openArray[string]): string =
+    ## A measured-shape ka10081 success body: the 12 measured row fields,
+    ## the top-level stk_cd echo, and (measured) cont-yn=Y carried by the
+    ## event — legitimate on the single-page declared scope.
+    var rows: seq[string]
+    for d in dts:
+      rows.add("{\"cur_prc\":\"187000\",\"dt\":\"" & d & "\"," &
+        "\"high_pric\":\"195400\",\"low_pric\":\"183800\"," &
+        "\"open_pric\":\"187200\",\"pred_pre\":\"-1700\"," &
+        "\"pred_pre_sig\":\"5\",\"trde_prica\":\"3790580\"," &
+        "\"trde_qty\":\"19855892\",\"trde_tern_rt\":\"+0.34\"," &
+        "\"upd_rt\":\"\",\"upd_stkpc_tp\":\"\"}")
+    "{\"return_code\":0,\"return_msg\":\"정상적으로 처리되었습니다\"," &
+      "\"stk_cd\":\"" & stkCd & "\",\"stk_dt_pole_chart_qry\":[" &
+      rows.join(",") & "]}"
+
+  var c = newCollector()
+  discard c.step(ev("ready", ts))
+  discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  discard c.step(evWs(1, ackPayload()))
+  # up rows 005930, 000660, 18064K (vendor order = rank order); down rows
+  # 18064K (duplicate — an out-of-shape code, so the candidate composition
+  # never sees it cross-direction), 999999. The sweep universe is the
+  # deduped union of ALL rows in first-appearance order: 005930, 000660,
+  # 18064K, 999999.
+  discard c.step(evRest("up", 1, 200, "N", "",
+                        restBody(@["005930", "000660", "18064K"])))
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = c.step(evRest("down", 1, 200, "N", "",
+                               restBody(@["18064K", "999999"])))
+  check("the sweep opens with the candidate REG and the first daily_req",
+        dirs.dirKinds() == @["reg", "daily_req"] and
+        dirs[1].daily.stkCd == "005930" and dirs[1].page == 1 and
+        dirs[1].daily.baseDt == "20261029" and
+        dirs[1].daily.updStkpcTp == "1")
+  check("the universe is the row union in first-appearance order, deduped",
+        c.dailyUniverse == @["005930", "000660", "18064K", "999999"] and
+        c.dailyPending == "005930" and c.dailyCursor == 1)
+  check("the daily_req directive line is the sidecar command contract",
+        directiveLine(dirs[1]) ==
+        "{\"api_id\":\"ka10081\",\"page\":1,\"params\":{" &
+        "\"base_dt\":\"20261029\",\"stk_cd\":\"005930\"," &
+        "\"upd_stkpc_tp\":\"1\"},\"type\":\"daily_req\"}")
+
+  # An affirmed response becomes the ka10081 rest_resp record (cont-yn=Y
+  # preserved verbatim — evidence, never a ka10081 obligation) and the
+  # sweep advances to the next symbol.
+  (recs, dirs) = c.step(evRestDaily(200, dailyBody("005930",
+                                                   @["20261029", "20261028"])))
+  check("an affirmed daily response is recorded as a ka10081 rest_resp",
+        recs.kinds() == @["rest_resp"] and
+        recs[0].raw.get("api_id").strVal == "ka10081" and
+        recs[0].raw.get("cont_yn").strVal == "Y" and
+        recs[0].raw.get("page").ival == 1 and
+        recs[0].raw.get("query").get("stk_cd").strVal == "005930" and
+        recs[0].raw.get("query").get("base_dt").strVal == "20261029" and
+        recs[0].raw.get("query").get("upd_stkpc_tp").strVal == "1")
+  check("the sweep advances one symbol at a time",
+        c.dailyPending == "000660" and c.dailyCursor == 2 and
+        dirs.dirKinds() == @["daily_req"] and dirs[0].daily.stkCd == "000660")
+
+  # A vendor failure body (the measured return_code 2 parameter error) is
+  # the honest gap, never a rest_resp record — the symbol is skipped and
+  # the session continues.
+  (recs, dirs) = c.step(evRestDaily(200,
+    "{\"return_code\":2,\"return_msg\":\"입력 값 오류입니다\"}"))
+  check("a return_code 2 daily response is the daily_capture_failed gap",
+        recs.kinds() == @["gap"] and
+        recs[0].raw.get("what").strVal == "daily_capture_failed" and
+        recs[0].raw.get("symbol").strVal == "000660" and
+        "return_code 2" in recs[0].raw.get("detail").strVal)
+  check("the failed symbol is skipped, not stopped",
+        not c.incomplete and c.dailyPending == "18064K" and
+        c.dailyCursor == 3 and
+        dirs.dirKinds() == @["daily_req"] and dirs[0].daily.stkCd == "18064K")
+
+  # A measured rate-limit shape (HTTP 429 + return_code 5) after the
+  # sidecar's one bounded retry skips the symbol the same way — including
+  # an out-of-shape universe code.
+  (recs, dirs) = c.step(evRestDaily(429,
+    "{\"return_code\":5,\"return_msg\":\"허용된 요청 개수를 초과하였습니다" &
+    "[1700:허용된 API 요청 개수를 초과하였습니다. 유량=1, API ID=ka10081]}",
+    contYn = "N", nextKey = ""))
+  check("a 429 daily response (retry exhausted) is the skip gap",
+        recs.kinds() == @["gap"] and
+        recs[0].raw.get("what").strVal == "daily_capture_failed" and
+        recs[0].raw.get("symbol").strVal == "18064K" and
+        "HTTP status 429" in recs[0].raw.get("detail").strVal)
+  check("the sweep continues to the last symbol",
+        c.dailyPending == "999999" and c.dailyCursor == 4 and
+        dirs.dirKinds() == @["daily_req"] and dirs[0].daily.stkCd == "999999")
+
+  (recs, dirs) = c.step(evRestDaily(200, dailyBody("999999",
+                                                   @["20261029"])))
+  check("the last affirmed capture records and the exhausted sweep issues " &
+        "nothing more",
+        recs.kinds() == @["rest_resp"] and
+        recs[0].raw.get("query").get("stk_cd").strVal == "999999" and
+        dirs.len == 0 and c.dailyPending == "" and
+        c.dailyCursor == 4 and not c.incomplete)
+
+  # The sweep never re-issues: a later poll round's new symbols extend
+  # nothing (the universe was fixed at the initial pair).
+  discard c.step(evWs(1, ackPayload()))
+  discard c.step(ev("timer", ts, ("kind", hStr("poll"))))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(@["005930"])))
+  (recs, dirs) = c.step(evRest("down", 1, 200, "N", "",
+                               restBody(@["777777"])))
+  check("a poll round derives and swaps without any daily_req",
+        dirs.len == 1 and dirs[0].kind == dkRemove and
+        c.dailyUniverse == @["005930", "000660", "18064K", "999999"] and
+        c.dailyPending == "" and not c.incomplete)
+
+  # A rest_daily without a request in flight is a protocol violation.
+  coreErr("an unsolicited rest_daily event is a violation", "unsolicited",
+          proc () =
+            var bad = newCollector()
+            discard bad.step(ev("ready", ts))
+            var r: seq[RecOut]
+            discard bad.handleEvent(evRestDaily(200,
+              dailyBody("005930", @["20261029"])), r))
+  # A rest_daily while one is in flight but with a wrong page is too.
+  coreErr("a rest_daily page beyond the declared single page is a " &
+          "violation", "page must be 1",
+          proc () =
+            var bad = newCollector()
+            discard bad.step(ev("ready", ts))
+            var r: seq[RecOut]
+            discard bad.handleEvent(
+              ev("rest_daily", ts, ("api_id", hStr(ka10081ApiId)),
+                 ("body_hex", hStr(hexOf(dailyBody("005930",
+                                                   @["20261029"])))),
+                 ("cont_yn", hStr("")), ("next_key", hStr("")),
+                 ("page", hInt(2)), ("status", hInt(200))), r))
+
+block dailySweepTransport:
+  ## The sidecar names a failed daily transport with req=daily (README
+  ## §3.6): the symbol is skipped, the sweep advances, the session
+  ## continues — and an unnamed rest error keeps its existing ka10027
+  ## meaning.
+  var c = newCollector()
+  discard c.step(ev("ready", ts))
+  discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  discard c.step(evWs(1, ackPayload()))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(@["005930"])))
+  discard c.step(evRest("down", 1, 200, "N", "", restBody(@["000660"])))
+  check("the sweep is in flight after the initial pair",
+        c.dailyPending == "005930")
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = c.step(ev("error", ts, ("detail", hStr("timeout")),
+                           ("req", hStr("daily")), ("what", hStr("rest"))))
+  check("a daily transport failure is the skip gap for the pending symbol",
+        recs.kinds() == @["gap"] and
+        recs[0].raw.get("what").strVal == "daily_capture_failed" and
+        recs[0].raw.get("symbol").strVal == "005930" and
+        not c.incomplete and c.dailyPending == "000660" and
+        dirs.dirKinds() == @["daily_req"])
+  # The same error without the discriminator is the existing ka10027
+  # standalone transport gap: it never advances the sweep.
+  (recs, dirs) = c.step(ev("error", ts, ("detail", hStr("timeout")),
+                           ("what", hStr("rest"))))
+  check("an unnamed rest transport failure keeps its ka10027 meaning",
+        recs.kinds() == @["gap"] and
+        recs[0].raw.get("what").strVal == "rest_transport" and
+        recs[0].raw.get("symbol").isNull and
+        c.dailyPending == "000660" and dirs.len == 0)
+  # A daily transport failure with nothing pending is a violation.
+  coreErr("a daily transport failure with no daily request in flight is " &
+          "a violation", "no daily request in flight", proc () =
+    var bad = newCollector()
+    discard bad.step(ev("ready", ts))
+    var r: seq[RecOut]
+    discard bad.handleEvent(ev("error", ts,
+      ("detail", hStr("timeout")), ("req", hStr("daily")),
+      ("what", hStr("rest"))), r))
+
+
 
 # ---------------------------------------------------- parse-failure counting
 
