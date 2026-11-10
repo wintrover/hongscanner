@@ -9,7 +9,9 @@
 ## error / missing return_code / missing list key), order and page-chain
 ## consistency, re-derivation from the preserved bytes, and the stream-level
 ## rule that a verified success changes no output byte while any failure
-## stays REJECT (exit 2).
+## stays REJECT (exit 2). ka10081 (the VS-1 daily capture, §12.9) covers the
+## same envelope, its measured cont-yn=Y single-page shape, and the
+## one-page-per-symbol / once-per-session capture rules.
 ## Run: nim c -r --hints:off --warnings:off --path:src tests/test_rest_resp_contract.nim
 import std/[os, strutils, tempfiles]
 import hs/[hcj, digest, records, replay, rest_resp, vendor_input, verify,
@@ -161,6 +163,36 @@ proc sameQuery(a, b: Ka10027Query): bool =
 let refScope = initKa10027Query(dirUp, "101", "0000", "0", "0", "1", "0",
                                 "0", "1")
 
+proc dailyRow(dt = "20261028"; cur = "71500"): HcjValue =
+  ## One row in the measured positional form: the 12 documented ka10081
+  ## fields in documented order, values as measured strings (the mock's
+  ## rows are all-string arrays, /tmp/hs-ka10081/).
+  hArr(hStr(cur), hStr("150000"), hStr("1074"), hStr(dt), hStr("71000"),
+       hStr("72000"), hStr("70500"), hStr("-500"), hStr("5"),
+       hStr("0.80"), hStr("1"), hStr("0.00"))
+
+proc okDailyBody(stkCd: string; rows: seq[HcjValue] = @[dailyRow()]): string =
+  ## A success ka10081 body: return_code 0 + return_msg + the measured
+  ## top-level stk_cd echo + the daily list.
+  canonical(hObj((ka10081ListKey, hArrSeq(rows)), ("return_code", hInt(0)),
+                 ("return_msg", hStr("정상처리되었습니다")),
+                 ("stk_cd", hStr(stkCd))))
+
+proc dailyQueryObj(stkCd = "005930"; baseDt = "20261029";
+                   upd = declaredDailyUpdStkpcTp): HcjValue =
+  ## The three declared ka10081 request fields, all strings.
+  hObj(("base_dt", hStr(baseDt)), ("stk_cd", hStr(stkCd)),
+       ("upd_stkpc_tp", hStr(upd)))
+
+proc dailyAttemptRaw(body: string; page = 1; status = 200; contYn = "Y";
+                    nextKey = "cur_prc:20261028"; query: HcjValue = dailyQueryObj()): HcjValue =
+  ## A ka10081 rest_resp record: the measured success page carries
+  ## cont-yn=Y + next-key (600 rows per page, continuation exists) while the
+  ## declared capture scope stays a single page.
+  hObj(("api_id", hStr(ka10081ApiId)), ("body_hex", hStr(hexOf(body))),
+       ("cont_yn", hStr(contYn)), ("next_key", hStr(nextKey)),
+       ("page", hInt(page)), ("query", query), ("status", hInt(status)))
+
 # ---------------------------------------------------------------- hex contract
 
 block hexContract:
@@ -283,6 +315,57 @@ block ka10080Acceptance:
         verifyAttempts(@[a, parseAttempt(4, attemptRaw(
           okBody(@[row("005930", "삼성전자", "71500", "5.10")])))]).len == 2)
 
+# ---------------------------------------------------- ka10081 acceptance
+
+block ka10081Acceptance:
+  ## The acceptance set declares ka10081 too (§12.9): a measured single-page
+  ## daily capture parses through the same envelope, verifies in the
+  ## measured cont-yn=Y page shape (the continuation is preserved response
+  ## evidence, never a ka10081 obligation), audits as one scope per symbol,
+  ## mixes with the other APIs' chains, and changes no output byte at the
+  ## stream level.
+  let body = okDailyBody("005930")
+  let a = parseAttempt(3, dailyAttemptRaw(body))
+  check("ka10081: parse surfaces the declared scope",
+        a.api == raKa10081 and a.page == 1 and
+        a.scope81.stkCd == "005930" and a.scope81.baseDt == "20261029" and
+        a.scope81.updStkpcTp == declaredDailyUpdStkpcTp)
+  check("ka10081: parse preserves the response metadata and body bytes",
+        a.resp.apiId == ka10081ApiId and a.resp.status == 200 and
+        a.resp.contYn == "Y" and a.resp.nextKey != "" and
+        a.resp.body == toBytes(body) and
+        a.bodySha256 == sha256Hex(toBytes(body)))
+  check("ka10081: a measured cont-yn=Y single page verifies (no continuation " &
+        "obligation)", verifyAttempts(@[a]).len == 1)
+  let b = parseAttempt(4, dailyAttemptRaw(okDailyBody("000660"),
+    query = dailyQueryObj(stkCd = "000660")))
+  let v = verifyAttempts(@[a, b])
+  check("ka10081: one scope per symbol, verified in stream order",
+        v.len == 2 and v[0].scope81.stkCd == "005930" and
+        v[1].scope81.stkCd == "000660")
+  let body80 = canonical(hObj((ka10080ListKey, hArr()), ("return_code", hInt(0))))
+  let c80 = parseAttempt(5, hObj(
+    ("api_id", hStr(ka10080ApiId)), ("body_hex", hStr(hexOf(body80))),
+    ("cont_yn", hStr("N")), ("next_key", hStr("")), ("page", hInt(1)),
+    ("query", hObj(("stk_cd", hStr("005930")), ("tic_scope", hStr("3")),
+                   ("upd_stkpc_tp", hStr("0")))),
+    ("status", hInt(200))))
+  check("ka10081: the same symbol's ka10080 scope never collides",
+        verifyAttempts(@[a, c80]).len == 2)
+  check("ka10081: a daily page mixes with the ka10027 chains",
+        verifyAttempts(@[a, parseAttempt(6, attemptRaw(
+          okBody(@[row("005930", "삼성전자", "71500", "5.10")])))]).len == 2)
+  check("ka10081: an explicit empty daily list is a confirmed empty answer",
+        verifyAttempts(@[parseAttempt(3, dailyAttemptRaw(
+          okDailyBody("005930", @[])))]).len == 1)
+
+  let lines = withInserts(baseLines(), 6, @[(kRestResp, dailyAttemptRaw(body))])
+  let res = runOf("daily-ok", lines)
+  check("ka10081: a verified daily capture stream replays OK",
+        res.status == rsOk and res.restVerified == 1)
+  check("ka10081: the daily acceptance changes no output byte",
+        coreBytes(lines) == coreBytes(baseLines()))
+
 # ---------------------------------------------------------------- schema
 
 block failureSchema:
@@ -364,6 +447,40 @@ block failureSchema:
              setType(r, "body_hex", hInt(0))
              discard parseAttempt(3, r))
 
+block ka10081Schema:
+  let body = okDailyBody("005930")
+  restUnit("ka10081 schema: missing base_dt is rejected (the measured " &
+           "vendor requires all three fields)", vfContract,
+           "missing declared ka10081 query field: base_dt",
+           proc () =
+             let q = dailyQueryObj()
+             dropKey(q, "base_dt")
+             discard parseAttempt(3, dailyAttemptRaw(body, query = q)))
+  restUnit("ka10081 schema: unknown query field is rejected", vfContract,
+           "unknown declared ka10081 query field: extra",
+           proc () =
+             let q = dailyQueryObj()
+             q.pairs.add(("extra", hStr("x")))
+             discard parseAttempt(3, dailyAttemptRaw(body, query = q)))
+  restUnit("ka10081 schema: a query field is not a string", vfContract,
+           "declared ka10081 query field is not a string",
+           proc () =
+             let q = dailyQueryObj()
+             setType(q, "stk_cd", hInt(5930))
+             discard parseAttempt(3, dailyAttemptRaw(body, query = q)))
+  restUnit("ka10081 schema: upd_stkpc_tp 0 is outside the declared capture " &
+           "scope", vfContract, "declared capture scope",
+           proc () = discard parseAttempt(3, dailyAttemptRaw(body,
+             query = dailyQueryObj(upd = "0"))))
+  restUnit("ka10081 schema: base_dt outside the measured YYYYMMDD form",
+           vfContract, "YYYYMMDD",
+           proc () = discard parseAttempt(3, dailyAttemptRaw(body,
+             query = dailyQueryObj(baseDt = "2026-10-29"))))
+  restUnit("ka10081 schema: an empty stk_cd is rejected", vfContract,
+           "stk_cd must not be empty",
+           proc () = discard parseAttempt(3, dailyAttemptRaw(body,
+             query = dailyQueryObj(stkCd = ""))))
+
 # ------------------------------------------------- success affirmation failures
 
 proc unitVerify(name: string; failure: VendorFailure; needle: string;
@@ -408,6 +525,41 @@ block failureAffirmation:
              parseAttempt(3, attemptRaw(okBody(@[
                hArr(hStr("2"), hStr("005930"))]))))
 
+block ka10081Affirmation:
+  unitVerify("ka10081: HTTP 429 (rate limit) is transport-rejected",
+             vfTransport, "HTTP status 429",
+             parseAttempt(3, dailyAttemptRaw(okDailyBody("005930"),
+               status = 429)))
+  unitVerify("ka10081: vendor return_code 2 (a missing request field at " &
+             "the vendor) is rejected", vfVendorError, "vendor return_code 2",
+             parseAttempt(3, dailyAttemptRaw(vendorErrBody(2, "필수값 누락"))))
+  unitVerify("ka10081: missing return_code never maps to success",
+             vfVendorError, "return_code is missing",
+             parseAttempt(3, dailyAttemptRaw(
+               rawBody(("return_msg", hStr("ok")), ("stk_cd", hStr("005930"))))))
+  unitVerify("ka10081: missing list key never maps to empty", vfContract,
+             ka10081ListKey & " is missing",
+             parseAttempt(3, dailyAttemptRaw(
+               rawBody(("return_code", hInt(0)), ("stk_cd", hStr("005930"))))))
+  unitVerify("ka10081: a body key outside the documented schema (the echo " &
+             "set is exactly stk_cd) is rejected", vfContract,
+             "outside the documented schema",
+             parseAttempt(3, dailyAttemptRaw(rawBody(
+               ("extra", hInt(1)), ("return_code", hInt(0)),
+               ("stk_cd", hStr("005930"))))))
+  unitVerify("ka10081: row field outside the schema is rejected", vfContract,
+             "row field outside the documented schema",
+             parseAttempt(3, dailyAttemptRaw(okDailyBody("005930", @[
+               hObj(("hack", hStr("x")), ("dt", hStr("20261028")))]))))
+  unitVerify("ka10081: non-string row field is rejected", vfContract,
+             "row field is not a string",
+             parseAttempt(3, dailyAttemptRaw(okDailyBody("005930", @[
+               hObj(("dt", hInt(20261028)))]))))
+  unitVerify("ka10081: positional row with the wrong length is rejected",
+             vfContract, "positional row length is not the documented field count",
+             parseAttempt(3, dailyAttemptRaw(okDailyBody("005930", @[
+               hArr(hStr("71500"))]))))
+
 # ---------------------------------------------------------------- chain rules
 
 block chainRules:
@@ -449,6 +601,22 @@ block chainRules:
            proc () = discard verifyAttempts(@[
              parseAttempt(3, attemptRaw(okBody(@[]), contYn = "Y")),
              parseAttempt(4, attemptRaw(okBody(@[]), page = 2))]))
+
+block ka10081Chain:
+  let a1 = parseAttempt(3, dailyAttemptRaw(okDailyBody("005930")))
+  let a2 = parseAttempt(4, dailyAttemptRaw(okDailyBody("005930")))
+  restUnit("ka10081 chain: a second page of the same scope is rejected " &
+           "(exactly one page)", vfContract, "exactly one page",
+           proc () = discard verifyAttempts(@[
+             parseAttempt(3, dailyAttemptRaw(okDailyBody("005930"))),
+             parseAttempt(4, dailyAttemptRaw(okDailyBody("005930"), page = 2))]))
+  restUnit("ka10081 chain: a repeated page 1 is rejected fail-closed",
+           vfContract, "repeats page 1",
+           proc () = discard verifyAttempts(@[a1, a2]))
+  restUnit("ka10081 chain: a repeated scope is rejected even under a " &
+           "declared re-poll cadence (once per symbol per session)",
+           vfContract, "once per symbol per session",
+           proc () = discard verifyAttempts(@[a1, a2], pollSeconds = 300))
 
 # ---------------------------------------------------------------- stream level
 
@@ -520,6 +688,21 @@ block streamRejections:
             "continuation page is missing",
             withInserts(baseLines(), 6, @[(kRestResp,
               attemptRaw(okBody(@[]), contYn = "Y", nextKey = "k"))]))
+  rejectRun("stream: a ka10081 two-page scope is REJECT (exactly one page)",
+            "exactly one page",
+            withInserts(baseLines(), 6, @[
+              (kRestResp, dailyAttemptRaw(okDailyBody("005930"))),
+              (kRestResp, dailyAttemptRaw(okDailyBody("005530"), page = 2,
+                                          nextKey = ""))]))
+  var repollLines = baseLines()
+  repollLines[1] = makeRecordLine(2, kConfig, hObj(
+    ("repoll_seconds", hInt(300)), ("session_date", hStr("2026-10-29"))))
+  rejectRun("stream: a repeated ka10081 scope is REJECT even under a " &
+            "declared re-poll cadence",
+            "once per symbol per session",
+            withInserts(repollLines, 6, @[
+              (kRestResp, dailyAttemptRaw(okDailyBody("005930"))),
+              (kRestResp, dailyAttemptRaw(okDailyBody("005530")))]))
 
   var msg = ""
   try:

@@ -298,6 +298,37 @@ still requires G2 credentials.
   '15' 거래량 ("+매수체결,-매도체결") · '20' 체결시간 (HHmmss) · '13'
   누적거래량 · '14' 누적거래대금 · '290' 장구분 · '9081' KRX/NXT 구분;
   the value set carries **no per-trade unique identifier field** (checked).
+- ka10081 주식일봉차트조회요청 (demo measured 2026-11-10, transcripts
+  preserved at /tmp/hs-ka10081/REPORT.md·attempts.jsonl, agent-59; ka10081
+  is **absent from the official kiwoom_api_spec.json** — every fact below
+  is mock-measured, never official): `POST
+  https://mockapi.kiwoom.com/api/dostk/chart` (the same path as ka10080;
+  the real-domain behavior is UNVERIFIED), api-id header `ka10081`, body
+  `{"stk_cd","base_dt","upd_stkpc_tp"}` — **all three fields required**
+  (any missing → HTTP 200 + return_code 2). base_dt is the measured
+  YYYYMMDD form; the mock answers the session date and past dates alike
+  (당일 진행 봉 포함). upd_stkpc_tp "0" and "1" both answer 200 OK (the
+  **difference between them is UNVERIFIED**: the mock's upd_rt is 0.00 in
+  every row, so adjusted-vs-unadjusted behavior cannot be distinguished —
+  the implementation pins the declared capture scope "1" and rejects the
+  other value at the schema layer). Response top level: `return_code`/
+  `return_msg`/`stk_cd` (an echo of the requested code — ka10080/ka10027
+  bodies carry no such key)/`stk_dt_pole_chart_qry` (LIST, 600 rows per
+  page, cont-yn=Y + next-key continuation present on a normal success; the
+  recent-20+-completed-trading-days need fits in one page, so the declared
+  capture scope never requests a continuation). Rows are 12 all-string
+  fields in this order: cur_prc, trde_qty, trde_prica, dt, open_pric,
+  high_pric, low_pric, pred_pre, pred_pre_sig, trde_tern_rt, upd_stkpc_tp,
+  upd_rt; dt is YYYYMMDD **descending** (first row = the base_dt day's
+  in-progress bar). **cur_prc carries no sign** (unlike ka10027's cur_prc)
+  and closing price = cur_prc. trde_prica's unit (백만원 suspected) and
+  pred_pre/pred_pre_sig's self-consistency are UNKNOWN (not cross-checked).
+  TR flow ~1/s: sleepless consecutive requests → HTTP 429 + body
+  return_code 5, recovered after ~1 s; 1.5 s pacing saw zero 429s (the
+  sidecar paces daily_req through the shared REST pacer and retries 429
+  once after 1 s, then reports the final response). At 1 TR/s a full
+  ~2,500-symbol universe sweep takes ≈ 41.7 min. Production-environment
+  behavior: UNVERIFIED (G2/G4).
 
 ## Trust boundary
 

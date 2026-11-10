@@ -9,13 +9,14 @@
 ##
 ## Two declared APIs share this one record envelope (the acceptance set;
 ## anything else is rejected): ka10027 (candidate selection, §12.1) and
-## ka10080 (3-minute backfill bars, §12.8). The envelope is identical for
-## both; only the declared query schema differs.
+## ka10080 (3-minute backfill bars, §12.8), plus ka10081 (the opening-MA20
+## daily-bar capture, §12.9 — a measured single-page scope). The envelope
+## is identical for all three; only the declared query schema differs.
 ##
 ## Record schema (module-internal contract; the record raw is one HCJ object
 ## with exactly these fields):
-##   api_id    string  response api-id; only ka10027 and ka10080 are declared
-##                     (§12.1/§12.8)
+##   api_id    string  response api-id; only ka10027, ka10080 and ka10081
+##                     are declared (§12.1/§12.8/§12.9)
 ##   page      int     1-based page index inside this scope's page chain
 ##   query     object  ka10027: exactly the nine request fields, all strings;
 ##                     sort_tp restricted to "1"/"3" (one query per
@@ -24,7 +25,12 @@
 ##                     scope "3"), upd_stkpc_tp (0|1), all strings, plus the
 ##                     OPTIONAL base_dt (YYYYMMDD, absent = undeclared);
 ##                     other tic_scope values are outside this
-##                     implementation's declared scope
+##                     implementation's declared scope.
+##                     ka10081: stk_cd, base_dt (REQUIRED, YYYYMMDD — the
+##                     measured vendor rejects its absence) and
+##                     upd_stkpc_tp, all strings; upd_stkpc_tp is pinned to
+##                     the declared capture scope "1" (adjusted bars; the
+##                     other measured value "0" is outside it, §12.9)
 ##   status    int     HTTP transport status as recorded by the producer
 ##   cont_yn   string  "Y", "N" or "" (header absent)
 ##   next_key  string  continuation key, <= 50 chars, "" when none
@@ -76,15 +82,17 @@ type
     ## scope belongs to. The scope object shape differs per API.
     raKa10027    ## candidate selection (REPLAY_CONTRACT §12.1)
     raKa10080    ## 3-minute backfill bars (REPLAY_CONTRACT §12.8)
+    raKa10081    ## opening-MA20 daily bars (REPLAY_CONTRACT §12.9)
 
   RestRespAttempt* = object
     ## One parsed rest_resp record: what was asked (declared scope + page
     ## index) and what came back (preserved response, byte-exact body).
-    ## Exactly one of scope/scope80 is meaningful, per api.
+    ## Exactly one of scope/scope80/scope81 is meaningful, per api.
     seqNo*: int
     api*: RestApi
     scope*: Ka10027Query      ## valid when api == raKa10027
     scope80*: Ka10080Query    ## valid when api == raKa10080
+    scope81*: Ka10081Query    ## valid when api == raKa10081
     page*: int
     resp*: RawHttpResp
     bodySha256*: string  ## sha256 over the decoded body bytes (audit print)
@@ -97,13 +105,20 @@ const
     "trde_prica_cnd", "trde_qty_cnd", "updown_incls"]
   ka10080QueryFields* = [
     "base_dt", "stk_cd", "tic_scope", "upd_stkpc_tp"]
+  ka10081QueryFields* = [
+    "base_dt", "stk_cd", "upd_stkpc_tp"]
   ## The declared acceptance set of this record path.
-  restApiIds* = [ka10027ApiId, ka10080ApiId]
+  restApiIds* = [ka10027ApiId, ka10080ApiId, ka10081ApiId]
   ## The implementation's declared chart scope: 3-minute bars only
   ## (REPLAY_CONTRACT §12.8 "ka10080 (3-minute bars)"). Other documented
   ## tic_scope values are valid vendor values but outside this
   ## implementation's declared scope.
   declaredTicScope* = "3"
+  ## The implementation's declared ka10081 capture scope: adjusted daily
+  ## bars (upd_stkpc_tp "1"). The other measured vendor value ("0") is
+  ## valid at the vendor but outside the declared capture scope (the
+  ## declaredTicScope pattern, REPLAY_CONTRACT §12.9).
+  declaredDailyUpdStkpcTp* = "1"
 
 proc rerr(seqNo: int; f: VendorFailure; msg: string): ref RestRespError =
   let e = newException(RestRespError, msg)
@@ -255,14 +270,46 @@ proc parseScope80(seqNo: int; qRaw: HcjValue): Ka10080Query =
     strField(seqNo, qRaw, "upd_stkpc_tp", "declared query field"),
     baseDt)
 
+proc parseScope81(seqNo: int; qRaw: HcjValue): Ka10081Query =
+  ## The declared ka10081 daily scope: all three measured fields are
+  ## REQUIRED strings — base_dt is required here, unlike ka10080's
+  ## optional field (the measured vendor answers its absence with
+  ## return_code 2) — and upd_stkpc_tp is pinned to the declared capture
+  ## scope (adjusted bars, §12.9): the other measured value is a
+  ## declared-scope mismatch, never silently consumed.
+  for p in qRaw.pairs:
+    if not inArr(p.k, ka10081QueryFields):
+      raise rerr(seqNo, vfContract,
+                 "unknown declared ka10081 query field: " & p.k)
+    if p.v.kind != hkStr:
+      raise rerr(seqNo, vfContract,
+                 "declared ka10081 query field is not a string: " & p.k &
+                 " is " & kindName(p.v))
+  for k in ka10081QueryFields:
+    if not qRaw.has(k):
+      raise rerr(seqNo, vfContract,
+                 "missing declared ka10081 query field: " & k)
+  let upd = strField(seqNo, qRaw, "upd_stkpc_tp", "declared query field")
+  if upd != declaredDailyUpdStkpcTp:
+    raise rerr(seqNo, vfContract,
+               "ka10081 upd_stkpc_tp " & upd & " is outside this " &
+               "implementation's declared capture scope (upd_stkpc_tp " &
+               declaredDailyUpdStkpcTp & ", REPLAY_CONTRACT §12.9): a " &
+               "different measured value is a declared-scope mismatch, " &
+               "rejected fail-closed")
+  initKa10081Query(
+    strField(seqNo, qRaw, "stk_cd", "declared query field"),
+    strField(seqNo, qRaw, "base_dt", "declared query field"),
+    upd)
+
 proc parseAttempt*(seqNo: int; raw: HcjValue): RestRespAttempt =
   ## Parse and validate one rest_resp record payload: schema, declared
-  ## request scope (ka10027 or ka10080, dispatched on the declared api_id),
-  ## page index, preserved response metadata and body bytes. Record-level
-  ## failures raise here, at the record's own seq. The body's success
-  ## affirmation and the chain-level rules (cont-yn repeat, page cap, 1..N
-  ## order) are stream properties: verifyAttempts applies them to the
-  ## complete record set and still rejects the whole stream.
+  ## request scope (ka10027, ka10080 or ka10081, dispatched on the declared
+  ## api_id), page index, preserved response metadata and body bytes.
+  ## Record-level failures raise here, at the record's own seq. The body's
+  ## success affirmation and the chain-level rules (cont-yn repeat, page
+  ## cap, 1..N order) are stream properties: verifyAttempts applies them to
+  ## the complete record set and still rejects the whole stream.
   try:
     if raw.kind != hkObj:
       raise rerr(seqNo, vfContract,
@@ -282,11 +329,15 @@ proc parseAttempt*(seqNo: int; raw: HcjValue): RestRespAttempt =
       result.api = raKa10080
       result.scope80 = parseScope80(seqNo,
         objField(seqNo, raw, "query", "rest_resp field"))
+    of ka10081ApiId:
+      result.api = raKa10081
+      result.scope81 = parseScope81(seqNo,
+        objField(seqNo, raw, "query", "rest_resp field"))
     else:
       raise rerr(seqNo, vfContract,
                  "rest_resp api_id is outside the declared acceptance path " &
-                 "(only " & restApiIds.join(" and ") & " are declared, " &
-                 "REPLAY_CONTRACT §12.1/§12.8): " & apiId)
+                 "(only " & restApiIds.join(", ") & " are declared, " &
+                 "REPLAY_CONTRACT §12.1/§12.8/§12.9): " & apiId)
     let page = intField(seqNo, raw, "page", "rest_resp field")
     if page < 1:
       raise rerr(seqNo, vfContract,
@@ -315,10 +366,11 @@ proc scopeKeyOf*(a: RestRespAttempt): string =
   ## Canonical text of the declared request scope, dispatched on the
   ## record's API: the page-chain grouping key (identical declared queries
   ## share one chain; a ka10027 and a ka10080 scope never collide, and
-  ## neither do two ka10080 scopes of different symbols).
+  ## neither do two ka10080/ka10081 scopes of different symbols).
   case a.api
   of raKa10027: canonical(ka10027RequestBody(a.scope))
   of raKa10080: canonical(ka10080RequestBody(a.scope80))
+  of raKa10081: canonical(ka10081RequestBody(a.scope81))
 
 proc scopeKey*(scope: Ka10027Query): string =
   ## Canonical text of the declared ka10027 request scope.
@@ -409,6 +461,27 @@ proc verifyAttempts*(attempts: seq[RestRespAttempt];
         raise rerr(g[0].seqNo, e.failure,
                    "ka10080 chart chain (stk_cd " & g[0].scope80.stkCd &
                    ", " & $g.len & " page(s)): " & e.msg)
+    of raKa10081:
+      # The declared ka10081 capture scope is exactly one page per symbol:
+      # the vendor offers cont-yn/next-key continuation, but this capture
+      # never requests it (the recent-20+-completed-days need is inside
+      # one 600-row page), so a continuation page or a repeat is outside
+      # the declared scope. A measured success page legitimately carries
+      # cont-yn=Y — the paginated chain rules (validateChainPages,
+      # cont-yn/page-cap) are therefore NOT applied to ka10081 at all:
+      # cont-yn/next-key stay preserved response evidence, never a
+      # ka10081 obligation.
+      if g.len != 1:
+        raise rerr(g[0].seqNo, vfContract,
+                   "declared ka10081 scope carries " & $g.len & " attempts " &
+                   "(stk_cd " & g[0].scope81.stkCd & "): the declared " &
+                   "capture scope is exactly one page, rejected fail-closed")
+      try:
+        discard parsePageRows(ka10081Spec, g[0].resp)
+      except VendorInputError as e:
+        raise rerr(g[0].seqNo, e.failure,
+                   "ka10081 daily response (stk_cd " & g[0].scope81.stkCd &
+                   "): " & e.msg)
     for a in g:
       result.add(a)
   for g in groups:
@@ -418,6 +491,16 @@ proc verifyAttempts*(attempts: seq[RestRespAttempt];
     else:
       # Declared cadence: split the scope's stream-order pages into rounds
       # at each page-1 record and audit every round on its own.
+      if g[0].api == raKa10081 and g.len > 1:
+        # The re-poll rounds model is a ka10027/ka10080 provision: the
+        # daily capture is once per symbol per session — a repeated ka10081
+        # scope is a capture-contract violation even under a declared
+        # cadence, rejected fail-closed (§12.9).
+        raise rerr(g[1].seqNo, vfContract,
+                   "declared ka10081 scope repeats (stk_cd " &
+                   g[0].scope81.stkCd & ", " & $g.len & " attempts): the " &
+                   "daily capture is once per symbol per session, no " &
+                   "re-poll rounds; rejected fail-closed")
       var rounds: seq[seq[RestRespAttempt]]
       for a in g:
         if a.page == 1:

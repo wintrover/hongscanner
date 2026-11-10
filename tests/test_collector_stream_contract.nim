@@ -248,6 +248,100 @@ block truncatedRun:
   check("verify declares MATCH on the truncated collector stream",
         v.verdict == vMatch and v.matched)
 
+# ------------------------------------------------- the daily sweep (VS-1)
+
+proc evRestDaily(body: string; status = 200; contYn = "Y";
+                 nextKey = "cur_prc:20261028"; t = ts): string =
+  ev("rest_daily", t, ("api_id", hStr(ka10081ApiId)),
+     ("body_hex", hStr(hexOf(body))), ("cont_yn", hStr(contYn)),
+     ("next_key", hStr(nextKey)), ("page", hInt(1)),
+     ("status", hInt(status)))
+
+proc dailyBody(stkCd: string): string =
+  ## A measured success ka10081 body: return_code 0 + return_msg + the
+  ## top-level stk_cd echo + one 12-field positional daily row.
+  "{\"return_code\":0,\"return_msg\":\"정상처리되었습니다\",\"stk_cd\":\"" &
+    stkCd & "\",\"stk_dt_pole_chart_qry\":[[\"71500\",\"150000\",\"1074\"," &
+    "\"20261028\",\"71000\",\"72000\",\"70500\",\"-500\",\"5\",\"0.80\"," &
+    "\"1\",\"0.00\"]]}"
+
+proc runDailySession(failSecond: bool): seq[RecOut] =
+  ## The full canned session with the VS-1 daily sweep: after the initial
+  ## chain pair completes, the collector walks the universe (up rows then
+  ## down rows) one ka10081 page per symbol. The first symbol affirms
+  ## success (a rest_resp record); the second either affirms too, or fails
+  ## (a vendor error body: the daily_capture_failed gap, symbol skipped,
+  ## session continues). The session then streams and closes normally.
+  var c = newCollector()
+  var outp = c.cfg.preambleRecords()
+  proc feed(line: string) =
+    var recs: seq[RecOut]
+    discard c.handleEvent(line, recs)
+    for r in recs: outp.add(r)
+  feed(ev("ready", ts))
+  feed(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  feed(evWs(1, ackPayload()))
+  feed(evRest("up", 1, 200, "N", "", restBody(@["005930"])))
+  feed(evRest("down", 1, 200, "N", "", restBody(@["000660"])))
+  feed(evWs(1, ackPayload()))     # candidate REG ack; the sweep is in flight
+  feed(evRestDaily(dailyBody("005930")))
+  if failSecond:
+    feed(evRestDaily("{\"return_code\":5,\"return_msg\":\"조회 거부\"}"))
+  else:
+    feed(evRestDaily(dailyBody("000660")))
+  feed(evWs(1, tick0B(item = "005930", t20 = "090500", price = "10000",
+                      cum = "100")))
+  feed(evWs(1, tick0B(item = "000660", t20 = "090600", price = "20000",
+                      cum = "200")))
+  feed(evWs(1, state0S(value215 = "4")))
+  feed(evWs(1, ackPayload(trnm = "REMOVE", code = 0)))
+  return outp
+
+block dailySweepRun:
+  let (dir, total) = sealStream(runDailySession(failSecond = false))
+  let recs = loadRecords(dir / inputFile)
+  check("the sealed daily-sweep session has the seal as its last record",
+        isSealed(recs) and recs.len == total)
+  var nDaily = 0
+  var nSkip = 0
+  for r in recs:
+    if r.kind == kRestResp and r.raw.get("api_id").strVal == ka10081ApiId:
+      inc nDaily
+    if r.kind == kGap and r.raw.get("what").strVal == "daily_capture_failed":
+      inc nSkip
+  check("both universe symbols landed a ka10081 rest_resp record",
+        nDaily == 2 and nSkip == 0)
+  let res = replayOf(dir)
+  check("the daily-sweep session replays OK", res.status == rsOk)
+  check("the ka10027 pair and both daily pages verified",
+        res.restVerified == 4)
+  check("the daily sweep changed no bar derivation", res.bars.len == 2)
+  let runDir = writeRunOf(dir, res)
+  let v = verifyOf(runDir)
+  check("verify declares MATCH on the daily-sweep collector stream",
+        v.verdict == vMatch and v.matched)
+
+block dailySweepSkip:
+  let (dir, _) = sealStream(runDailySession(failSecond = true))
+  let recs = loadRecords(dir / inputFile)
+  var nDaily = 0
+  var nSkip = 0
+  for r in recs:
+    if r.kind == kRestResp and r.raw.get("api_id").strVal == ka10081ApiId:
+      inc nDaily
+    if r.kind == kGap and r.raw.get("what").strVal == "daily_capture_failed":
+      inc nSkip
+  check("a failed capture is the daily_capture_failed gap, never a rest_resp",
+        nDaily == 1 and nSkip == 1)
+  let res = replayOf(dir)
+  check("the session with one failed capture still replays OK (fail-closed " &
+        "per symbol, not per session)", res.status == rsOk)
+  check("only the affirming pages verified", res.restVerified == 3)
+  let runDir = writeRunOf(dir, res)
+  let v = verifyOf(runDir)
+  check("verify still declares MATCH with the skipped symbol's gap",
+        v.verdict == vMatch and v.matched)
+
 # --------------------------------------------------- the quarantined tick
 
 block quarantined:

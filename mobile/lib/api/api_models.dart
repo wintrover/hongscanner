@@ -110,6 +110,7 @@ class MarketViewItem {
     this.direction,
     this.eventId,
     this.eventType,
+    this.ma20Tag,
     this.name,
     this.observedAt,
     this.prevRank,
@@ -123,6 +124,7 @@ class MarketViewItem {
         direction: _asString(raw['direction']),
         eventId: _asString(raw['event_id']),
         eventType: _asString(raw['event_type']),
+        ma20Tag: _asString(raw['ma20_tag']),
         name: _asString(raw['name']),
         observedAt: _asString(raw['observed_at']),
         prevRank: _asInt(raw['prev_rank']),
@@ -139,6 +141,12 @@ class MarketViewItem {
   final String? direction;
   final String? eventId;
   final String? eventType;
+
+  /// Opening-window MA20 position: ABOVE = price above the 20-day moving
+  /// average, BELOW = below it; null = no tag (out-of-window rows and
+  /// core-mode rows carry none). Verbatim from the projection — the app
+  /// never derives or corrects it.
+  final String? ma20Tag;
 
   /// Recorded stock name; null when the ledger has no name record —
   /// honest absence, displayed as the symbol fallback.
@@ -232,6 +240,7 @@ class MarketViewResponse {
     required this.asOf,
     required this.history,
     required this.latest,
+    required this.mode,
     required this.run,
     required this.risingTop10,
     required this.fallingTop10,
@@ -250,6 +259,7 @@ class MarketViewResponse {
       latest: latest is Map<String, Object?>
           ? MarketViewLatest.fromMap(latest)
           : null,
+      mode: _asString(raw['mode']) ?? 'core',
       run: run is Map<String, Object?> ? MarketViewRun.fromMap(run) : null,
       risingTop10:
           _asMapList(raw['rising_top10']).map(MarketViewItem.fromMap).toList(),
@@ -269,6 +279,15 @@ class MarketViewResponse {
   final List<MarketViewItem> history;
 
   final MarketViewLatest? latest;
+
+  /// Projection mode: 'core' = the day's change-rate classification,
+  /// 'opening_ma20' = the opening 30 minutes (09:00–09:30) classified
+  /// against the 20-day moving average. The contract has the server
+  /// always send it; a missing or unrecognized value keeps 'core' — the
+  /// pre-mode display — never a fabricated opening_ma20 reading. Display
+  /// only: the app switches its labels on it, never the row order or
+  /// the classification.
+  final String mode;
 
   /// Eligible run context; null = no eligible run recorded.
   final MarketViewRun? run;

@@ -42,6 +42,10 @@ void main() {
       expect(find.text('2026-11-02'), findsNothing);
       expect(find.text('INCOMPLETE×1, OBSERVING×3'), findsNothing);
       expect(find.textContaining('푸시'), findsNothing);
+      // Core mode carries no MA20 semantics: no mode headers, no tag
+      // badges — the pre-mode display unchanged.
+      expect(find.textContaining('(MA20'), findsNothing);
+      expect(find.byType(Badge), findsNothing);
 
       // 히스토리 tab: the retained TOP10 state-change records in server
       // order (oldest→newest), prev rank→new rank.
@@ -112,6 +116,7 @@ void main() {
         'falling_top10': <Object?>[],
         'history': <Object?>[],
         'latest': null,
+        'mode': 'core',
         'rising_top10': [
           fixtureMarketItem(evUpEnterId,
               eventType: 'CANDIDATE_ENTERED',
@@ -147,6 +152,47 @@ void main() {
     expect(find.text('000660 (rank 2)'), findsOneWidget);
   });
 
+  testWidgets(
+    'opening_ma20 mode labels both lists with the MA20 basis and tags rows',
+    (WidgetTester tester) async {
+      final store = makeStore(transport: fixtureTransport(extra: {
+        '/mobile/market-view': okJson(fixtureMarketViewOpeningMa20),
+      }));
+      await store.bootstrap();
+      await pumpTallApp(tester, store);
+
+      // In opening_ma20 mode the two lists rank the price against the
+      // 20-day MA over the opening 30 minutes — not the day's change
+      // rate — and the headers say so. Row order and row titles are the
+      // server's, unchanged by the mode.
+      expect(find.text('상승 TOP 10 (MA20 위)'), findsOneWidget);
+      expect(find.text('하락 TOP 10 (MA20 아래)'), findsOneWidget);
+      expect(find.text('삼성전자 (rank 1)'), findsOneWidget);
+      expect(find.text('삼성전자 (rank 2)'), findsOneWidget);
+      expect(find.text('SK하이닉스 (rank 1)'), findsOneWidget);
+
+      // The projection's tag rides as a badge: ABOVE → 'MA20 위',
+      // BELOW → 'MA20 아래' — verbatim, never derived in the app.
+      expect(find.text('MA20 위'), findsOneWidget);
+      expect(find.text('MA20 아래'), findsOneWidget);
+      expect(find.byType(Badge), findsNWidgets(2));
+
+      // A null ma20_tag (an out-of-window row) renders no badge: the
+      // rank-2 row's trailing is the bare chevron, not a badge row.
+      final rank2Tile = tester.widget<ListTile>(
+          find.widgetWithText(ListTile, '삼성전자 (rank 2)'));
+      expect(rank2Tile.trailing, isA<Icon>());
+
+      // The mode reaches only the top-10 lists: the history tab shows
+      // the same rows as in core mode, with no MA20 strings.
+      await tester.tap(find.text('히스토리'));
+      await tester.pumpAndSettle();
+      expect(find.text('TOP10_ENTERED · 삼성전자 · UP #11→7'), findsOneWidget);
+      expect(find.textContaining('(MA20'), findsNothing);
+      expect(find.byType(Badge), findsNothing);
+    },
+  );
+
   testWidgets('no eligible run renders honest absence, not fake content',
       (WidgetTester tester) async {
     final store = makeStore(transport: fixtureTransport(extra: {
@@ -155,6 +201,7 @@ void main() {
         'falling_top10': <Object?>[],
         'history': <Object?>[],
         'latest': null,
+        'mode': 'core',
         'rising_top10': <Object?>[],
         'run': null,
         'runs_present': false,

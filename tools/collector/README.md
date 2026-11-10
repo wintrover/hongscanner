@@ -18,7 +18,7 @@ collector-core(`src/hs/collector.nim`)는 이 문서의 필드·순서·오류 �
 ```
 Python sidecar (tools/collector/sidecar.py, Python 3.13 격리 venv)
   통신 전용 — 해석·기록·판정 권한 없음:
-    REST ka10027/ka10080 (원문 body bytes), WS 단일 영속 연결(demo),
+    REST ka10027/ka10080/ka10081 (원문 body bytes), WS 단일 영속 연결(demo),
     recv(decode=False) 원문 bytes, PING 최소 판별 후 원문 echo,
     클라이언트발 프로토콜 ping 차단(ping_interval=None),
     타이머 소유(재조회 300s·watchdog 15:40·drain 10s·quiet 10s),
@@ -35,8 +35,9 @@ Nim collector-core (src/hs/collector.nim + tools/collector/collector.nim)
 
 - sidecar는 시장 데이터를 **해석하지 않는다**: 채널 판별(REG/REAL/0B/0s/…), 
   REG/REMOVE ack 짝짓기, 후보 도출, 종료 판정은 전부 Nim core가 한다.
-  ka10080(주식분봉차트, 백필)도 같다: sidecar는 원문 응답만 전달하고(§2.7),
-  봉 파싱·origin 표시·연속조회 판단은 전부 core의 몫이다.
+  ka10080(주식분봉차트, 백필)과 ka10081(주식일봉차트, 개장 MA20 모드)도 같다:
+  sidecar는 원문 응답만 전달하고(§2.7/§2.8), 봉 파싱·origin 표시·연속조회 판단은
+  전부 core의 몫이다.
 - sidecar가 예외적으로 판별하는 것은 통신 계층의 세 가지뿐이다(§4): 
   Kiwoom PING(echo), LOGIN(접속 인증 수명), 그리고 토큰 만료(갱신).
 - core는 시계가 없다: 기록되는 모든 `t`는 sidecar가 이벤트에 찍은 시각이거나,
@@ -216,9 +217,42 @@ Nim collector-core (src/hs/collector.nim + tools/collector/collector.nim)
 - 응답은 `rest_chart` 이벤트(§3.7)로 원문 보고한다. HTTP 전송 실패는
   `error what=rest`로 보고한다(`rest_req`와 동일한 계약).
 - 페이지 반복 판단(cont-yn/next-key)은 **core**가 한다. **REST 송신
-  간격**: §2.4의 1.5초 간격이 모든 REST 트래픽(rkinfo·chart 공통)에
+  간격**: §2.4의 1.5초 간격이 모든 REST 트래픽(rkinfo·chart·일봉 공통)에
   같은 잠금으로 적용된다 — 벤더의 TR 1초 1회 한도는 API 호출 전체에
   걸린 제한이다.
+
+### 2.8 `daily_req` — REST ka10081 1페이지 (주식일봉차트, 개장 MA20 모드 VS-1)
+
+```json
+{"type":"daily_req","api_id":"ka10081","page":1,
+ "params":{"stk_cd":"005930","base_dt":"20261029","upd_stkpc_tp":"1"}}
+```
+
+- 목적: 개장 MA20 모드가 쓸 일봉(최근 20+ 완료 거래일) 확보. 호출 시점은
+  core가 정한다: 세션 시작 후 초기 체인쌍(§12.1 up/down 첫 완성) 직후
+  유니버스(체인 행의 stk_cd 합집합, 응답 순서)를 1회 순회하며 종목당
+  정확히 1페이지. 재조회 라운드는 순회를 재시작·확장하지 않는다
+  (REPLAY_CONTRACT §12.9).
+- `api_id`는 `"ka10081"`로 고정된다(이 호출의 승인 api-id). 다른 값은
+  명령 거부(exit 4)다. `params`의 세 필드는 **전부 필수**이며 비지 않은
+  문자열이어야 한다(모의 실측: 누락 시 HTTP 200 + 본문 return_code 2).
+  `page`는 항상 1이다(선언 캡처 스코프가 정확히 1페이지 — 600행에 필요
+  일봉이 들어간다). sidecar는 송신 형상만 검증하고, 스코프 값 권위
+  (base_dt YYYYMMDD·upd_stkpc_tp "1" 고정)는 core의 vendor_input 검증이
+  담당한다. 본문은 선언된 params를 그대로 송신한다.
+- 송신: `POST {rest_domain}/api/dostk/chart`, 헤더 `api-id: ka10081`,
+  `authorization: Bearer <token>`. **REST 송신 간격**: §2.4의 공유 잠금과
+  1.5초 간격이 그대로 적용된다(ka10081도 429를 낸다 — HTTP 429 + 본문
+  return_code 5). **429 재시도 1회**: 1초 대기 후 `_pace_rest`를 다시
+  통과해 재송신하고, 최종 응답(성공이든 같은 429든)을 한 번만
+  `rest_daily` 이벤트로 보고한다(LOGIN 재시도와 같은 HTTP 상태 기반
+  선례).
+- HTTP 전송 실패(연결·타임아웃 등)는 `rest_daily` 대신 `error what=rest`
+  **+ `"req":"daily"`** 이벤트로 보고한다(§3.6). core는 해당 종목을
+  스킵한다(fail-closed 종목 단위 — 세션은 계속, §12.9의
+  daily_capture_failed 갭).
+- 응답은 `rest_daily` 이벤트(§3.8)로 원문 보고한다. cont-yn=Y가 실려
+  와도 연속조회는 송신하지 않는다: 1페이지가 선언 스코프다.
 
 ## 3. sidecar → core 이벤트
 
@@ -292,12 +326,17 @@ sidecar 소유 시계)를 가진다.
 ```json
 {"ev":"drain_done","t":"..."}
 {"ev":"error","what":"rest|token|send|internal","detail":"...","t":"..."}
+{"ev":"error","what":"rest","req":"daily","detail":"...","t":"..."}
 ```
 
 - `what=send`: 와이어 송신 실패(REG/REMOVE/…). core는 이것을 확인된 전송
   오류로 분류한다(§7).
 - `what=internal`: sidecar 내부 결함. core는 세션을 즉시 비정상 종료한다
   (INCOMPLETE 경로, §8). sidecar 자신도 같은 결함으로 exit 4.
+- `what=rest`: REST 전송 실패. `req` 필드가 `"daily"`면 실패한 전송이
+  `daily_req`(§2.8)임을 판별한다(ka10027 poll 체인과 동시 진행 시의
+  모호성 해소): core는 종목 단위 스킵(§12.9)으로 처리한다. `req`가 없으면
+  기존 ka10027 체인 처리 그대로다.
 
 ### 3.7 `rest_chart` — ka10080 REST 응답 (원문)
 
@@ -316,6 +355,26 @@ sidecar 소유 시계)를 가진다.
   뒤 체인을 조립한다. 백필 봉은 그 검증된 원문에서만 파생되며
   `origin:"BACKFILL"`로 표시된다 — 실시간 틱으로 위장한 입력 경로는
   존재하지 않는다(§12.8).
+
+### 3.8 `rest_daily` — ka10081 REST 응답 (원문)
+
+```json
+{"ev":"rest_daily","api_id":"ka10081","page":1,"status":200,
+ "cont_yn":"Y","next_key":"...","body_hex":"7b0a...","t":"..."}
+```
+
+- `rest`/`rest_chart`(§3.5/§3.7)와 같은 원문 보고 계약: `status`·
+  `cont_yn`/`next_key`(헤더 원문, 없으면 "")·`body_hex`(원문 bytes 소문자
+  hex). 요청 파라미터는 이벤트에 반복되지 않는다 — core가 `daily_req`를
+  발행했을 때 pending 종목으로 귀속시키고, 기록되는 rest_resp 레코드가
+  선언 스코프(stk_cd·base_dt·upd_stkpc_tp, core가 config에서 도출)를
+  담는다(REPLAY_CONTRACT §12.9).
+- `cont_yn`은 보존되는 응답 증거일 뿐이다: 측정된 성공 페이지는
+  cont-yn=Y를 실어보내지만(600행/페이지 연속조회 존재) 선언 캡처
+  스코프가 1페이지이므로 core도 sidecar도 연속조회 의무를 갖지 않는다.
+- core의 기록 규칙은 §2.8·§12.9와 같다: 성립 검증(parsePageRows)을 통과한
+  응답만 rest_resp 레코드가 되고, 실패(본문 미성립)는 daily_capture_failed
+  갭 후 다음 종목 진행(전송 실패는 §3.6 error req="daily" 경로).
 
 ## 4. sidecar의 최소 판별 (전부 — 이것 밖에 없다)
 
@@ -419,6 +478,8 @@ core가 Recorder의 단일 작성자로서 쓰는 레코드(seq = 기록 순서)
 | core가 보낸 reg/remove | `sub`(phase=req, gen/types/codes/refresh) — 송신 **전에** 기록 |
 | REST 응답 전부 | `rest_resp`(rest_resp.nim 스키마: 선언 스코프+page+status+cont_yn+next_key+body_hex) |
 | REST 실패(전송 실패·non-200·본문 미성립) | `gap`(symbol null, api_id/direction/page/what/detail — §7) |
+| ka10081 일봉 캡처 성립 응답 | `rest_resp`(ka10081 스키마 — 성립 검증 통과분만, §2.8/§12.9) |
+| ka10081 일봉 캡처 실패(본문 미성립·전송 실패) | `gap`(symbol=해당 종목, what=daily_capture_failed — 종목 스킵, 세션 계속) |
 | 세션 정상 종료 | `recorder.finish()` — seal + COMMITTED 마커 |
 
 내구성 순서(syncNow): 레코드 자체는 이벤트 없는 틱이 압도적이므로 60초
@@ -482,7 +543,11 @@ req(refresh="1") → ack → 스트리밍. 상한 도달 시
 `gap`(rest_truncated)을 기록하고 조회된 페이지로 도출·선출·REG를
 진행한다
 (선언된 truncated 부분집합 — REPLAY_CONTRACT §12.1: 초과분은 "미조회",
-세션을 죽이지 않는다. 사실은 REST_TRUNCATED 이벤트가 담당). 이후
+세션을 죽이지 않는다. 사실은 REST_TRUNCATED 이벤트가 담당). 초기 체인쌍
+완성 직후 ka10081 일봉 스윕이 1회 시작된다(유니버스 = 초기 체인쌍 행의
+stk_cd 합집합, 응답 순서; 종목당 1페이지 `daily_req` → `rest_daily` →
+성립 rest_resp/실패 daily_capture_failed 갭, §2.8/§12.9 — 재조회
+라운드로 재발행되지 않는다). 이후
 `timer poll`마다
 재조회 → 도출·선출 → 후보 변화 시 스왑: REMOVE(구세대 전체)→ack(return_code 0)→
 REG(신세대, refresh="1")→ack. 0s는 스왑 경로에 절대 등장하지 않는다
@@ -634,3 +699,7 @@ composeRegData에 도달하는 경로는 없다.
   동작. 로컬 fake 서버 테스트는 계약 구현의 검증일 뿐 실측이 아니다.
 - websockets 잔여 UNVERIFIED(max_size 초과 종료 코드, recv 지연 무유실의
   직접 문구) — GAP 기록·fail-closed로 흡수.
+- ka10081 실측(개장 MA20 모드 일봉 캡처, 모의 측정 2026-11-10): 운영
+  도메인 형상(공식 스펙 JSON에 없는 TR — 모든 사실이 모의 측정이다),
+  upd_stkpc_tp 0/1의 실제 차이(모의 upd_rt 0.00으로 구분 불가),
+  429 임계(1초 무휴면 연속 → 429 + return_code 5)의 운영값.

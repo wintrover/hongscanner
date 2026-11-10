@@ -502,6 +502,52 @@ Target contract for P21/P22; no producer exists yet.
   (the §13.6 three-homes rule); `HOLIDAY`/`UNRECOVERABLE` are dispatcher
   outcomes, not session modes.
 
+### 12.9 Opening-MA20 daily capture (ka10081)
+
+The opening MA20 mode's daily-bar evidence (VS-1) declares its own capture
+contract on the same `rest_resp` envelope as §12.1/§12.8:
+
+- API: Kiwoom REST `ka10081` (주식일봉차트조회요청), `POST /api/dostk/chart`.
+  All vendor behavior here is mock-measured (ASSUMPTIONS "Vendor facts",
+  ka10081 entry); the TR is absent from the official spec JSON.
+- Query scope: exactly `stk_cd`, `base_dt` (REQUIRED, YYYYMMDD, the session
+  date without dashes) and `upd_stkpc_tp`, pinned to the declared capture
+  scope `"1"` (the other measured value `"0"` is a valid vendor value but a
+  declared-scope mismatch — the `declaredTicScope` pattern of §12.8,
+  rejected fail-closed at the schema layer).
+- The declared capture scope is **exactly one page per symbol** (600 rows
+  cover the recent-20+-completed-days need). The vendor does offer
+  cont-yn/next-key continuation — a measured success page legitimately
+  carries `cont-yn=Y` — so the paginated chain rules of §12.1/§12.8
+  (validateChainPages, cont-yn obligations, the page cap) do NOT apply:
+  cont-yn/next-key stay preserved response evidence, never a ka10081
+  obligation. A second page or a repeat of the same scope in one stream is
+  outside the declared scope — REJECT, including under a declared re-poll
+  cadence (`config.repoll_seconds` never licenses a second capture of the
+  same symbol's daily page).
+- **Record divergence from §12.1's record-first rule (intended)**: only a
+  response that affirms success (the §12.3-class parse: HTTP 200,
+  `return_code` 0, the documented list key, every row inside the documented
+  12-field schema) becomes a `rest_resp` record. The stream-level
+  acceptance path of §12.1 rejects any non-affirming attempt, so a
+  per-symbol skip policy could otherwise turn one symbol's failed capture
+  into a whole-stream REJECT. A failed capture (affirmation failure or
+  transport failure) is instead the collector's `daily_capture_failed` gap
+  record — the symbol is skipped, excluded from this session's daily-bar
+  evidence, never marked captured — and the session continues
+  (fail-closed per symbol, not per session).
+- The sweep runs exactly once per session, started when the session's
+  initial chain pair (§12.1, first completion only — a re-poll round never
+  restarts it) completes. The universe is the initial pair's row `stk_cd`
+  union in vendor order (up chain rows then down chain rows, deduped,
+  candidate-shaped and non-candidate-shaped codes alike — the whole
+  recorded in-scope universe, not the selected subscription set). A symbol
+  that appears only in a later poll round stays uncaptured: no re-issue.
+- `base_dt` is the session date (the day's in-progress first row included);
+  the descending `dt` order, the unsigned `cur_prc` (closing price) and
+  the `stk_cd` echo of the measured shape are preserved verbatim in
+  `body_hex` (§12.2 rules apply unchanged).
+
 ## 13. Events (VS-3 contract)
 
 The judgment layer described in this section is implemented
