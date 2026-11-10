@@ -102,6 +102,30 @@ void main() {
           {'INCOMPLETE': 1, 'OBSERVING': 3});
     });
 
+    test('mode and ma20_tag parse as the projection recorded them',
+        () async {
+      final marketView = await fetchFixture();
+      expect(marketView.mode, 'core',
+          reason: 'the recorded mode parses verbatim');
+      expect(marketView.risingTop10.first.ma20Tag, isNull,
+          reason: 'core-mode rows carry no tag — honest absence');
+
+      final opening = await ApiClient(
+        baseUrl: 'http://127.0.0.1:8080',
+        transport: FakeTransport(
+            (_) async => okJson(fixtureMarketViewOpeningMa20)),
+      ).fetchMarketView();
+      expect(opening.mode, 'opening_ma20');
+      expect(opening.risingTop10.first.ma20Tag, 'ABOVE');
+      expect(opening.fallingTop10.single.ma20Tag, 'BELOW');
+      expect(opening.risingTop10.last.ma20Tag, isNull,
+          reason: 'an out-of-window row carries ma20_tag:null');
+
+      expect(MarketViewResponse.fromMap(const {}).mode, 'core',
+          reason: 'a missing mode key keeps the core display — never a '
+              'fabricated opening_ma20 reading');
+    });
+
     test('history keeps the server order (oldest→newest), change kinds',
         () async {
       final marketView = await fetchFixture();

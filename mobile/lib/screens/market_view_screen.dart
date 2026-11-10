@@ -72,6 +72,13 @@ class _Top10sBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // opening_ma20 mode redefines both lists: the rows rank the price
+    // against the 20-day moving average over the opening 30 minutes,
+    // not the day's change rate, so only that mode gets the
+    // disambiguating headers. core mode keeps the pre-mode headerless
+    // cards verbatim — mode switches labels, never the row order or
+    // the classification.
+    final ma20Mode = marketView.mode == 'opening_ma20';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -79,10 +86,20 @@ class _Top10sBody extends StatelessWidget {
           margin: const EdgeInsets.only(bottom: 8),
           child: Padding(
             padding: const EdgeInsets.all(12),
-            child: _Top10List(
-              items: marketView.risingTop10,
-              direction: 'UP',
-              emptyMessage: '상승 TOP 10 기록 없음',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (ma20Mode) ...[
+                  Text('상승 TOP 10 (MA20 위)',
+                      style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 6),
+                ],
+                _Top10List(
+                  items: marketView.risingTop10,
+                  direction: 'UP',
+                  emptyMessage: '상승 TOP 10 기록 없음',
+                ),
+              ],
             ),
           ),
         ),
@@ -90,10 +107,20 @@ class _Top10sBody extends StatelessWidget {
           margin: const EdgeInsets.only(bottom: 8),
           child: Padding(
             padding: const EdgeInsets.all(12),
-            child: _Top10List(
-              items: marketView.fallingTop10,
-              direction: 'DOWN',
-              emptyMessage: '하락 TOP 10 기록 없음',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (ma20Mode) ...[
+                  Text('하락 TOP 10 (MA20 아래)',
+                      style: Theme.of(context).textTheme.titleSmall),
+                  const SizedBox(height: 6),
+                ],
+                _Top10List(
+                  items: marketView.fallingTop10,
+                  direction: 'DOWN',
+                  emptyMessage: '하락 TOP 10 기록 없음',
+                ),
+              ],
             ),
           ),
         ),
@@ -140,6 +167,38 @@ String _qualityAwareSubtitle(MarketViewItem item) {
   return '${item.observedAt ?? '?'} · ${quality ?? '?'}';
 }
 
+/// MA20 tag label: ABOVE = 'MA20 위', BELOW = 'MA20 아래'. Any other
+/// value (null included — out-of-window rows, core-mode rows) has no
+/// label: an unrecognized tag is never guessed into one of the two
+/// positions.
+String? _ma20TagLabel(String? tag) => switch (tag) {
+      'ABOVE' => 'MA20 위',
+      'BELOW' => 'MA20 아래',
+      _ => null,
+    };
+
+/// Top-10 row trailing: the chevron, preceded by the projection's MA20
+/// tag badge when the row carries a recognizable one (opening_ma20
+/// mode). The badge shows the server's tag verbatim — it is never
+/// derived from price data in the app.
+Widget _top10Trailing(BuildContext context, MarketViewItem item) {
+  final label = _ma20TagLabel(item.ma20Tag);
+  if (label == null) return const Icon(Icons.chevron_right);
+  final scheme = Theme.of(context).colorScheme;
+  return Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Badge(
+        backgroundColor: scheme.secondaryContainer,
+        textColor: scheme.onSecondaryContainer,
+        label: Text(label),
+      ),
+      const SizedBox(width: 8),
+      const Icon(Icons.chevron_right),
+    ],
+  );
+}
+
 class _Top10List extends StatelessWidget {
   const _Top10List({
     required this.items,
@@ -166,7 +225,7 @@ class _Top10List extends StatelessWidget {
             ),
             title: Text('${_itemTitle(item)} (rank ${item.rank ?? '—'})'),
             subtitle: Text(_qualityAwareSubtitle(item)),
-            trailing: const Icon(Icons.chevron_right),
+            trailing: _top10Trailing(context, item),
             onTap: item.eventId == null
                 ? null
                 : () => AppScope.of(context).openEvent(item.eventId!),

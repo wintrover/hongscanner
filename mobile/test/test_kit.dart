@@ -94,10 +94,11 @@ final Map<String, Object?> fixtureDeliveryRecord = {
 };
 
 /// One `/mobile/market-view` top-10 item: exactly the frozen item fields
-/// (event_type is the ledger-recorded CANDIDATE_* value). When [rank] or
-/// [name] is null the key is present with a JSON null — the contract's
-/// honest-absence shape (a ledger without a name record carries no
-/// name).
+/// (event_type is the ledger-recorded CANDIDATE_* value). When [rank],
+/// [name], or [ma20Tag] is null the key is present with a JSON null —
+/// the contract's honest-absence shape (a ledger without a name record
+/// carries no name; an out-of-window or core-mode row carries no MA20
+/// tag).
 Map<String, Object?> fixtureMarketItem(
   String eventId, {
   required String eventType,
@@ -107,12 +108,14 @@ Map<String, Object?> fixtureMarketItem(
   String symbol = '005930',
   String dataQuality = 'OBSERVING',
   String? name,
+  String? ma20Tag,
 }) =>
     {
       'data_quality': dataQuality,
       'direction': direction,
       'event_id': eventId,
       'event_type': eventType,
+      'ma20_tag': ma20Tag,
       'name': name,
       'observed_at': observedAt,
       'rank': rank,
@@ -151,10 +154,12 @@ Map<String, Object?> fixtureHistoryChangeItem(
 /// `/mobile/market-view` fixture: the single bounded projection the phone
 /// renders — rising/falling top 10 in ascending rank, the retained TOP10
 /// state-change records (oldest→newest, one per change kind, rank null
-/// on the CANDIDATE_EXITED row), and the run/as_of context. Same
-/// synthetic world as the ledger fixtures. Stock names are the real KRX
-/// names for the synthetic symbols; the CANDIDATE_EXITED row has no name
-/// record (symbol-fallback coverage).
+/// on the CANDIDATE_EXITED row), and the run/as_of context. mode is
+/// 'core' — the day's change-rate classification — and no row carries
+/// an ma20_tag (the core-mode shape). Same synthetic world as the
+/// ledger fixtures. Stock names are the real KRX names for the
+/// synthetic symbols; the CANDIDATE_EXITED row has no name record
+/// (symbol-fallback coverage).
 final Map<String, Object?> fixtureMarketView = {
   'as_of': '2026-11-02T15:30:58+09:00',
   'falling_top10': [
@@ -207,6 +212,7 @@ final Map<String, Object?> fixtureMarketView = {
     'event_type': 'CANDIDATE_EXITED',
     'observed_at': '2026-11-02T09:03:30+09:00',
   },
+  'mode': 'core',
   'rising_top10': [
     fixtureMarketItem(evUpEnterId,
         eventType: 'CANDIDATE_ENTERED',
@@ -233,6 +239,46 @@ final Map<String, Object?> fixtureMarketView = {
   'status': {
     'by_data_quality': {'INCOMPLETE': 1, 'OBSERVING': 3},
   },
+};
+
+/// `/mobile/market-view` fixture in opening_ma20 mode: the same
+/// synthetic world projected by the opening 30 minutes (09:00–09:30)
+/// MA20 classification — mode 'opening_ma20' plus per-item ma20_tag:
+/// ABOVE on the rank-1 rising row, BELOW on the falling row, and the
+/// rank-2 rising row carries none (the out-of-window honest-absence
+/// shape — rendered without a badge). The history/run/as_of context is
+/// shared with the core fixture verbatim: the mode does not reach the
+/// history tab.
+final Map<String, Object?> fixtureMarketViewOpeningMa20 = {
+  ...fixtureMarketView,
+  'falling_top10': [
+    fixtureMarketItem(evDownEnterId,
+        eventType: 'CANDIDATE_ENTERED',
+        observedAt: '2026-11-02T09:01:12+09:00',
+        direction: 'DOWN',
+        rank: 1,
+        symbol: '000660',
+        name: 'SK하이닉스',
+        ma20Tag: 'BELOW'),
+  ],
+  'mode': 'opening_ma20',
+  'rising_top10': [
+    fixtureMarketItem(evUpEnterId,
+        eventType: 'CANDIDATE_ENTERED',
+        observedAt: '2026-11-02T09:00:05+09:00',
+        direction: 'UP',
+        rank: 1,
+        symbol: '005930',
+        name: '삼성전자',
+        ma20Tag: 'ABOVE'),
+    fixtureMarketItem(evUpUpdateId,
+        eventType: 'CANDIDATE_UPDATED',
+        observedAt: '2026-11-02T09:02:41+09:00',
+        direction: 'UP',
+        rank: 2,
+        symbol: '005930',
+        name: '삼성전자'),
+  ],
 };
 
 /// HCJ-canonical encoding (keys codepoint-ascending, compact, trailing LF)
