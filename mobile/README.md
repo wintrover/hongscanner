@@ -123,6 +123,15 @@ Basic Auth), which the app supports as follows:
   events into candidates, and `runs_present:false` / `run:null` renders
   as "기록 없음" — never zero-filled rows. Market prices are not served by
   the API and are not shown.
+- **Opening MA20 mode** — when the projection's `mode` is
+  `opening_ma20` (the recorded observation window 09:00–09:30, price vs
+  the 20-day moving average), both lists get the disambiguating headers
+  "상승 TOP 10 (MA20 위)" / "하락 TOP 10 (MA20 아래)" and a row's recorded
+  `ma20_tag` rides as a trailing Badge ("MA20 위" / "MA20 아래"). Labels
+  only: the mode never changes row order or classification, a missing or
+  unrecognized `mode` keeps the `core` display (fail-closed — an opening
+  reading is never fabricated), and an unrecognized or absent
+  `ma20_tag` renders no badge. The 히스토리 tab is mode-independent.
 - **히스토리 (tab 1)** — the retained TOP10 상태 변화 (진입·이탈·순위
   변경·후보 종료) 최근 100건 (server order oldest→newest, 이전 순위→새
   순위 표시) from the same projection; a tab switch reads the store and
@@ -293,9 +302,13 @@ APK artifacts are gitignored (`/build/`) and never committed.
 
 - `flutter test` — the mobile suite: API client against fake transports
   (market-view contract shapes, name parsing and symbol-fallback
-  semantics, null/absence semantics, error classification),
+  semantics, null/absence semantics, error classification, opening
+  MA20 mode/`ma20_tag` parsing with the `core` fallback),
   fixture-driven widget tests for the two-tab shell (top-10 cards with
   names, the TOP10 change history, conditional quality display,
+  opening-MA20 mode display — mode headers, verbatim tag badges,
+  null-tag no-badge, core-mode regression with no MA20 strings,
+  history tab mode-independence,
   drill-down into the pushed Event Detail route with a natural back,
   honest-absence and offline states), permission flow (first-run ask
   once, denial persistence, manual re-ask, unwired, FID logged to
