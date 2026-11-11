@@ -356,6 +356,18 @@ still requires G2 credentials.
   server-composed notification via the platform's NotificationManager
   cannot double-display. Delivery priority (FCM `android.priority`) and
   display intrusiveness (channel importance) are separate settings.
+- Android automatic notification grouping (developer.android.com
+  /develop/ui/views/notifications/group, checked 2026-11-11 against the
+  device dump): "If your app sends four or more notifications and doesn't
+  specify a group, the system automatically groups them" (Android 7.0+).
+  The system's summary carries no app contentIntent — tapping it expands
+  the group; only child-notification taps reach the app. FCM
+  `collapse_key` is a server-side folding identifier for resuming
+  delivery ("notification messages are always collapsible and will
+  ignore the collapse_key parameter") and `notification_key` is
+  multi-device addressing — neither performs tray grouping. Observed on
+  the 2026-11-11 device as the `ranker_group` group key and a
+  "texts are empty" heads-up reject for the auto summary.
 
 ## Trust boundary
 
