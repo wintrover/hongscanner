@@ -379,6 +379,50 @@ APK artifacts are gitignored (`/build/`) and never committed.
   "File google-services.json is missing", rebuild after copying it from
   the main checkout: exit 0).
 
+## Local debug APK for a physical device
+
+`flutter run` already carries the USB setup (*Running against the local
+API*: `adb reverse tcp:8080 tcp:8080` +
+`--dart-define=HS_API_BASE=http://127.0.0.1:8080`). Building the APK
+directly restates the define as a build input — both defects below were
+measured 2026-11-11 (SM-G977N, serve on 127.0.0.1:8080, `adb reverse`
+set), and neither shows up as a build failure:
+
+```sh
+# cwd: mobile/ (needs the gitignored google-services.json — see above)
+flutter build apk --debug --dart-define=HS_API_BASE=http://127.0.0.1:8080
+adb install build/app/outputs/flutter-apk/app-debug.apk
+```
+
+- **A missing `--dart-define` builds a working APK aimed at the wrong
+  host.** The build succeeds, the app installs and runs — offline: the
+  runtime constant keeps the `defaultValue` from `lib/api/api_client.dart`
+  (`http://10.0.2.2:8080`, the emulator's host-loopback alias — a
+  physical device has no route to it), so serve logged **0 requests**
+  and the app rendered its offline state. Nothing in the build or
+  install output distinguishes this APK from a correctly built one
+  (quiet misbehavior, not a fail-closed error).
+- **A changed `--dart-define` value may not reach an incremental debug
+  build** (measured 2026-11-11): rebuilding with the USB define right
+  after a no-define build (gradle 10.2 s, "✓ Built") still left the app
+  on 10.0.2.2 — serve stayed at 0 requests — even though
+  `kernel_blob.bin` then contained both the `defaultValue` literal and
+  the new `127.0.0.1` one. `flutter clean` + the identical rebuild fixed
+  it immediately (the first `GET /mobile/market-view` reached serve).
+  After changing a define, treat clean + rebuild as the only verified
+  path; an incremental "✓ Built" is not evidence the new value took.
+
+Why nothing warns: `--dart-define` values are compile-time constants.
+The tool's own help (pinned Flutter 3.47.9, `flutter build apk --help`
+/ `flutter run --help`) defines the flag as pairs "available as
+constants from the String.fromEnvironment, bool.fromEnvironment, and
+int.fromEnvironment constructors", and the compiler frontend evaluates
+`const *.fromEnvironment` at compile time and discards the defines —
+the engine keeps no runtime copy to re-check against (flutter/flutter
+#196112, open). No official doc or public issue documents the
+incremental-build staleness measured above, so the clean-rebuild rule
+rests on that measurement, not on an upstream source.
+
 ## Local toolchain used for this scaffold
 
 - Flutter SDK: `~/sdk/flutter` (stable 3.47.9)
