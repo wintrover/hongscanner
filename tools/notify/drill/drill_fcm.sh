@@ -141,7 +141,6 @@ write_config() { # $1 = sandbox, $2 = registry path (D: inside the repo)
   "delivery_path": "$1/delivery.hcj.jsonl",
   "registry_path": "$2",
   "register_bearer_file": "$1/bearer.secret",
-  "min_severity": "INFO",
   "retry_min_seconds": 1,
   "backoff_cap_seconds": 30,
   "token_command": ["fcm-token-cmd"]

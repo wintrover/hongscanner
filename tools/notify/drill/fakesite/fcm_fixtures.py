@@ -28,8 +28,9 @@ def event_id(session_id, event_type, rule_id, entity, transition_seq):
     return hashlib.sha256(canonical).hexdigest()
 
 
-def make_event(event_type="CANDIDATE_ENTERED", rule_id="candidate-entered",
-               seq=17, severity="INFO", symbol="005930"):
+def make_event(event_type="TOP10_ENTERED", rule_id="top10-entered",
+               seq=17, severity="INFO", symbol="005930", name="삼성전자",
+               previous_rank=None, rank=3, direction="UP"):
     doc = {
         "event_id": event_id(SESSION, event_type, rule_id,
                              symbol if symbol else "*", seq),
@@ -41,29 +42,36 @@ def make_event(event_type="CANDIDATE_ENTERED", rule_id="candidate-entered",
         "data_quality": "OBSERVING",
         "severity": severity,
         "evidence_ref": EVIDENCE_REF,
-        "direction": "UP",
-        "rank": 1,
+        "direction": direction,
     }
     if symbol:
         doc["symbol"] = symbol
+    if name:
+        doc["name"] = name
+    if previous_rank is not None:
+        doc["previous_rank"] = previous_rank
+    if rank is not None:
+        doc["rank"] = rank
     return doc
 
 
 def events_source():
-    """Scenario A/B/C fact stream: two events (INFO candidate entered,
-    CRITICAL replay mismatch), byte-stable."""
+    """Scenario A fact stream: two market TOP10 transitions (a new
+    entry, a rank change), byte-stable. The dispatcher's allowlist
+    sends exactly these types — the drill must produce them."""
     return [
-        make_event(),
-        make_event(event_type="REPLAY_MISMATCH", rule_id="replay-mismatch",
-                   seq=42, severity="CRITICAL", symbol=None),
+        make_event(seq=17, rank=7),
+        make_event(event_type="RANK_CHANGED", rule_id="rank-changed",
+                   seq=18, previous_rank=5, rank=2),
     ]
 
 
 def single_event():
-    """Scenario B fact stream: one CRITICAL event, one device."""
-    return [make_event(event_type="FEED_DISCONNECTED",
-                       rule_id="feed-disconnect", seq=7,
-                       severity="CRITICAL", symbol=None)]
+    """Scenario B/C fact stream: one TOP10 exit (the candidate left
+    the universe: previous_rank, no rank), one device."""
+    return [make_event(event_type="TOP10_EXITED", rule_id="top10-exited",
+                       seq=7, previous_rank=6, rank=None,
+                       direction="DOWN")]
 
 
 def write_source(path, events):

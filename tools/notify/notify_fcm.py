@@ -2,7 +2,9 @@
 """notify_fcm: the FCM HTTP v1 transport for the notify tools (PR-5).
 
 Official sources verified 2026-11-01 (page updates 2026-10-28), per
-AGENTS.md §0.3 vendor-fact rule — the claims below are the vendor's:
+AGENTS.md §0.3 vendor-fact rule — the claims below are the vendor's.
+The Android priority/channel pages were re-verified 2026-11-11
+(message-priority guide updated 2026-11-10; REST v1 reference):
 
 - Send: POST https://fcm.googleapis.com/v1/projects/<project>/messages:send
   with `Authorization: Bearer <OAuth2 access token>`. The message is a
@@ -39,15 +41,30 @@ AGENTS.md §0.3 vendor-fact rule — the claims below are the vendor's:
   onto success and never guessed retryable (delivery.schema.json
   error_code: the set is open and kept verbatim).
 - Payload limit: 4096 bytes for most messages, keys and values included.
-- Android priority: the message always carries android.priority
-  explicitly ("high" for HIGH/CRITICAL, "normal" for INFO). The
-  vendor's own pages disagree on the unset default: the REST v1
-  reference documents HIGH as "Default priority for notification
-  messages" while the guide says "Normal priority. This is the default
-  priority for data and notification messages" (both pages updated
-  2026-10-28, consulted 2026-11-02). The effective unset priority is
-  therefore not provable from official prose; README §6 records the
-  conflict and claims neither default.
+- Android priority and channel: every message carries android.priority
+  explicitly. The events the dispatcher forwards are the TOP10 rank
+  transitions (notify_dispatcher.NOTIFIABLE_EVENT_TYPES); they are
+  always "high" with android.notification.channel_id
+  "market_rank_changes" — the REST v1 reference: "The app must create
+  a channel with this channel ID before any notification with this
+  channel ID is received" (the app owns creating that channel; without
+  it FCM falls back to the channel id in the app manifest). The
+  defensive generic assembly keeps the severity mapping ("high" for
+  HIGH/CRITICAL, "normal" for INFO). The vendor's own pages disagree
+  on the unset default: the REST v1 reference documents HIGH as
+  "Default priority for notification messages" while the guide says
+  "Normal priority. This is the default priority for data and
+  notification messages" (both consulted 2026-11-11). The effective
+  unset priority is therefore not provable from official prose;
+  README §6 records the conflict and claims neither default.
+- High priority is a delivery attempt, not a display promise (guide,
+  2026-11-10): "If FCM detects a pattern in which messages don't
+  result in user-facing notifications, your messages may be
+  deprioritized to normal priority or delegated for handling by
+  Google Play services" — decided from 7 days of message behavior per
+  app instance. The TOP10 notifications are user-facing notification
+  messages, which is exactly the use the vendor asks of high
+  priority.
 
 accepted != delivered: an HTTP 200 only proves FCM accepted the message
 for delivery. Arrival time, ordering, display and user reads are outside
@@ -78,6 +95,16 @@ FCM_SEND_URL = "https://fcm.googleapis.com/v1/projects/%s/messages:send"
 FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 PAYLOAD_LIMIT_BYTES = 4096
 GRANT_TYPE = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+
+# The event types that get the market TOP10 message assembly (README
+# §6). notify_dispatcher.NOTIFIABLE_EVENT_TYPES — the delivery policy's
+# allowlist — is this same set: the policy and the translation share
+# one truth, so a fourth notifiable type changes both together.
+TOP10_EVENT_TYPES = frozenset(
+    ("TOP10_ENTERED", "TOP10_EXITED", "RANK_CHANGED"))
+TOP10_TITLE = "홍스캐너 TOP10 변화"
+TOP10_CHANNEL_ID = "market_rank_changes"
+DIRECTION_WORDS = {"UP": "상승", "DOWN": "하락"}
 
 # The SHA-256 DigestInfo prefix of EMSA-PKCS1-v1_5 (RFC 8017 §9.2 note 1):
 # SEQUENCE { SEQUENCE { OID 2.16.840.1.101.3.4.2.1, NULL }, OCTET STRING }.
@@ -347,20 +374,90 @@ class TokenSource:
 
 def build_message(event, fcm_token):
     """The notification+data message for one event -> one device
-    (README §6). Minimal title/body; the data payload carries the ids.
-    android.priority is always explicit — HIGH/CRITICAL send "high",
-    INFO sends "normal" — because the vendor's own pages disagree on
-    the unset default (README §6 records the conflict verbatim); an
-    explicit value is the only sure path. The FCM registration token
-    is inside the request body only."""
-    title = "Hong Scanner %s" % event["severity"]
+    (README §6). The dispatcher's allowlist means the events reaching
+    this in production are the TOP10 rank transitions: they get the
+    dedicated Korean notification (title TOP10_TITLE, body
+    "<name|symbol> <상승|하락> TOP10 <rank move>"), android.priority
+    "high" and the market_rank_changes channel. The generic branch is
+    the defensive assembly for any other event type that somehow
+    reaches the transport — the dispatcher blocks them before this
+    point; the transport stays general, not a second policy gate.
+    android.priority is always explicit because the vendor's own pages
+    disagree on the unset default (README §6 records the conflict
+    verbatim); an explicit value is the only sure path. The FCM
+    registration token is inside the request body only."""
+    if event["event_type"] in TOP10_EVENT_TYPES:
+        message = _top10_message(event, fcm_token)
+    else:
+        message = _generic_message(event, fcm_token)
+    size = len(json.dumps(message, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8"))
+    if size > PAYLOAD_LIMIT_BYTES:
+        raise FcmError("payload is %d bytes; the vendor limit is %d "
+                       "(keys and values included)" %
+                       (size, PAYLOAD_LIMIT_BYTES))
+    return message
+
+
+def _top10_message(event, fcm_token):
+    """The market TOP10 rank-transition notification (README §6).
+    body = "<display> <direction word> TOP10 <rank move>": display is
+    the vendor name, falling back to the symbol and (a fact that
+    carries neither, defensively) to the event_type — never an
+    invented name; an absent direction drops its word rather than
+    guessing one. The rank move is exactly what the fact carries:
+    both ranks -> "<prev>위 → <rank>위", rank only -> "신규 진입
+    <rank>위", previous only -> "<prev>위 → 후보 제외", neither ->
+    no move text (no invented rank). data values are all strings (the
+    vendor requires string:string); ints are stringified."""
+    display = event.get("name") or event.get("symbol") or \
+        event["event_type"]
+    direction = DIRECTION_WORDS.get(event.get("direction"), "")
+    previous = event.get("previous_rank")
+    rank = event.get("rank")
+    if previous is not None and rank is not None:
+        move = "%d위 → %d위" % (previous, rank)
+    elif rank is not None:
+        move = "신규 진입 %d위" % rank
+    elif previous is not None:
+        move = "%d위 → 후보 제외" % previous
+    else:
+        move = ""
+    body = " ".join(part for part in (display, direction, "TOP10", move)
+                    if part)
+    data = {
+        "event_id": event["event_id"],
+        "event_type": event["event_type"],
+        "severity": event["severity"],
+    }
+    for key in ("direction", "symbol", "previous_rank", "rank"):
+        if key in event:
+            data[key] = str(event[key])
+    return {
+        "message": {
+            "token": fcm_token,
+            "notification": {"title": TOP10_TITLE, "body": body},
+            "android": {
+                "priority": "high",
+                "notification": {"channel_id": TOP10_CHANNEL_ID},
+            },
+            "data": data,
+        },
+    }
+
+
+def _generic_message(event, fcm_token):
+    """The defensive assembly for event types outside the TOP10
+    allowlist (the dispatcher never forwards them, README §0/§6):
+    minimal title/body, severity-mapped priority, ids in data."""
     body = event["event_type"]
     if "symbol" in event:
         body = "%s %s" % (body, event["symbol"])
-    message = {
+    return {
         "message": {
             "token": fcm_token,
-            "notification": {"title": title, "body": body},
+            "notification": {"title": "Hong Scanner %s" %
+                                      event["severity"], "body": body},
             "android": {"priority": "high" if
                         event["severity"] in ("HIGH", "CRITICAL")
                         else "normal"},
@@ -371,13 +468,6 @@ def build_message(event, fcm_token):
             },
         },
     }
-    size = len(json.dumps(message, ensure_ascii=False,
-                          separators=(",", ":")).encode("utf-8"))
-    if size > PAYLOAD_LIMIT_BYTES:
-        raise FcmError("payload is %d bytes; the vendor limit is %d "
-                       "(keys and values included)" %
-                       (size, PAYLOAD_LIMIT_BYTES))
-    return message
 
 
 def send_message(project_id, access_token, message, opener=None):

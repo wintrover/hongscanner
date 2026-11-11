@@ -11,7 +11,12 @@ Two modes (README §0/§1/§11):
 One-shot sweep (default; the backward-compatible form):
   1. read the event ledger (read-only; a concurrently-appending tail is
      skipped, never half-consumed);
-  2. apply the notification policy (min_severity, default INFO = all);
+  2. apply the notification policy — the event-type allowlist
+     (NOTIFIABLE_EVENT_TYPES: the market TOP10 rank transitions
+     TOP10_ENTERED / TOP10_EXITED / RANK_CHANGED). A fact's severity
+     is its operational importance, never a send decision: every
+     other event type (faults, replay, session lifecycle included)
+     is recorded in the ledgers and never pushed;
   3. suppress duplicates: an ACCEPTED (event_id, device_id) pair is
      never sent again; a FAILED pair is terminal (UNREGISTERED token,
      SENDER_ID_MISMATCH config error, unknown permanent codes);
@@ -79,6 +84,14 @@ import notify_config
 import notify_fcm
 import notify_ledger
 
+# The delivery policy's event-type allowlist (README §0/§6): only the
+# market TOP10 rank transitions are pushed. Severity is a fact field —
+# operational importance — and never gates delivery. The set is
+# notify_fcm's TOP10_EVENT_TYPES so the policy and the message
+# assembly share one truth: a fourth notifiable type changes both
+# together or neither.
+NOTIFIABLE_EVENT_TYPES = notify_fcm.TOP10_EVENT_TYPES
+
 
 class Dispatcher:
     """One dispatch sweep over the event ledger, or a resident watch
@@ -103,8 +116,6 @@ class Dispatcher:
                                                 lock=resident)
         self.tokens = notify_fcm.TokenSource(cfg, opener=opener)
         self.project_id = cfg["project_id"]
-        self.min_rank = notify_ledger.severity_rank(
-            cfg.get("min_severity", "INFO"))
         self.retry_min = cfg["retry_min_seconds"]
         self.backoff_cap = cfg["backoff_cap_seconds"]
         self.opener = opener or notify_fcm.urllib.request.urlopen
@@ -133,7 +144,7 @@ class Dispatcher:
         notifyable = 0
         pairs = []
         for event in events:
-            if notify_ledger.severity_rank(event["severity"]) < self.min_rank:
+            if event["event_type"] not in NOTIFIABLE_EVENT_TYPES:
                 continue
             notifyable += 1
             for device_id in sorted(devices):
@@ -151,7 +162,7 @@ class Dispatcher:
                 pairs.append((event, device_id,
                               record["attempts"] if record else 0))
         self.counts["events_total"] = len(events)
-        self.counts["severity_skipped"] = len(events) - notifyable
+        self.counts["type_skipped"] = len(events) - notifyable
         self.counts["devices_active"] = len(devices)
         return pairs
 

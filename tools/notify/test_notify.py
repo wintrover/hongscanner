@@ -146,9 +146,10 @@ def event_id(session_id, event_type, rule_id, entity, transition_seq):
     return hashlib.sha256(canonical).hexdigest()
 
 
-def make_event(session_id="2026-11-01", event_type="CANDIDATE_ENTERED",
-               rule_id="candidate-entered", seq=17, severity="INFO",
-               symbol="005930"):
+def make_event(session_id="2026-11-01", event_type="TOP10_ENTERED",
+               rule_id="top10-entered", seq=17, severity="INFO",
+               symbol="005930", name=None, previous_rank=None, rank=3,
+               direction="UP"):
     doc = {
         "event_id": event_id(session_id, event_type, rule_id,
                              symbol if symbol else "*", seq),
@@ -160,11 +161,17 @@ def make_event(session_id="2026-11-01", event_type="CANDIDATE_ENTERED",
         "data_quality": "OBSERVING",
         "severity": severity,
         "evidence_ref": "ka10027:stex_tp=1:sort_tp=1",
-        "direction": "UP",
-        "rank": 1,
     }
+    if direction is not None:
+        doc["direction"] = direction
     if symbol:
         doc["symbol"] = symbol
+    if name:
+        doc["name"] = name
+    if previous_rank is not None:
+        doc["previous_rank"] = previous_rank
+    if rank is not None:
+        doc["rank"] = rank
     return doc
 
 
@@ -249,7 +256,6 @@ class Base(unittest.TestCase):
             "delivery_path": os.path.join(self.tmp, "delivery.hcj.jsonl"),
             "registry_path": self.registry_path,
             "register_bearer_file": self.bearer_path,
-            "min_severity": "INFO",
             "retry_min_seconds": 0,
             "backoff_cap_seconds": 5,
             "service_account_path": os.path.join(self.outside, "sa.json"),
@@ -347,16 +353,22 @@ class TestConfig(Base):
         with self.assertRaises(notify_config.ConfigError):
             notify_config.load_config(path, "dispatch")
 
-    def test_defaults_and_severity_validation(self):
+    def test_min_severity_is_removed_not_validated(self):
+        # min_severity is gone from the contract: the loader injects no
+        # default and judges no leftover value — a stale key in an old
+        # config file is ignored (unknown keys stay permissive, README
+        # §7); the delivery policy is the dispatcher's event-type
+        # allowlist, not a config knob.
         path, _ = self.config()
         loaded = notify_config.load_config(path, "dispatch")
         self.assertEqual(loaded["retry_min_seconds"], 0)
         self.assertEqual(loaded["backoff_cap_seconds"], 5)
-        self.assertEqual(loaded["min_severity"], "INFO")
+        self.assertNotIn("min_severity", loaded)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({**loaded, "min_severity": "LOUD"}, f)
-        with self.assertRaises(notify_config.ConfigError):
-            notify_config.load_config(path, "dispatch")
+            json.dump(dict(loaded, min_severity="LOUD"), f)
+        again = notify_config.load_config(path, "dispatch")
+        self.assertEqual(again["retry_min_seconds"], 0)
+        self.assertEqual(again.get("min_severity"), "LOUD")  # ignored
 
     def test_relative_paths_are_refused(self):
         path, cfg = self.config(ledger_path="relative/ledger.jsonl")
@@ -447,6 +459,41 @@ class TestEventSchema(Base):
                              b'{"entity":"*","event_type":"CANDIDATE_'
                              b'ENTERED","rule_id":"r","session_id":"s",'
                              b'"transition_seq":1}').hexdigest())
+
+    def test_event_types_vocabulary_is_sixteen_with_top10(self):
+        # contracts/events/event.schema.json grew the three market
+        # TOP10 transition types: the ledger mirror carries all 16.
+        self.assertEqual(len(notify_ledger.EVENT_TYPES), 16)
+        self.assertEqual(
+            {"TOP10_ENTERED", "TOP10_EXITED", "RANK_CHANGED"} -
+            set(notify_ledger.EVENT_TYPES), set())
+
+    def test_top10_optional_fields_are_accepted_and_checked(self):
+        event = make_event(name="삼성전자", previous_rank=12, rank=4)
+        notify_ledger.validate_event(event)
+        for key, value in (("previous_rank", 0),
+                           ("previous_rank", "12"),
+                           ("name", ""),
+                           ("name", 5930)):
+            bad = make_event()
+            bad[key] = value
+            with self.assertRaises(notify_ledger.LedgerError):
+                notify_ledger.validate_event(bad)
+
+    def test_ledger_accepts_top10_optional_fields(self):
+        # A producer fact carrying the new optional fields passes the
+        # ledger's own validation path (ingest + read-back unchanged).
+        event = make_event(name="삼성전자", previous_rank=12, rank=4)
+        encoded = json.dumps(event, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+        _, cfg = self.config()
+        ledger = notify_ledger.EventLedger(cfg["ledger_path"], lock=True)
+        try:
+            stats = ledger.ingest_lines([encoded])
+            self.assertEqual(stats["appended"], 1)
+            self.assertEqual(ledger.events()[0], event)
+        finally:
+            ledger.close()
 
 
 class TestDeliverySchema(Base):
@@ -766,8 +813,14 @@ class TestCrypto(Base):
 
 
 class TestTransport(Base):
-    def test_build_message_is_notification_plus_data(self):
-        message = notify_fcm.build_message(make_event(), FCM_TOKEN)
+    def test_generic_branch_is_notification_plus_data(self):
+        # The defensive generic assembly (README §6): the dispatcher's
+        # allowlist blocks every non-TOP10 type before the transport,
+        # but build_message stays general — minimal title/body, ids in
+        # data — instead of hiding a second policy gate here.
+        event = make_event(event_type="CANDIDATE_ENTERED",
+                           rule_id="candidate-entered")
+        message = notify_fcm.build_message(event, FCM_TOKEN)
         inner = message["message"]
         self.assertEqual(inner["token"], FCM_TOKEN)
         self.assertEqual(
@@ -775,20 +828,26 @@ class TestTransport(Base):
             {"title": "Hong Scanner INFO", "body": "CANDIDATE_ENTERED "
              "005930"})
         self.assertEqual(inner["data"], {
-            "event_id": make_event()["event_id"],
+            "event_id": event["event_id"],
             "event_type": "CANDIDATE_ENTERED",
             "severity": "INFO"})
+        self.assertNotIn("channel_id", inner["android"].get(
+            "notification", {}))
 
-    def test_android_priority_is_explicit_and_severity_mapped(self):
+    def test_generic_branch_priority_is_explicit_and_severity_mapped(self):
         # The vendor's pages disagree on the unset default (README §6),
         # so the mapping is always explicit: HIGH/CRITICAL -> high,
         # INFO -> normal.
-        message = notify_fcm.build_message(make_event(), FCM_TOKEN)
+        message = notify_fcm.build_message(
+            make_event(event_type="CANDIDATE_ENTERED",
+                       rule_id="candidate-entered"), FCM_TOKEN)
         self.assertEqual(message["message"]["android"]["priority"],
                          "normal")
         for severity in ("HIGH", "CRITICAL"):
             message = notify_fcm.build_message(
-                make_event(severity=severity), FCM_TOKEN)
+                make_event(event_type="CANDIDATE_ENTERED",
+                           rule_id="candidate-entered",
+                           severity=severity), FCM_TOKEN)
             self.assertEqual(message["message"]["android"]["priority"],
                              "high")
         # The explicit field is inside the wire payload the guard
@@ -924,6 +983,113 @@ class TestTransport(Base):
                                     "raise SystemExit(3)"]
         with self.assertRaises(notify_fcm.FcmError):
             notify_fcm.TokenSource(failing).get()
+
+
+# --------------------------------------------------- top10 message
+
+
+class TestTop10Message(Base):
+    """The market TOP10 message assembly (README §6): the five rank
+    move texts, the name->symbol fallback, the always-high priority,
+    the market_rank_changes channel and the stringified data fields."""
+
+    def message_for(self, **overrides):
+        event = make_event(**overrides)
+        return event, notify_fcm.build_message(event, FCM_TOKEN)
+
+    def assert_top10_shape(self, event, message, expected_body):
+        inner = message["message"]
+        self.assertEqual(inner["token"], FCM_TOKEN)
+        self.assertEqual(inner["notification"]["title"],
+                         "홍스캐너 TOP10 변화")
+        self.assertEqual(inner["notification"]["body"], expected_body)
+        self.assertEqual(inner["android"],
+                         {"priority": "high",
+                          "notification": {"channel_id":
+                                           "market_rank_changes"}})
+        self.assertEqual(inner["data"]["event_id"], event["event_id"])
+        self.assertEqual(inner["data"]["event_type"],
+                         event["event_type"])
+        self.assertEqual(inner["data"]["severity"], event["severity"])
+        for key in ("direction", "symbol", "previous_rank", "rank"):
+            if key in event:
+                # FCM data values are strings: ints are stringified.
+                self.assertEqual(inner["data"][key], str(event[key]))
+            else:
+                self.assertNotIn(key, inner["data"])
+        size = len(json.dumps(message, ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8"))
+        self.assertLessEqual(size, notify_fcm.PAYLOAD_LIMIT_BYTES)
+
+    def test_new_entry_body(self):
+        # 신규진입: an entry without a previous confirmed rank.
+        event, message = self.message_for(name="삼성전자", rank=7)
+        self.assert_top10_shape(
+            event, message, "삼성전자 상승 TOP10 신규 진입 7위")
+
+    def test_reentry_body(self):
+        # 기존진입: an entry whose previous confirmed rank is known.
+        event, message = self.message_for(name="삼성전자",
+                                          previous_rank=15, rank=4)
+        self.assert_top10_shape(
+            event, message, "삼성전자 상승 TOP10 15위 → 4위")
+
+    def test_rank_change_body(self):
+        # 순위변경: both ranks, up and down.
+        event, message = self.message_for(event_type="RANK_CHANGED",
+                                          rule_id="rank-changed",
+                                          name="삼성전자", previous_rank=4,
+                                          rank=2)
+        self.assert_top10_shape(
+            event, message, "삼성전자 상승 TOP10 4위 → 2위")
+        event, message = self.message_for(event_type="RANK_CHANGED",
+                                          rule_id="rank-changed",
+                                          name="삼성전자", previous_rank=2,
+                                          rank=4, direction="DOWN")
+        self.assert_top10_shape(
+            event, message, "삼성전자 하락 TOP10 2위 → 4위")
+
+    def test_exit_body(self):
+        # 밖이탈: fell out of the TOP10, still ranked in the universe.
+        event, message = self.message_for(event_type="TOP10_EXITED",
+                                          rule_id="top10-exited",
+                                          name="삼성전자", previous_rank=9,
+                                          rank=13, direction="DOWN")
+        self.assert_top10_shape(
+            event, message, "삼성전자 하락 TOP10 9위 → 13위")
+
+    def test_candidate_exclusion_body(self):
+        # 후보제외: left the candidate universe entirely — no rank.
+        event, message = self.message_for(event_type="TOP10_EXITED",
+                                          rule_id="top10-exited",
+                                          name="삼성전자", previous_rank=6,
+                                          rank=None, direction="DOWN")
+        self.assert_top10_shape(
+            event, message, "삼성전자 하락 TOP10 6위 → 후보 제외")
+
+    def test_symbol_fallback_when_no_name(self):
+        event, message = self.message_for(rank=7)
+        self.assert_top10_shape(
+            event, message, "005930 상승 TOP10 신규 진입 7위")
+
+    def test_no_invented_words(self):
+        # An absent direction drops its word and a fact with neither
+        # rank drops the move text — the translation never invents a
+        # direction or a rank the fact does not carry.
+        event, message = self.message_for(name="삼성전자", rank=None,
+                                          direction=None)
+        self.assert_top10_shape(event, message, "삼성전자 TOP10")
+
+    def test_priority_is_always_high_regardless_of_severity(self):
+        # The three notifiable types are time-sensitive market moves:
+        # priority follows the policy path, never the severity field.
+        for severity in ("INFO", "HIGH", "CRITICAL"):
+            event, message = self.message_for(severity=severity, rank=7)
+            self.assertEqual(message["message"]["android"]["priority"],
+                             "high")
+            self.assertEqual(message["message"]["android"]
+                             ["notification"]["channel_id"],
+                             "market_rank_changes")
 
 
 # ---------------------------------------------------------- dispatcher
@@ -1158,18 +1324,35 @@ class TestDispatcher(Base):
         self.assertEqual((record["state"], record["error_code"]),
                          ("FAILED", "HTTP_418"))
 
-    def test_severity_policy_filters_before_any_send(self):
-        _, cfg = self.config(min_severity="HIGH")
+    def test_type_allowlist_filters_before_any_send(self):
+        """The delivery policy is the event-type allowlist: the three
+        TOP10 transitions are send candidates; every other type
+        (faults, session lifecycle, the candidate series) is counted
+        type_skipped and never creates a delivery record. Severity is
+        not a send decision — a CRITICAL fault is skipped exactly like
+        an INFO one (AGENTS/ASSUMPTIONS P27)."""
+        _, cfg = self.config()
         self.write_service_account(cfg)
-        self.seed_ledger(cfg, [make_event(severity="INFO"),
-                               make_event(severity="HIGH",
-                                          event_type="FEED_DISCONNECTED",
-                                          rule_id="feed-disconnect",
-                                          seq=18, symbol=None),
-                               make_event(severity="CRITICAL",
-                                          event_type="REPLAY_MISMATCH",
-                                          rule_id="replay-mismatch",
-                                          seq=19, symbol=None)])
+        blocked = [
+            make_event(event_type="DATA_GAP_SUSPECTED",
+                       rule_id="data-gap", seq=31, symbol=None,
+                       rank=None, direction=None, severity="CRITICAL"),
+            make_event(event_type="SESSION_INCOMPLETE",
+                       rule_id="session-incomplete", seq=32, symbol=None,
+                       rank=None, direction=None),
+            make_event(event_type="CANDIDATE_ENTERED",
+                       rule_id="candidate-entered", seq=33,
+                       severity="HIGH"),
+        ]
+        notifiable = [
+            make_event(event_type="TOP10_ENTERED", seq=17),
+            make_event(event_type="RANK_CHANGED", rule_id="rank-changed",
+                       seq=18, previous_rank=5, rank=2),
+            make_event(event_type="TOP10_EXITED", rule_id="top10-exited",
+                       seq=19, previous_rank=6, rank=None,
+                       direction="DOWN"),
+        ]
+        self.seed_ledger(cfg, blocked + notifiable)
         self.register("dev-1")
         transport = FakeTransport()
         dispatcher = self.dispatcher(cfg, transport)
@@ -1178,14 +1361,19 @@ class TestDispatcher(Base):
         finally:
             dispatcher.close()
         self.assertEqual(code, 0)
-        self.assertEqual(transport.send_count(), 2)
-        self.assertEqual(dispatcher.counts.get("severity_skipped"), 1)
-        devices = {r["device_id"] for r in self.delivery_records(cfg)}
-        self.assertEqual(devices, {"dev-1"})
-        types = {r["event_id"] for r in self.delivery_records(cfg)}
-        info_id = event_id("2026-11-01", "CANDIDATE_ENTERED",
-                           "candidate-entered", "005930", 17)
-        self.assertNotIn(info_id, types)
+        self.assertEqual(transport.send_count(), 3)
+        self.assertEqual(dispatcher.counts.get("type_skipped"), 3)
+        self.assertEqual(dispatcher.counts.get("events_total"), 6)
+        # No delivery record is ever created for a type-skipped event:
+        # the block happens before the pair is formed (no fake
+        # PENDING, README §7).
+        records = self.delivery_records(cfg)
+        self.assertEqual(len(records), 3)
+        sent_ids = {r["event_id"] for r in records}
+        for event in notifiable:
+            self.assertIn(event["event_id"], sent_ids)
+        for event in blocked:
+            self.assertNotIn(event["event_id"], sent_ids)
 
     def test_crash_between_send_and_record_resends_on_restart(self):
         """The honest duplicate: the provider accepted a push whose
@@ -1242,8 +1430,8 @@ class TestDispatcher(Base):
         _, cfg = self.config()
         self.write_service_account(cfg)
         first = make_event(seq=17)
-        second = make_event(event_type="CANDIDATE_EXITED",
-                            rule_id="candidate-exited", seq=18)
+        second = make_event(event_type="RANK_CHANGED",
+                            rule_id="rank-changed", seq=18)
         self.seed_ledger(cfg, [first, second])
         self.register("dev-1")
         order = []

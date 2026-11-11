@@ -14,18 +14,34 @@ library;
 /// not something the platform can answer.
 enum PushPermissionDecision { granted, denied, provisional }
 
-/// One received push message, reduced to the fields the app routes on.
+/// One received push message: the data fields the app routes on plus
+/// the notification payload's title/body.
 ///
 /// The dispatcher sends notification+data messages; the data payload is
-/// the contract (`{event_id, event_type, severity}` — docs plan PR-6
-/// dispatcher). Tap routing keys on `event_id`.
+/// the routing contract (`{event_id, event_type, severity}` — docs plan
+/// PR-6 dispatcher). Tap routing keys on `event_id`. The notification
+/// title/body are the dispatcher's own assembled strings — the app
+/// treats them as opaque display text (passed verbatim to the OS
+/// market-alert post) and never re-derives or overrides them.
 class PushMessage {
-  const PushMessage(this.data);
+  const PushMessage(
+    this.data, {
+    this.notificationTitle,
+    this.notificationBody,
+  });
 
   factory PushMessage.fromData(Map<String, dynamic> data) =>
       PushMessage(Map<String, dynamic>.from(data));
 
   final Map<String, dynamic> data;
+
+  /// The notification payload's title, as the dispatcher assembled it.
+  /// Null on data-only messages.
+  final String? notificationTitle;
+
+  /// The notification payload's body, as the dispatcher assembled it.
+  /// Null on data-only messages.
+  final String? notificationBody;
 
   String? get eventId {
     final value = data['event_id'];
@@ -82,8 +98,10 @@ abstract interface class PushTokenSource {
 abstract interface class PushMessageSource {
   /// Messages received while the app is in the foreground. With
   /// notification+data messages the OS does not display the notification
-  /// in the foreground; the app shows an in-app banner instead (documented
-  /// in mobile/README.md — data-only plus local notification is forbidden).
+  /// in the foreground (official firebase_messaging behavior); the app
+  /// re-posts the server's own title/body to the OS market-alert channel
+  /// or falls back to the in-app banner (documented in mobile/README.md
+  /// — the app never re-assembles the text itself).
   Stream<PushMessage> get foregroundMessages;
 
   /// Messages whose notification the user tapped while the app was in the

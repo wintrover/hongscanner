@@ -10,12 +10,14 @@ each one exits cleanly (SIGTERM -> exit 0, no residue). A malformed
 response byte, a leaked path/secret, or a surviving process fails the
 suite. Fail-closed: no assertion reports a pass on absence of evidence.
 
-The §3.7 market view is covered twice: MarketViewSuite holds the core
-fold and change-history contract, MarketViewOpeningSuite the VS-2
-opening MA20 mode (the recorded window predicate, the chain-pair
-correspondence offsets, the integer cross-product order, the honest
-exclusions and the DataFault shapes), and MarketFoldSuite the pure
-fold_market_projection unit and its memoization."""
+The §3.7 market view is covered by four suites: MarketViewSuite holds
+the core fold and the legacy change-history contract, MarketViewFactSuite
+the events_contract "top10-v1" dual path (the fact translation, its
+eligibility rule, the discriminator branches), MarketViewOpeningSuite
+the VS-2 opening MA20 mode (the recorded window predicate, the
+chain-pair correspondence offsets, the integer cross-product order, the
+honest exclusions and the DataFault shapes), and MarketFoldSuite the
+pure fold_market_projection unit and its memoization."""
 
 import hashlib
 import json
@@ -735,6 +737,278 @@ def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0",
         {"kind": "config", "raw": {"session_date": OM_SESSION_DATE},
          "seq": 1}))
     box.write(os.path.join(smoke, "events.hcj.jsonl"), b"")
+    return box
+
+
+# -- §3.7 events_contract "top10-v1" fact-path fixtures (README §3.7) -----
+#
+# A separate 2026-11-12 run: the same candidate-event fold as the legacy
+# winner, plus the TOP10 facts Core journals per the emission contract —
+# a group's boundary facts sit between its candidate batch and the next
+# group's batch, the final group's kSessionEnd flush facts are followed
+# only by the same-stamp SESSION_ENDED. Unsealed, the run serves exactly
+# group 2's boundary facts (group 3's next-stamp batch follows them);
+# the seal admits group 3's flush facts too. The same recorded events
+# with NO config marker project the legacy state-comparison history —
+# the discriminator test's both branches.
+
+TF_WINNER = "fact-2026-11-12-a"
+TF_SESSION_DATE = "2026-11-12"
+TF_T1 = "2026-11-12T10:00:01+09:00"
+TF_T2 = "2026-11-12T10:05:01+09:00"
+TF_T3 = "2026-11-12T10:10:01+09:00"  # the flush facts' AND
+                                     # SESSION_ENDED's shared stamp
+
+TF_NAMES = {"005930": "삼성전자", "006660": "LG전자"}
+
+
+def tf_candidate(tag, stamp, event_type, symbol, direction, rank=None):
+    extra = {"direction": direction, "symbol": symbol}
+    if rank is not None:
+        extra["rank"] = rank
+    return event_fact(b"tf-" + tag, event_type, TF_SESSION_DATE, stamp,
+                      "candidate-transition-v1", **extra)
+
+
+def tf_fact(tag, stamp, event_type, symbol, direction=None, rank=None,
+            previous_rank=None, name=None, session_id=TF_SESSION_DATE):
+    """A TOP10 fact of the events_contract shape: the event schema's
+    common fields plus the optional direction / rank / previous_rank /
+    name the fact path translates (an absent key projects as null —
+    TOP10_EXITED's candidate-disappearance case records no rank, a
+    brand-new TOP10 member records no previous_rank)."""
+    extra = {"symbol": symbol}
+    if direction is not None:
+        extra["direction"] = direction
+    if rank is not None:
+        extra["rank"] = rank
+    if previous_rank is not None:
+        extra["previous_rank"] = previous_rank
+    if name is not None:
+        extra["name"] = name
+    return event_fact(b"tff-" + tag, event_type, session_id, stamp,
+                      "top10-market-alert-v1", **extra)
+
+
+# Group 1 (TF_T1) — the baseline: twelve UP candidates (ranks 1..12, so
+# TOP10 membership is ranks 1-10) and two DOWN candidates enter. The
+# baseline group confirms zero changes — Core journals no facts for it.
+TF_G1 = [
+    tf_candidate(b"g1-up01", TF_T1, "CANDIDATE_ENTERED", "005930", "UP", 1),
+    tf_candidate(b"g1-up02", TF_T1, "CANDIDATE_ENTERED", "006660", "UP", 2),
+    tf_candidate(b"g1-up03", TF_T1, "CANDIDATE_ENTERED", "007070", "UP", 3),
+    tf_candidate(b"g1-up04", TF_T1, "CANDIDATE_ENTERED", "008480", "UP", 4),
+    tf_candidate(b"g1-up05", TF_T1, "CANDIDATE_ENTERED", "009150", "UP", 5),
+    tf_candidate(b"g1-up06", TF_T1, "CANDIDATE_ENTERED", "010060", "UP", 6),
+    tf_candidate(b"g1-up07", TF_T1, "CANDIDATE_ENTERED", "011060", "UP", 7),
+    tf_candidate(b"g1-up08", TF_T1, "CANDIDATE_ENTERED", "011140", "UP", 8),
+    tf_candidate(b"g1-up09", TF_T1, "CANDIDATE_ENTERED", "011780", "UP", 9),
+    tf_candidate(b"g1-up10", TF_T1, "CANDIDATE_ENTERED", "012330", "UP", 10),
+    tf_candidate(b"g1-up11", TF_T1, "CANDIDATE_ENTERED", "015760", "UP", 11),
+    tf_candidate(b"g1-up12", TF_T1, "CANDIDATE_ENTERED", "012450", "UP", 12),
+    tf_candidate(b"g1-dn01", TF_T1, "CANDIDATE_ENTERED", "000660", "DOWN",
+                 1),
+    tf_candidate(b"g1-dn02", TF_T1, "CANDIDATE_ENTERED", "000810", "DOWN",
+                 2),
+]
+
+# Group 2 (TF_T2) — the recorded candidate batch: the TOP10 head swap
+# (005930/006660), 011060 pushed to rank 11, 015760 entering at 7, a
+# DOWN reshuffle (000720 new at 1, 000660 to 2) and 000810's exit.
+TF_G2 = [
+    tf_candidate(b"g2-up01", TF_T2, "CANDIDATE_UPDATED", "005930", "UP", 2),
+    tf_candidate(b"g2-up02", TF_T2, "CANDIDATE_UPDATED", "006660", "UP", 1),
+    tf_candidate(b"g2-up07", TF_T2, "CANDIDATE_UPDATED", "011060", "UP", 11),
+    tf_candidate(b"g2-up11", TF_T2, "CANDIDATE_UPDATED", "015760", "UP", 7),
+    tf_candidate(b"g2-dn00", TF_T2, "CANDIDATE_ENTERED", "000720", "DOWN",
+                 1),
+    tf_candidate(b"g2-dn01", TF_T2, "CANDIDATE_UPDATED", "000660", "DOWN",
+                 2),
+    tf_candidate(b"g2-dn02x", TF_T2, "CANDIDATE_EXITED", "000810", "DOWN"),
+]
+
+# Group 2's boundary facts (TF_T2, recorded in a deliberately non-
+# symbol-sorted order — history must keep this journal order): the
+# vocabulary's three types, the rank-null (candidate disappearance) and
+# previous_rank-null (brand-new member) cases, and the three name
+# shapes (the fact's own name, the ka10027 dictionary fallback, and
+# honest null when neither names the symbol).
+TF_G2_FACTS = [
+    tf_fact(b"g2-f02", TF_T2, "RANK_CHANGED", "006660", "UP", rank=1,
+            previous_rank=2),
+    tf_fact(b"g2-f01", TF_T2, "RANK_CHANGED", "005930", "UP", rank=2,
+            previous_rank=1, name="삼성전자"),
+    tf_fact(b"g2-f07", TF_T2, "TOP10_EXITED", "011060", "UP", rank=11,
+            previous_rank=7, name="SK텔레콤"),
+    tf_fact(b"g2-f11", TF_T2, "TOP10_ENTERED", "015760", "UP", rank=7,
+            previous_rank=11),
+    tf_fact(b"g2-fd01", TF_T2, "RANK_CHANGED", "000660", "DOWN", rank=2,
+            previous_rank=1),
+    tf_fact(b"g2-fx02", TF_T2, "TOP10_EXITED", "000810", "DOWN",
+            previous_rank=2),
+    tf_fact(b"g2-fn00", TF_T2, "TOP10_ENTERED", "000720", "DOWN", rank=1),
+]
+
+# Group 3 (TF_T3) — a four-side reshuffle; its facts are the kSessionEnd
+# flush (group 4 never comes), followed only by the same-stamp
+# SESSION_ENDED: unsealed they have no eligibility, sealed they serve.
+TF_G3 = [
+    tf_candidate(b"g3-up01", TF_T3, "CANDIDATE_UPDATED", "005930", "UP", 1),
+    tf_candidate(b"g3-up02", TF_T3, "CANDIDATE_UPDATED", "006660", "UP", 2),
+    tf_candidate(b"g3-up03", TF_T3, "CANDIDATE_UPDATED", "007070", "UP", 4),
+    tf_candidate(b"g3-up04", TF_T3, "CANDIDATE_UPDATED", "008480", "UP", 3),
+]
+TF_G3_FLUSH_FACTS = [
+    tf_fact(b"g3-f01", TF_T3, "RANK_CHANGED", "005930", "UP", rank=1,
+            previous_rank=2),
+    tf_fact(b"g3-f02", TF_T3, "RANK_CHANGED", "006660", "UP", rank=2,
+            previous_rank=1),
+    tf_fact(b"g3-f03", TF_T3, "RANK_CHANGED", "007070", "UP", rank=4,
+            previous_rank=3),
+    tf_fact(b"g3-f04", TF_T3, "RANK_CHANGED", "008480", "UP", rank=3,
+            previous_rank=4),
+]
+TF_SESSION_END = event_fact(b"tf-end", "SESSION_ENDED", TF_SESSION_DATE,
+                            TF_T3, "session-close-v1")
+
+
+def tf_winner_events():
+    """The fact run's committed sequence: three candidate batches with
+    their fact blocks interleaved per the emission order, closed by the
+    same-stamp SESSION_ENDED."""
+    return (TF_G1 + TF_G2 + TF_G2_FACTS + TF_G3 + TF_G3_FLUSH_FACTS
+            + [TF_SESSION_END])
+
+
+def tf_committed_marker(name):
+    return canonical({"run_id": name, "schema": "hong-scanner-commit/1",
+                      "seq": 3, "sha256": sha(b"input-tf"),
+                      "t": "2026-11-12T10:11:00+09:00"}) + b"\n"
+
+
+# The input's ka10027 rows: the folded dictionary is exactly TF_NAMES
+# (005930 named at the head, 006660 renamed later — the fallback order
+# is irrelevant here, only the final map).
+TF_WINNER_INPUT = [
+    rest_resp_record(3, ka10027_body([("005930", "삼성전자", 75000),
+                                      ("006660", "LG전자", 45000)])),
+]
+
+
+def tf_change(fact, names=None):
+    """The §3.7 fact-path change record of a fixture fact: the fact's
+    own nine whitelisted fields — change_type is the event_type
+    verbatim, prev_rank the fact's previous_rank (absent -> null), rank
+    the fact's rank (absent -> null), name the fact's name with the
+    fixture dictionary fallback."""
+    return {"change_type": fact["event_type"],
+            "data_quality": fact["data_quality"],
+            "direction": fact.get("direction"),
+            "event_id": fact["event_id"],
+            "name": fact.get("name", (names or {}).get(fact["symbol"])),
+            "observed_at": fact["observed_at"],
+            "prev_rank": fact.get("previous_rank"),
+            "rank": fact.get("rank"),
+            "symbol": fact["symbol"]}
+
+
+def tf_item(ev):
+    """The §3.7 top10 item of a fixture candidate event (the unchanged
+    candidate fold's own shape): nine fields, name from the folded
+    dictionary, rank null on CANDIDATE_EXITED."""
+    item = {k: ev[k] for k in ("data_quality", "direction", "event_id",
+                               "event_type", "observed_at", "symbol")}
+    item["ma20_tag"] = None
+    item["rank"] = ev.get("rank")
+    item["name"] = TF_NAMES.get(ev["symbol"])
+    return item
+
+
+TF_HISTORY_G2 = [tf_change(f, TF_NAMES) for f in TF_G2_FACTS]
+TF_HISTORY_G3 = [tf_change(f, TF_NAMES) for f in TF_G3_FLUSH_FACTS]
+
+TF_EXPECTED = {
+    "as_of": TF_T3,
+    "falling_top10": [tf_item(TF_G2[4]), tf_item(TF_G2[5])],
+    "history": TF_HISTORY_G2,  # the unsealed run: flush facts ineligible
+    "latest": {"data_quality": "OBSERVING",
+               "event_id": TF_SESSION_END["event_id"],
+               "event_type": "SESSION_ENDED",
+               "observed_at": TF_T3},
+    "mode": "core",  # every confirmed group stamps 10:05 or earlier
+    "rising_top10": [tf_item(TF_G3[0]), tf_item(TF_G3[1]),
+                     tf_item(TF_G3[3]), tf_item(TF_G3[2]),
+                     tf_item(TF_G1[4]), tf_item(TF_G1[5]),
+                     tf_item(TF_G2[3]), tf_item(TF_G1[7]),
+                     tf_item(TF_G1[8]), tf_item(TF_G1[9])],
+    "run": {"environment": "demo", "run_id": TF_WINNER,
+            "session": TF_WINNER, "session_date": TF_SESSION_DATE},
+    "runs_present": True,
+    "status": {"by_data_quality": {"OBSERVING": 37}},
+}
+TF_EXPECTED_SEALED = dict(TF_EXPECTED, history=TF_HISTORY_G2 + TF_HISTORY_G3)
+
+# The SAME recorded events through the legacy path (config marker
+# absent): the state-comparison derivation of groups 2 and (sealed) 3 —
+# the facts count in status like any event but never fold into history.
+TF_LEGACY_HISTORY_G2 = [
+    mv_change("RANK_CHANGED", TF_G2[0], 2, 1, TF_NAMES),
+    mv_change("RANK_CHANGED", TF_G2[1], 1, 2, TF_NAMES),
+    mv_change("TOP10_EXITED", TF_G2[2], 11, 7, TF_NAMES),
+    mv_change("TOP10_ENTERED", TF_G2[3], 7, 11, TF_NAMES),
+    mv_change("TOP10_ENTERED", TF_G2[4], 1, None, TF_NAMES),
+    mv_change("RANK_CHANGED", TF_G2[5], 2, 1, TF_NAMES),
+    mv_change("CANDIDATE_EXITED", TF_G2[6], None, 2, TF_NAMES),
+]
+TF_LEGACY_HISTORY_G3 = [
+    mv_change("RANK_CHANGED", TF_G3[0], 1, 2, TF_NAMES),
+    mv_change("RANK_CHANGED", TF_G3[1], 2, 1, TF_NAMES),
+    mv_change("RANK_CHANGED", TF_G3[2], 4, 3, TF_NAMES),
+    mv_change("RANK_CHANGED", TF_G3[3], 3, 4, TF_NAMES),
+]
+
+
+def tf_ring_events(groups=12, per_group=10):
+    """A facts-only run: `groups` fact blocks of `per_group`
+    RANK_CHANGED facts (distinct stamps per block) closed by a
+    non-candidate INCOMPLETE record at a later stamp — every fact is
+    eligible without the seal, so the ring alone bounds the history."""
+    events = []
+    for g in range(groups):
+        stamp = "2026-11-12T11:%02d:01+09:00" % g
+        for i in range(per_group):
+            events.append(tf_fact(("ring%02d-%02d" % (g, i)).encode(),
+                                  stamp, "RANK_CHANGED", "005930", "UP",
+                                  rank=i + 1, previous_rank=i + 2))
+    events.append(event_fact(b"tf-ring-tail", "SUBSCRIPTION_TRUNCATED",
+                             TF_SESSION_DATE,
+                             "2026-11-12T11:%02d:01+09:00" % groups,
+                             "subscription-truncated-v1",
+                             severity="HIGH", data_quality="INCOMPLETE",
+                             direction="UP"))
+    return events
+
+
+def build_fact_sandbox(events_contract="top10-v1", sealed=False):
+    """The §3.7 fact-path fixture tree: one eligible run.
+    `events_contract` writes the config discriminator (None omits the
+    key — the legacy-path branch); `sealed` plants the finish()
+    marker."""
+    box = Sandbox()
+    run_dir = box.session_dir(TF_WINNER)
+    config = {"environment": "demo", "run_id": TF_WINNER,
+              "session_date": TF_SESSION_DATE}
+    if events_contract is not None:
+        config["events_contract"] = events_contract
+    box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+        {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+        {"kind": "config", "raw": config, "seq": 2},
+        *TF_WINNER_INPUT))
+    box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+              jsonl(*tf_winner_events()))
+    if sealed:
+        box.write(os.path.join(run_dir, "input.hcj.jsonl.committed"),
+                  tf_committed_marker(TF_WINNER))
     return box
 
 
@@ -1981,6 +2255,346 @@ class MarketViewOpeningSuite(unittest.TestCase):
         status, _, raw, _ = server.get_json("/mobile/market-view")
         self.assertEqual(status, 500)
         self.assertIn(b"data_fault", raw)
+
+
+class MarketViewFactSuite(unittest.TestCase):
+    """GET /mobile/market-view (README §3.7): the events_contract
+    "top10-v1" dual path. The history is the display translation of the
+    Core-confirmed TOP10 facts recorded in the journal — every change
+    record value is the fact's own recorded value, no classification,
+    no judgment — while the top10 fold, the opening mode and every
+    other field keep the candidate-event projection unchanged. The
+    eligibility rule is the fact-path equivalent of the legacy
+    unsealed-tail rule: a fact serves only when the run is sealed or a
+    different-stamp journal event follows it."""
+
+    def setUp(self):
+        self.box = build_fact_sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.server = ServerProc(self.box, with_delivery=False)
+        self.addCleanup(self.reap_server)
+
+    def reap_server(self):
+        code, _ = self.server.stop()
+        self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
+        self.server.assert_gone()
+
+    def _reap(self, server):
+        code, _ = server.stop()
+        self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
+        server.assert_gone()
+
+    def fact_server(self, **kwargs):
+        box = build_fact_sandbox(**kwargs)
+        self.addCleanup(box.cleanup)
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        return box, server
+
+    def seal_winner(self, box):
+        """Plant the recorder's finish() marker — the §3.7 run seal; the
+        server re-reads the recorded files every request."""
+        box.write(os.path.join(box.runs, TF_WINNER,
+                               "input.hcj.jsonl.committed"),
+                  tf_committed_marker(TF_WINNER))
+
+    # -- full-response contract --------------------------------------------
+
+    def test_fact_path_full_scenario_byte_canonical(self):
+        # unsealed: group 2's boundary facts serve (group 3's next-stamp
+        # batch follows them), group 3's flush facts do not; top10 is
+        # the final live candidate state; status counts every event
+        # including the facts; the whole body is canonical bytes
+        status, body, raw, headers = self.server.get_json(
+            "/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, TF_EXPECTED)
+        self.assertEqual(raw, canonical(TF_EXPECTED) + b"\n")
+        self.assertEqual(headers["Content-Type"],
+                         "application/json; charset=utf-8")
+        # the contract's mechanical size bound (README §3.7)
+        self.assertLessEqual(len(raw), 65536)
+
+    def test_fact_path_flush_facts_need_the_seal(self):
+        # group 3's kSessionEnd flush facts are followed only by the
+        # same-stamp SESSION_ENDED: unsealed they stay out of history
+        # (the seal is their only confirmation), sealed they enter —
+        # the same file, no restart, the server re-reads per request
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(body["history"], TF_HISTORY_G2)
+        self.assertTrue(all(c["observed_at"] != TF_T3
+                            for c in body["history"]))
+        self.seal_winner(self.box)
+        status, body, raw, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, TF_EXPECTED_SEALED)
+        self.assertEqual(raw, canonical(TF_EXPECTED_SEALED) + b"\n")
+        self.assertLessEqual(len(raw), 65536)
+
+    def test_fact_path_consecutive_requests_identical(self):
+        # determinism: two consecutive requests serve identical bytes
+        raw1 = self.server.get("/mobile/market-view")[1]
+        raw2 = self.server.get("/mobile/market-view")[1]
+        self.assertEqual(raw1, raw2)
+
+    # -- the translation ---------------------------------------------------
+
+    def test_fact_path_translate_fields_and_order(self):
+        # journal-order translation: the fact block was recorded in a
+        # non-symbol order and history keeps exactly that order; every
+        # record is the nine-field change whitelist with no event_type
+        # key; CANDIDATE_EXITED — the legacy-only display type — never
+        # occurs in the fact path
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        history = body["history"]
+        self.assertEqual([c["event_id"] for c in history],
+                         [f["event_id"] for f in TF_G2_FACTS])
+        for item in history:
+            self.assertEqual(sorted(item),
+                             ["change_type", "data_quality", "direction",
+                              "event_id", "name", "observed_at",
+                              "prev_rank", "rank", "symbol"])
+            self.assertNotIn("event_type", item)
+            self.assertIn(item["change_type"], serve.MARKET_CHANGE_TYPES)
+        self.assertEqual({c["change_type"] for c in history},
+                         {"RANK_CHANGED", "TOP10_ENTERED", "TOP10_EXITED"})
+        by_symbol = {c["symbol"]: c for c in history}
+        # rank null: the candidate-disappearance TOP10_EXITED records no
+        # rank — honest absence, never 0
+        disappeared = by_symbol["000810"]
+        self.assertEqual(disappeared["change_type"], "TOP10_EXITED")
+        self.assertIsNone(disappeared["rank"])
+        self.assertEqual(disappeared["prev_rank"], 2)
+        # prev_rank null: the brand-new DOWN member records no previous
+        entered = by_symbol["000720"]
+        self.assertEqual(entered["change_type"], "TOP10_ENTERED")
+        self.assertIsNone(entered["prev_rank"])
+        self.assertEqual(entered["rank"], 1)
+        self.assertEqual(entered["direction"], "DOWN")
+        # name: the fact's own recorded name, the ka10027 dictionary
+        # fallback, and honest null when neither names the symbol
+        self.assertEqual(by_symbol["005930"]["name"], "삼성전자")  # fact
+        self.assertEqual(by_symbol["011060"]["name"], "SK텔레콤")  # fact
+        self.assertEqual(by_symbol["006660"]["name"], "LG전자")  # dict
+        self.assertIsNone(by_symbol["015760"]["name"])
+        self.assertIsNone(by_symbol["000660"]["name"])
+        self.assertIsNone(by_symbol["000810"]["name"])
+        self.assertIsNone(by_symbol["000720"]["name"])
+        # the record's evidence is the fact itself: the drilldown id is
+        # the fact's own event_id
+        self.assertEqual(by_symbol["006660"]["event_id"],
+                         TF_G2_FACTS[0]["event_id"])
+
+    def test_fact_path_top10_lists_come_from_the_candidate_fold(self):
+        # only the history source changes: the top10 lists are still
+        # the candidate-event last-record-wins fold of the final live
+        # state, event_type included verbatim
+        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual([i["symbol"] for i in body["rising_top10"]],
+                         ["005930", "006660", "008480", "007070", "009150",
+                          "010060", "015760", "011140", "011780", "012330"])
+        self.assertEqual([i["symbol"] for i in body["falling_top10"]],
+                         ["000720", "000660"])
+        for item in body["rising_top10"] + body["falling_top10"]:
+            self.assertIsNone(item["ma20_tag"])
+            self.assertIn(item["event_type"],
+                          ("CANDIDATE_ENTERED", "CANDIDATE_UPDATED"))
+
+    # -- the eligibility rule ----------------------------------------------
+
+    def test_fact_path_boundary_facts_without_later_stamp_excluded(self):
+        # the rule's exclusion case: boundary facts followed only by a
+        # same-stamp merged batch (no different-stamp event after them)
+        # are not eligible unsealed — the seal alone confirms them
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        run_dir = box.session_dir("fact-2026-11-12-edge")
+        stamp1 = "2026-11-12T10:00:01+09:00"
+        stamp2 = "2026-11-12T10:05:01+09:00"
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "events_contract": "top10-v1",
+                                       "run_id": "fact-2026-11-12-edge",
+                                       "session_date": TF_SESSION_DATE},
+             "seq": 2},
+            rest_resp_record(3, ka10027_body([("005930", "삼성전자",
+                                               75000)]))))
+        facts = [
+            tf_fact(b"e-f01", stamp2, "RANK_CHANGED", "005930", "UP",
+                    rank=2, previous_rank=1),
+            # a fact recording no direction projects the honest null
+            tf_fact(b"e-f02", stamp2, "RANK_CHANGED", "006660",
+                    rank=1, previous_rank=2),
+        ]
+        events = [
+            tf_candidate(b"e-up01", stamp1, "CANDIDATE_ENTERED",
+                         "005930", "UP", 1),
+            tf_candidate(b"e-up02", stamp1, "CANDIDATE_ENTERED",
+                         "006660", "UP", 2),
+            tf_candidate(b"e-up01b", stamp2, "CANDIDATE_UPDATED",
+                         "005930", "UP", 2),
+            tf_candidate(b"e-up02b", stamp2, "CANDIDATE_UPDATED",
+                         "006660", "UP", 1),
+        ] + facts + [
+            # a same-stamp merged batch after the facts: the only events
+            # that follow them carry the facts' own stamp
+            tf_candidate(b"e-up01c", stamp2, "CANDIDATE_UPDATED",
+                         "005930", "UP", 1),
+            tf_candidate(b"e-up02c", stamp2, "CANDIDATE_UPDATED",
+                         "006660", "UP", 2),
+        ]
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+                  jsonl(*events))
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        status, body, _, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["history"], [])  # unsealed: excluded
+        box.write(os.path.join(run_dir, "input.hcj.jsonl.committed"),
+                  tf_committed_marker("fact-2026-11-12-edge"))
+        status, body, _, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        expected = [
+            tf_change(facts[0], {"005930": "삼성전자"}),
+            tf_change(facts[1], {"005930": "삼성전자"}),
+        ]
+        self.assertEqual(body["history"], expected)
+        self.assertIsNone(body["history"][1]["direction"])
+
+    def test_fact_path_ring_keeps_last_100(self):
+        # a facts-only run (no candidates — facts never open a group):
+        # 120 eligible facts, the ring keeps exactly the last 100, the
+        # oldest twenty (blocks one and two) are dropped
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        run_dir = box.session_dir("fact-2026-11-12-ring")
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "events_contract": "top10-v1",
+                                       "run_id": "fact-2026-11-12-ring",
+                                       "session_date": TF_SESSION_DATE},
+             "seq": 2}))
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+                  jsonl(*tf_ring_events()))
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        status, body, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["history"]), 100)
+        first, last = body["history"][0], body["history"][-1]
+        self.assertEqual(first["observed_at"],
+                         "2026-11-12T11:02:01+09:00")
+        self.assertEqual((first["rank"], first["prev_rank"]), (1, 2))
+        self.assertEqual(last["observed_at"],
+                         "2026-11-12T11:11:01+09:00")
+        self.assertEqual((last["rank"], last["prev_rank"]), (10, 11))
+        self.assertEqual({c["change_type"] for c in body["history"]},
+                         {"RANK_CHANGED"})
+        self.assertEqual(body["rising_top10"], [])
+        self.assertEqual(body["falling_top10"], [])
+        self.assertEqual(body["mode"], "core")
+        self.assertEqual(body["status"]["by_data_quality"],
+                         {"INCOMPLETE": 1, "OBSERVING": 120})
+        self.assertLessEqual(len(raw), 65536)
+
+    # -- the discriminator -------------------------------------------------
+
+    def test_config_without_the_marker_is_the_legacy_path(self):
+        # the absence branch: the same recorded bytes with no
+        # events_contract key project the legacy state-comparison
+        # history — the facts are ordinary non-candidate events there
+        # (counted in status, never folded into groups or history)
+        box, server = self.fact_server(events_contract=None)
+        status, body, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        expected = dict(TF_EXPECTED, history=TF_LEGACY_HISTORY_G2)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
+        # sealed, the legacy derivation confirms group 3 on the same
+        # events — the facts still never enter history
+        self.seal_winner(box)
+        status, body, _, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["history"],
+                         TF_LEGACY_HISTORY_G2 + TF_LEGACY_HISTORY_G3)
+
+    def test_unknown_events_contract_value_is_data_fault(self):
+        # fail-closed discriminator: a recorded contract this projection
+        # cannot consume is never guessed into either path — a future
+        # version string or a non-string value both fault
+        for value in ("top10-v2", 17):
+            _, server = self.fact_server(events_contract=value)
+            status, _, raw, _ = server.get_json("/mobile/market-view")
+            self.assertEqual(status, 500, value)
+            self.assertIn(b"data_fault", raw, value)
+
+    def test_fact_path_shape_violations_are_data_fault(self):
+        # the fact fold's dependent recorded shape: a rank below 1 and
+        # an unknown TOP10_* event type are corruption, never a skip
+        for label, bad in (
+                ("rank", tf_fact(b"bad-rank", TF_T3, "RANK_CHANGED",
+                                 "005930", "UP", rank=0, previous_rank=1)),
+                ("type", tf_fact(b"bad-type", TF_T3, "TOP10_PROMOTED",
+                                 "005930", "UP", rank=1))):
+            with open(os.path.join(self.box.runs, TF_WINNER,
+                                   "events.hcj.jsonl"), "ab") as f:
+                f.write(canonical(bad) + b"\n")
+            status, _, raw, _ = self.server.get_json("/mobile/market-view")
+            self.assertEqual(status, 500, label)
+            self.assertIn(b"data_fault", raw, label)
+            # restore the fixture bytes for the next case
+            self.box.write(
+                os.path.join(self.box.runs, TF_WINNER, "events.hcj.jsonl"),
+                jsonl(*tf_winner_events()))
+
+    # -- the opening mode is orthogonal to the history path ---------------
+
+    def test_fact_path_opening_mode_unchanged(self):
+        # a top10-v1 run in the opening window: the reference group is
+        # still the last CONFIRMED candidate group, the top10 lists
+        # still come from the recorded chain-pair prices against the
+        # close sums — and history is the fact translation
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        run_dir = box.session_dir(OM_WINNER)
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "events_contract": "top10-v1",
+                                       "run_id": OM_WINNER,
+                                       "session_date": OM_SESSION_DATE},
+             "seq": 2},
+            *om_winner_input("0")))
+        facts = [
+            # group 2's boundary facts: the disappearance (rank null),
+            # and the two TOP10 entries the correspondence check is
+            # about
+            tf_fact(b"om-f01", OM_REF_STAMP, "TOP10_EXITED", "017960",
+                    "DOWN", previous_rank=5, session_id=OM_SESSION_DATE),
+            tf_fact(b"om-f02", OM_REF_STAMP, "TOP10_ENTERED", "011060",
+                    "DOWN", rank=3, session_id=OM_SESSION_DATE),
+            tf_fact(b"om-f03", OM_REF_STAMP, "TOP10_ENTERED", "006660",
+                    "DOWN", rank=7, session_id=OM_SESSION_DATE),
+        ]
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"), jsonl(
+            *(OM_G1 + [om_g2_017960x(OM_REF_STAMP),
+                       om_g2_011060(OM_REF_STAMP),
+                       om_g2_006660(OM_REF_STAMP)]
+              + facts + [OM_G3_005930, OM_TAIL])))
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        expected, _, _ = om_expected_bodies(OM_REF_STAMP)
+        expected = dict(expected,
+                        history=[tf_change(f, OM_NAMES) for f in facts],
+                        status={"by_data_quality": {"INCOMPLETE": 1,
+                                                    "OBSERVING": 19}})
+        status, body, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
+        self.assertEqual(body["mode"], "opening_ma20")
 
 
 class MarketFoldSuite(unittest.TestCase):

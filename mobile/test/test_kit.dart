@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
 import 'package:hongscanner/api/api_client.dart';
 import 'package:hongscanner/services/credential_store.dart';
+import 'package:hongscanner/services/market_alert_channel.dart';
 import 'package:hongscanner/services/noop_push_service.dart';
 import 'package:hongscanner/services/push_permission.dart';
 import 'package:hongscanner/services/push_service.dart';
@@ -455,6 +458,72 @@ class FakeMessagePushService extends FakePushService
     tapController.close();
     foregroundController.close();
   }
+}
+
+/// Method-channel mock for `hongscanner/market_alert`, installed through
+/// TestDefaultBinaryMessengerBinding: records the app's postNotification
+/// calls and scripts the platform's answer (permission granted/refused),
+/// plus the one-shot pending cold-start tap. Only the Dart→platform
+/// direction is intercepted; incoming platform messages
+/// ("onNotificationTap" — the warm tap path) still reach the app's real
+/// handler, so both directions are observable in one test.
+class MarketAlertMock {
+  MarketAlertMock({this.postResult = true, this._pendingTap});
+
+  /// What the platform answers to postNotification: true = posted,
+  /// false = refused (notification permission off / bad arguments).
+  final bool postResult;
+
+  /// One postNotification call's arguments, in arrival order.
+  final List<Map<String, Object?>> posts = <Map<String, Object?>>[];
+
+  String? _pendingTap;
+
+  Future<Object?>? handle(MethodCall call) async {
+    switch (call.method) {
+      case 'postNotification':
+        posts.add(Map<String, Object?>.from(call.arguments as Map));
+        return postResult;
+      case 'getPendingTap':
+        // One-shot, like the platform side: answered once, then consumed.
+        final pending = _pendingTap;
+        _pendingTap = null;
+        return pending;
+    }
+    return null;
+  }
+}
+
+/// Installs [MarketAlertMock] on the market-alert method channel and
+/// removes the handler on teardown.
+MarketAlertMock mockMarketAlert({bool postResult = true, String? pendingTap}) {
+  final binding = TestWidgetsFlutterBinding.ensureInitialized();
+  final mock = MarketAlertMock(postResult: postResult, pendingTap: pendingTap);
+  binding.defaultBinaryMessenger.setMockMethodCallHandler(
+    MarketAlertChannel.channel,
+    mock.handle,
+  );
+  addTearDown(() {
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      MarketAlertChannel.channel,
+      null,
+    );
+  });
+  return mock;
+}
+
+/// Simulates MainActivity.onNewIntent → invokeMethod("onNotificationTap"):
+/// delivers the platform→Dart call to whatever real handler the app
+/// registered on the channel (see MarketAlertChannel.setTapHandler).
+Future<void> deliverMarketAlertTap(String eventId) async {
+  final binding = TestWidgetsFlutterBinding.ensureInitialized();
+  await binding.defaultBinaryMessenger.handlePlatformMessage(
+    MarketAlertChannel.channel.name,
+    const StandardMethodCodec().encodeMethodCall(
+      MethodCall('onNotificationTap', {'event_id': eventId}),
+    ),
+    (ByteData? data) {},
+  );
 }
 
 /// Store factory with a zero-cost backoff clock so tests stay synchronous

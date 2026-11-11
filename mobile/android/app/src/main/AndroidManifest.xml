@@ -46,6 +46,16 @@
         <meta-data
             android:name="firebase_messaging_installation_id_enabled"
             android:value="true" />
+        <!-- Default notification channel for FCM background/terminated
+             display: notification payloads without an explicit
+             android.notification.channel_id post here, and the dispatcher
+             (tools/notify) names this channel explicitly too. MainActivity
+             creates "market_rank_changes" (IMPORTANCE_HIGH: sound, heads-up)
+             at startup — until the app has run once, FCM falls back to its
+             own low-importance channel (no sound, no heads-up). -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="market_rank_changes" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

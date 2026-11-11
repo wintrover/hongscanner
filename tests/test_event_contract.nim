@@ -33,7 +33,8 @@ const
   ## The full contract vocabularies. The contract defines all of them; an
   ## implementation may lag, the vocabulary never depends on it.
   eventTypes = @["CANDIDATE_ENTERED", "CANDIDATE_UPDATED",
-                 "CANDIDATE_EXITED", "FEED_DISCONNECTED",
+                 "CANDIDATE_EXITED", "TOP10_ENTERED", "TOP10_EXITED",
+                 "RANK_CHANGED", "FEED_DISCONNECTED",
                  "DATA_GAP_SUSPECTED", "REST_TRUNCATED",
                  "SUBSCRIPTION_TRUNCATED", "MARKET_STATE_UNKNOWN",
                  "REPLAY_MATCH", "REPLAY_MISMATCH",
@@ -43,8 +44,9 @@ const
   directions = @["UP", "DOWN"]
   deliveryStates = @["PENDING", "ACCEPTED", "FAILED"]
   eventFields = @["data_quality", "direction", "event_id", "event_type",
-                  "evidence_ref", "observed_at", "rank", "rule_id",
-                  "rule_version", "session_id", "severity", "symbol"]
+                  "evidence_ref", "name", "observed_at", "previous_rank",
+                  "rank", "rule_id", "rule_version", "session_id",
+                  "severity", "symbol"]
   requiredEventFields = @["data_quality", "event_id", "event_type",
                           "evidence_ref", "observed_at", "rule_id",
                           "rule_version", "session_id", "severity"]
@@ -138,6 +140,16 @@ proc validateEvent(v: HcjValue): seq[string] =
       result.add("event: rank is not an integer")
     elif x.ival < 1:
       result.add("event: rank must be >= 1")
+  if v.has("previous_rank"):
+    let x = v.get("previous_rank")
+    if x.kind != hkInt:
+      result.add("event: previous_rank is not an integer")
+    elif x.ival < 1:
+      result.add("event: previous_rank must be >= 1")
+  if v.has("name"):
+    let x = v.get("name")
+    if x.kind != hkStr or x.strVal.len == 0:
+      result.add("event: name is not a non-empty string")
   if v.has("data_quality"):
     let x = v.get("data_quality")
     if x.kind != hkStr or not dataQualities.contains(x.strVal):
@@ -294,8 +306,8 @@ block schemaFiles:
           .get("description").asStr)
 
 block enumCompleteness:
-  check("enum: the contract vocabulary is exactly 13 event types",
-        eventTypes.len == 13)
+  check("enum: the contract vocabulary is exactly 16 event types",
+        eventTypes.len == 16)
   check("enum: event_type is the full contract vocabulary",
         enumOf(eventSchema, "event_type") == eventTypes)
   check("enum: data_quality is OBSERVING|INCOMPLETE|UNKNOWN",
@@ -434,6 +446,53 @@ block eventFieldRules:
     eventRejected("a non-object fact is rejected: " & bad.kindName,
             "not an object",
             proc (): HcjValue = bad)
+
+block top10FieldRules:
+  ## The top10-transition facts' optional judgment fields: previous_rank
+  ## (the rank in the previous confirmed observation group) and name (the
+  ## vendor row's preserved stk_nm) — closed fields of the fact record,
+  ## emitted only when judged, never verified or delivered anywhere.
+  proc top10EventHcj(): HcjValue =
+    hObj(("data_quality", hStr("OBSERVING")),
+         ("direction", hStr("UP")),
+         ("event_id", hStr(pinnedEventId)),
+         ("event_type", hStr("TOP10_ENTERED")),
+         ("evidence_ref", hStr("ka10027:stex_tp=1:sort_tp=1")),
+         ("name", hStr("삼성전자")),
+         ("observed_at", hStr("2026-10-29T09:00:05+09:00")),
+         ("previous_rank", hInt(11)),
+         ("rank", hInt(10)),
+         ("rule_id", hStr("top10-transition-v1")),
+         ("rule_version", hInt(1)),
+         ("session_id", hStr("2026-10-29")),
+         ("severity", hStr("INFO")),
+         ("symbol", hStr("005930")))
+  check("a TOP10 fact with previous_rank and name passes validation",
+        validateEvent(top10EventHcj()).len == 0)
+  check("the schema declares both optional judgment fields",
+        propNames(eventSchema).contains("previous_rank") and
+        propNames(eventSchema).contains("name"))
+  eventRejected("a string previous_rank is rejected", "is not an integer",
+          proc (): HcjValue =
+            var v = top10EventHcj()
+            setType(v, "previous_rank", hStr("11"))
+            v)
+  eventRejected("previous_rank 0 is rejected", "must be >= 1",
+          proc (): HcjValue =
+            var v = top10EventHcj()
+            setType(v, "previous_rank", hInt(0))
+            v)
+  eventRejected("an empty name is rejected", "is not a non-empty string",
+          proc (): HcjValue =
+            var v = top10EventHcj()
+            setType(v, "name", hStr(""))
+            v)
+  check("previous_rank and name are optional, never required",
+        (block:
+           var v = top10EventHcj()
+           dropKey(v, "previous_rank")
+           dropKey(v, "name")
+           validateEvent(v).len == 0))
 
 # --------------------------------------------------------- event id rule
 

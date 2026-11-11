@@ -25,8 +25,6 @@ import os
 REPO_ROOT = os.path.realpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-SEVERITIES = ("INFO", "HIGH", "CRITICAL")
-
 # Per-command required path keys (tools/notify/README.md §7); project_id
 # is a plain string key, validated separately for dispatch.
 COMMAND_PATH_KEYS = {
@@ -66,7 +64,10 @@ def _refuse_under_repo(cfg, key):
 def load_config(path, for_command):
     """Load and validate the config JSON for one command. Raises
     ConfigError on any deviation; there are no silent defaults except
-    the documented INT_DEFAULTS/min_severity."""
+    the documented INT/FLOAT_DEFAULTS. Unknown keys (a stale
+    min_severity among them — the key is removed from the contract,
+    README §7) pass through unvalidated: the policy no longer reads
+    them."""
     if not isinstance(path, str) or not path:
         raise ConfigError("no config path (--config or $HSNOTIFY_CONFIG)")
     try:
@@ -100,10 +101,6 @@ def load_config(path, for_command):
                 if not isinstance(arg, str) or not arg:
                     raise ConfigError("token_command entries must be "
                                       "non-empty strings")
-        severity = cfg.get("min_severity", "INFO")
-        if severity not in SEVERITIES:
-            raise ConfigError("min_severity must be one of %s"
-                              % (", ".join(SEVERITIES),))
 
     if for_command == "register":
         _require_abs_string(cfg, "register_bearer_file")

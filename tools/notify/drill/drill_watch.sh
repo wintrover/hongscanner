@@ -117,7 +117,6 @@ write_config() { # $1 = sandbox, $2 = watch_poll_seconds
   "delivery_path": "$1/delivery.hcj.jsonl",
   "registry_path": "$1/devices.jsonl",
   "register_bearer_file": "$1/bearer.secret",
-  "min_severity": "INFO",
   "retry_min_seconds": 1,
   "backoff_cap_seconds": 30,
   "watch_poll_seconds": $2,

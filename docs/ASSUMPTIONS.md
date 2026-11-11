@@ -54,6 +54,7 @@ changeable assumption; treating one as a requirement is what stalled v1–v5.
 | P24 | contract evolution rule: every new input/artifact field is optional with a declared default meaning "pre-contract" (the `environment`/`repoll_seconds` precedent); `run.json` gains a non-checksummed `contract_version`; replay stays same-commit — a sealed run verifies only under its own recorded commit's binary, and no provenance weakening is introduced for old runs | re-verifying old runs under new binaries by relaxing REPLAY_CONTRACT §8 check 1 (rejected: fail-closed by design) |
 | P25 | calendar approval is the operator's explicit decision recorded with three separable evidences: source match (`tools/check_calendar_source.py` output), integrity (`CALENDAR_INDEX.sha256` match), and the approved scope (first/last trading day). The INDEX commit is not a cryptographic signature; byte equality is not authority | treating INDEX hash equality or a restored copy's byte match as approval (rejected) |
 | P26 | event ids are namespaced by the run's own identity: a config record with `run_id` (the run directory's basename, the recorder COMMITTED convention) joins the `x-event-id-rule` digest between `rule_id` and `session_id`; a config without `run_id` (every sealed pre-2026-11-09 run) keeps the legacy five-key digest byte-identically. One date may hold more than one run — a failed run's immutable ledger facts and its same-day restart's facts must coexist, not collide (2026-11-09 incident: the date-only id space made the ledger refuse the restart's whole batch) | a date-only id space (rejected: same-day restarts cannot record their facts); rewriting or deleting the failed run's ledger facts to make room (rejected: the ledger is immutable) |
+| P27 | notification delivery gates on an event-type allowlist, exactly `TOP10_ENTERED`, `TOP10_EXITED`, `RANK_CHANGED` (user decision 2026-11-11; resolves U16). A fact's severity is operational importance only and never gates delivery; `min_severity` is removed from the dispatcher contract and the live config. System-fault facts (FEED_DISCONNECTED, DATA_GAP_SUSPECTED, REST_TRUNCATED, SUBSCRIPTION_TRUNCATED, MARKET_STATE_UNKNOWN, SESSION_INCOMPLETE) stay recorded in the ledgers and are never pushed — the user chose silence over fault alarms | severity-gated delivery (rejected: severity measures system impact, not user interest); fault events pushed (rejected: user decision) |
 
 ## IMPLEMENTATION CHOICE (free to change without breaking the contract)
 
@@ -89,7 +90,7 @@ changeable assumption; treating one as a requirement is what stalled v1–v5.
 | U13 | whether Kiwoom accepts (registering) a Northflank dedicated egress IP | NF-1 |
 | U14 | APAC region latency (Kiwoom and device push) — not yet measured | NF-3 |
 | U15 | actual volume usage and required size (1 GiB provisional from the 2026-11-02 runs/ measurement — GATES Phase-0 evidence log) | NF-4 |
-| U16 | the final `min_severity` policy value (the session default HIGH is provisional; REST_TRUNCATED can fire per poll) | user decision |
+| U16 | RESOLVED 2026-11-11 (P27): the severity-gate question is superseded by the event-type allowlist; nothing remains to measure | — |
 | U17 | FCM and API end-to-end from a cloud deployment to a real device | NF-8 |
 | U18 | GHCR package visibility handling (first push is private by default; the operator read:packages PAT path) | NF-9 (tools/container/README.md §8.3) |
 
@@ -329,6 +330,32 @@ still requires G2 credentials.
   once after 1 s, then reports the final response). At 1 TR/s a full
   ~2,500-symbol universe sweep takes ≈ 41.7 min. Production-environment
   behavior: UNVERIFIED (G2/G4).
+- FCM / Android notification behavior (official Firebase + FlutterFire
+  docs and plugin source, collected 2026-11-11 — the basis of the market
+  alert slice): notification messages on Android are **not displayed while
+  the app is in the foreground** (FlutterFire receive.md: "won't display a
+  visible notification by default"; FirebaseMessagingService.onMessageReceived
+  reference: "also called when a notification message is received while the
+  application is in the foreground"); the app must post them itself.
+  Background/terminated: the system tray displays notification messages
+  automatically (onMessageReceived is not called). `android.notification.
+  channel_id` applies only when "the app must create a channel with this
+  channel ID before any notification with this channel ID can be received";
+  without it (or an uncreated channel) FCM falls back to the manifest's
+  `default_notification_channel_id` and then to the fallback channel.
+  `android.priority: HIGH` means FCM "attempts to deliver high priority
+  messages immediately even if the device is in Doze mode" — an attempt,
+  never a delivery-time guarantee; high-priority messages that repeatedly
+  fail to result in user-facing notifications are deprioritized after ~7
+  days of observed behavior. Per-device throttle: 240 messages/min, 5,000/hr
+  (no documented daily cap). An FCM HTTP 200 acknowledges acceptance by
+  FCM, not delivery to the device. Android 8+ channel importance is fixed
+  at creation; the app cannot change it afterwards (users can). The
+  firebase_messaging 17.0.1 plugin source (pub-cache, read directly) posts
+  foreground messages to the Dart stream only — the app posting a
+  server-composed notification via the platform's NotificationManager
+  cannot double-display. Delivery priority (FCM `android.priority`) and
+  display intrusiveness (channel importance) are separate settings.
 
 ## Trust boundary
 

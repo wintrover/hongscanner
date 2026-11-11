@@ -13,15 +13,21 @@
 ## fold; resuming the recorded stream from the prefix state reproduces
 ## exactly the same events), the candidate transition rules (ENTERED /
 ## UPDATED rank change / EXITED, the declared-vendor-scope evidence, the
-## one-judgment-per-tuple dedup), the no-verification/no-delivery
-## immutability of every generated fact, and the verify byte comparison
-## of the events artifact (MATCH with the replayed file; tampered or
-## missing file is a MISMATCH, never a pass).
+## one-judgment-per-tuple dedup), the TOP10 observation-group rules
+## (top10-transition-v1: pairs under one observation stamp form a group;
+## a new stamp confirms the pending group — the first group is the
+## baseline, ENTERED/EXITED/RANK_CHANGED compare the confirmed tail with
+## the pending tail per direction, the facts precede the new group's
+## candidate facts, the session_end seal flushes the last group before
+## SESSION_ENDED, and an unsealed stream never flushes), the
+## no-verification/no-delivery immutability of every generated fact, and
+## the verify byte comparison of the events artifact (MATCH with the
+## replayed file; tampered or missing file is a MISMATCH, never a pass).
 ##
 ## Hand-rolled assertions in the repo's contract-suite style; synthetic
 ## fixtures only: no network, no vendor data, no wall clock.
 ## Run: nim c -r --hints:off --warnings:off --path:src tests/test_event_gen_contract.nim
-import std/[os, strutils, tempfiles]
+import std/[os, strutils, tempfiles, options]
 import hs/[hcj, digest, records, sub_input, replay, verify, event_gen, binfo]
 
 var failures = 0
@@ -39,13 +45,15 @@ proc check(name: string; cond: bool) =
 
 const
   eventFields = @["data_quality", "direction", "event_id", "event_type",
-                  "evidence_ref", "observed_at", "rank", "rule_id",
-                  "rule_version", "session_id", "severity", "symbol"]
+                  "evidence_ref", "name", "observed_at", "previous_rank",
+                  "rank", "rule_id", "rule_version", "session_id",
+                  "severity", "symbol"]
   requiredEventFields = @["data_quality", "event_id", "event_type",
                           "evidence_ref", "observed_at", "rule_id",
                           "rule_version", "session_id", "severity"]
   eventTypes = @["CANDIDATE_ENTERED", "CANDIDATE_UPDATED",
-                 "CANDIDATE_EXITED", "FEED_DISCONNECTED",
+                 "CANDIDATE_EXITED", "TOP10_ENTERED", "TOP10_EXITED",
+                 "RANK_CHANGED", "FEED_DISCONNECTED",
                  "DATA_GAP_SUSPECTED", "REST_TRUNCATED",
                  "SUBSCRIPTION_TRUNCATED", "MARKET_STATE_UNKNOWN",
                  "REPLAY_MATCH", "REPLAY_MISMATCH",
@@ -85,6 +93,10 @@ proc validateEventLine(line: string): seq[string] =
     result.add("event: rule_version must be >= 1")
   if v.has("symbol") and not validCode(v.get("symbol").asStr):
     result.add("event: symbol is not a 6-digit code")
+  if v.has("previous_rank") and v.get("previous_rank").ival < 1:
+    result.add("event: previous_rank must be >= 1")
+  if v.has("name") and v.get("name").asStr.len == 0:
+    result.add("event: name is empty")
   if v.has("severity") and not severities.contains(v.get("severity").asStr):
     result.add("event: severity is not INFO|HIGH|CRITICAL")
   if v.has("data_quality") and
@@ -456,20 +468,25 @@ proc hexOf(s: string): string =
     result.add(digits[int(b shr 4)])
     result.add(digits[int(b and 0x0f'u8)])
 
-proc restRecord(seqNo: int; sortTp: string; codes: seq[string];
-                contYn = "N"): Record =
-  ## A synthetic terminal ka10027 page: the declared scope, a preserved
-  ## body affirming success (return_code 0 + the documented list key).
-  var rows: seq[HcjValue]
-  for c in codes:
-    rows.add(hObj(
+proc restRecordRows(seqNo: int; sortTp: string;
+                    rows: seq[tuple[code, nm: string]];
+                    contYn = "N"): Record =
+  ## A synthetic terminal ka10027 page with per-row stk_nm control: an
+  ## empty nm omits the field entirely (a nameless row — collected
+  ## nowhere, the consumer falls back to the symbol).
+  var rowVals: seq[HcjValue]
+  for r in rows:
+    var ps: seq[HcjPair] = @[
       ("buy_req", hStr("500")), ("cnt", hStr("1")),
       ("cntr_str", hStr("0")), ("cur_prc", hStr("70000")),
       ("flu_rt", hStr("3.50")), ("now_trde_qty", hStr("100")),
       ("pred_pre", hStr("500")), ("pred_pre_sig", hStr("2")),
-      ("sel_req", hStr("1000")), ("stk_cd", hStr(c)),
-      ("stk_cls", hStr("2")), ("stk_nm", hStr("synthetic"))))
-  let body = canonical(hObj(("pred_pre_flu_rt_upper", hArrSeq(rows)),
+      ("sel_req", hStr("1000")), ("stk_cd", hStr(r.code)),
+      ("stk_cls", hStr("2"))]
+    if r.nm.len > 0:
+      ps.add(("stk_nm", hStr(r.nm)))
+    rowVals.add(hObj(ps))
+  let body = canonical(hObj(("pred_pre_flu_rt_upper", hArrSeq(rowVals)),
                             ("return_code", hInt(0)),
                             ("return_msg", hStr("synthetic"))))
   Record(seq: seqNo, kind: kRestResp, raw: hObj(
@@ -485,6 +502,27 @@ proc restRecord(seqNo: int; sortTp: string; codes: seq[string];
       ("trde_prica_cnd", hStr("0")), ("trde_qty_cnd", hStr("0000")),
       ("updown_incls", hStr("1")))),
     ("status", hInt(200))))
+
+proc restRecord(seqNo: int; sortTp: string; codes: seq[string];
+                contYn = "N"): Record =
+  ## A synthetic terminal ka10027 page: the declared scope, a preserved
+  ## body affirming success (return_code 0 + the documented list key).
+  var rows: seq[tuple[code, nm: string]]
+  for c in codes:
+    rows.add((code: c, nm: "synthetic"))
+  restRecordRows(seqNo, sortTp, rows, contYn)
+
+proc wsFrame(seqNo: int; t: string): Record =
+  ## A ws_frame whose own t advances the observation stamp (touchT
+  ## composes the time-of-day form onto the session date). The record
+  ## judges nothing itself — its role here is the observation-group
+  ## boundary.
+  Record(seq: seqNo, kind: kWsFrame, raw: hObj(
+    ("m", hStr("2")), ("price", hInt(70000)), ("symbol", hStr("005930")),
+    ("t", hStr(t)), ("vol", hInt(1000))))
+
+proc sessionEndRecord(seqNo: int): Record =
+  Record(seq: seqNo, kind: kSessionEnd, raw: hNull())
 
 proc summary(evs: seq[EventFact]): string =
   for f in evs:
@@ -551,6 +589,320 @@ block candidateTransitions:
         "stream-level audit rejects it; no event leaks past)",
         e11.len == 0)
   discard s
+
+# ------------------------------------------------------ TOP10 transitions
+
+proc top10Facts(evs: seq[EventFact]): seq[EventFact] =
+  for f in evs:
+    if f.ruleId == ruleTop10Transition: result.add(f)
+
+proc candFacts(evs: seq[EventFact]): seq[EventFact] =
+  for f in evs:
+    if f.ruleId == ruleCandidateTransition: result.add(f)
+
+proc top10Summary(evs: seq[EventFact]): string =
+  for f in evs:
+    result.add(f.eventType & "/" & f.symbol & "/" & f.direction & "/" &
+               $f.rank & "/" & $f.previousRank & "/" & f.name & " ")
+
+block top10Transitions:
+  ## The top10-transition-v1 judgment over three observation groups. G1
+  ## completes under the config-midnight stamp (rest_resp records carry
+  ## no t), G2 under 10:10, G3 under 10:20: the G1 pair starts the
+  ## pending group; the G2 pair crosses the FIRST boundary (G1 becomes
+  ## the confirmed baseline — zero facts); the G3 pair crosses the second
+  ## boundary and judges the G1->G2 TOP10 transitions BEFORE its own
+  ## G2->G3 candidate facts; the seal flushes G2->G3 before
+  ## SESSION_ENDED.
+  let g1up = @["000001", "000002", "000003", "000004", "000005", "000006",
+               "000007", "000008", "000009", "000010", "000011", "000012",
+               "000013", "000014", "000015"]
+  let g2up = @["000001", "000005", "000003", "000004", "000002", "000006",
+               "000007", "000016", "000009", "000011", "000010", "000012",
+               "000013", "000015", "000014"]
+  let g3up = @["000001", "000005", "000004", "000003", "000002", "000006",
+               "000007", "000016", "000009", "000011", "000010", "000012",
+               "000013", "000015", "000014"]
+  var stream = recs[0 ..< 2]
+  var s = stateAt(recs[0 ..< 2])
+  var journal: seq[string]
+
+  proc feed(r: Record): seq[EventFact] =
+    stream.add(r)
+    let (s2, evs) = step(s, r)
+    s = s2
+    for f in evs: journal.add(eventLine(f))
+    evs
+
+  # G1: the first completed pair starts the pending group — no boundary.
+  let e1 = feed(restRecord(3, "1", g1up))
+  check("top10: an up chain alone still judges nothing", e1.len == 0)
+  let e2 = feed(restRecord(4, "3", @[]))
+  check("top10: the first generation judges only candidate facts — the " &
+        "group baseline carries no transition",
+        e2.top10Facts().len == 0 and e2.len == 15 and
+        (block:
+           var ok = true
+           for f in e2:
+             if f.eventType != "CANDIDATE_ENTERED": ok = false
+           ok))
+  check("top10: the first generation sets the pending stamp and q",
+        s.pendingStamp == "2026-11-02T00:00:00+09:00" and s.pendingQ == 4 and
+        s.top10Confirmed.isNone)
+
+  # G2: the stamp changes — the first boundary. G1 becomes the confirmed
+  # baseline: zero TOP10 facts (never guessed), the candidate rule
+  # unchanged.
+  discard feed(wsFrame(5, "10:10:00+09:00"))
+  discard feed(restRecord(6, "1", g2up))
+  let e4 = feed(restRecord(7, "3", @[]))
+  check("top10: the first boundary confirms the baseline with zero facts " &
+        "(a generation with no predecessor has no transition)",
+        e4.top10Facts().len == 0 and
+        s.top10Confirmed.isSome and s.top10Confirmed.get.up == g1up)
+  check("top10: the baseline boundary still judges the new generation's " &
+        "candidate facts (the existing rule is unchanged — the 14/15 " &
+        "rank swap too)",
+        e4.candFacts().len == 8)
+  check("top10: the pending group is G2 now (stamp, q, tail)",
+        s.pendingStamp == "2026-11-02T10:10:00+09:00" and s.pendingQ == 7 and
+        s.candidates.up == g2up)
+
+  # G3: the second boundary. The G1->G2 TOP10 facts are judged FIRST,
+  # then the G2->G3 candidate facts — the order contract.
+  discard feed(wsFrame(8, "10:20:00+09:00"))
+  discard feed(restRecord(9, "1", g3up))
+  let e6 = feed(restRecord(10, "3", @[]))
+  check("top10: the second boundary judges the confirmed->pending tail " &
+        "transition — the full rule table (11->10 ENTERED with " &
+        "previous_rank, 10->11 EXITED with rank, 5->2 RANK_CHANGED, " &
+        "absence->top10 ENTERED without previous_rank, top10->absence " &
+        "EXITED without rank)",
+        e6.top10Facts().top10Summary() ==
+        "RANK_CHANGED/000005/UP/2/5/synthetic " &
+        "RANK_CHANGED/000002/UP/5/2/synthetic " &
+        "TOP10_ENTERED/000016/UP/8/0/synthetic " &
+        "TOP10_ENTERED/000011/UP/10/11/synthetic " &
+        "TOP10_EXITED/000010/UP/11/10/synthetic " &
+        "TOP10_EXITED/000008/UP/0/8/ ")
+  check("top10: the boundary TOP10 facts precede the new group's " &
+        "candidate facts (the order contract)",
+        e6.len == 8 and
+        (block:
+           var ok = true
+           for i in 0 ..< 6:
+             if e6[i].ruleId != ruleTop10Transition: ok = false
+           for i in 6 ..< 8:
+             if e6[i].ruleId != ruleCandidateTransition: ok = false
+           ok))
+  check("top10: the candidate facts after the boundary facts are the " &
+        "G2->G3 rank swap only",
+        summary(@[e6[6], e6[7]]) ==
+        "CANDIDATE_UPDATED/000004/UP/3 CANDIDATE_UPDATED/000003/UP/4 ")
+  check("top10: unchanged ranks and outside<->outside judge nothing " &
+        "(1->1, 6->6, 9->9, 12->12, 13->13, 15->14, 14->15)",
+        (block:
+           var ok = true
+           for f in e6.top10Facts():
+             if f.symbol in ["000001", "000003", "000004", "000006",
+                             "000007", "000009", "000012", "000013",
+                             "000014", "000015"]: ok = false
+           ok))
+  check("top10: the boundary facts bind the PENDING pair's q (7), never " &
+        "the current pair's (10)",
+        e6.top10Facts()[0].eventId ==
+          eventIdOf("2026-11-02", "RANK_CHANGED", ruleTop10Transition,
+                    "000005", 7) and
+        e6.top10Facts()[2].eventId ==
+          eventIdOf("2026-11-02", "TOP10_ENTERED", ruleTop10Transition,
+                    "000016", 7))
+  check("top10: the boundary facts observe the pending group's own stamp " &
+        "(10:10), never the emission moment's fallbackT (10:20)",
+        (block:
+           var ok = true
+           for f in e6.top10Facts():
+             if f.observedAt != "2026-11-02T10:10:00+09:00": ok = false
+           ok))
+  check("top10: the boundary facts carry the direction's declared vendor " &
+        "scope evidence and are INFO/OBSERVING facts of the top10 rule",
+        e6.top10Facts()[0].evidenceRef == "ka10027:stex_tp=1:sort_tp=1" and
+        (block:
+           var ok = true
+           for f in e6.top10Facts():
+             if f.severity != "INFO" or f.dataQuality != "OBSERVING": ok = false
+           ok))
+  check("top10: every boundary fact is a schema-valid fact line (closed " &
+        "field set, previous_rank >= 1 or absent, name non-empty or absent)",
+        (block:
+           var bad: seq[string]
+           for f in e6:
+             bad.add(validateEventLine(eventLine(f)))
+           bad.len == 0))
+  check("top10: the boundary facts' ids are distinct",
+        idsUnique(e6) and idsUnique(e6.top10Facts()))
+
+  # The seal: the final group (G2->G3) is flushed BEFORE SESSION_ENDED.
+  let seRec = sessionEndRecord(11)
+  let e7 = feed(seRec)
+  check("top10: the seal flushes the final group before SESSION_ENDED " &
+        "(order, shape and the 5->5 silence)",
+        e7.len == 3 and e7.top10Facts().len == 2 and
+        e7[2].eventType == "SESSION_ENDED" and
+        e7.top10Facts().top10Summary() ==
+        "RANK_CHANGED/000004/UP/3/4/synthetic " &
+        "RANK_CHANGED/000003/UP/4/3/synthetic ")
+  check("top10: the flush binds the pending pair's q (10) and the pending " &
+        "group's stamp (10:20)",
+        e7[0].eventId ==
+          eventIdOf("2026-11-02", "RANK_CHANGED", ruleTop10Transition,
+                    "000004", 10) and
+        e7[0].observedAt == "2026-11-02T10:20:00+09:00")
+  check("top10: the flush's evidence is the seal record's content address",
+        e7[0].evidenceRef == contentRef(seRec) and
+        e7[2].evidenceRef == contentRef(seRec))
+
+  check("top10: the fold of the whole stream is exactly the manual " &
+        "judgment and byte-identical on a second fold (replay twice)",
+        eventsOfRecords(stream) == journal and
+        eventsOfRecords(stream) == eventsOfRecords(stream))
+
+  # Without the seal the final group is never flushed: finish() judges
+  # only SESSION_INCOMPLETE and the journal holds no G2->G3 TOP10 fact.
+  let unsealed = eventsOfRecords(stream[0 ..< ^1])
+  var nTop10 = 0
+  for l in unsealed:
+    if "\"rule_id\":\"top10-transition-v1\"" in l: inc nTop10
+  check("top10: an unsealed stream never flushes the final group — only " &
+        "the boundary facts exist and the tail is SESSION_INCOMPLETE",
+        nTop10 == 6 and unsealed.len == 32 and
+        unsealed[^1].contains("\"SESSION_INCOMPLETE\""))
+
+block top10GroupMerge:
+  ## Consecutive pairs under one observation stamp merge into one group:
+  ## only the group's TAIL is ever compared (an intra-group change judges
+  ## no TOP10 fact), and a previous group's facts appear only when a
+  ## different-stamp pair arrives (the boundary delay).
+  var stream = recs[0 ..< 2]
+  var s = stateAt(recs[0 ..< 2])
+
+  proc feed(r: Record): seq[EventFact] =
+    stream.add(r)
+    let (s2, evs) = step(s, r)
+    s = s2
+    evs
+
+  # group A (the config-midnight stamp): two pairs, the second reorders
+  # the ranking — same stamp, one merged group.
+  discard feed(restRecord(3, "1", @["000001", "000002"]))
+  discard feed(restRecord(4, "3", @[]))
+  discard feed(restRecord(5, "1", @["000002", "000001"]))
+  let eMerge = feed(restRecord(6, "3", @[]))
+  check("top10 merge: an intra-group ranking change judges no TOP10 fact " &
+        "(the group's tail is the only compared state)",
+        eMerge.top10Facts().len == 0 and eMerge.candFacts().len == 2)
+  # group B (10:10): the first boundary confirms the baseline (still zero
+  # facts — A has no predecessor), so no A->B fact exists yet.
+  discard feed(wsFrame(7, "10:10:00+09:00"))
+  discard feed(restRecord(8, "1", @["000001", "000002"]))
+  let eB = feed(restRecord(9, "3", @[]))
+  check("top10 delay: the previous group's facts do not exist until a " &
+        "different-stamp pair arrives (the boundary itself judged the " &
+        "baseline, never a guess)",
+        eB.top10Facts().len == 0)
+  # group C (10:20): its pair's boundary judges A(tail, the merged " &
+  # reorder)->B — two RANK_CHANGED facts prove the tail (not A's first
+  # generation, which equals B and would judge nothing).
+  discard feed(wsFrame(10, "10:20:00+09:00"))
+  discard feed(restRecord(11, "1", @["000001", "000002"]))
+  let eC = feed(restRecord(12, "3", @[]))
+  check("top10 delay: the different-stamp pair finally judges the merged " &
+        "A-tail -> B transition (the boundary delay is real, the tail is " &
+        "the merged one)",
+        eC.top10Facts().top10Summary() ==
+        "RANK_CHANGED/000001/UP/1/2/synthetic " &
+        "RANK_CHANGED/000002/UP/2/1/synthetic ")
+  # the seal flushes B->C (identical lists): nothing, then SESSION_ENDED.
+  let eSeal = feed(sessionEndRecord(13))
+  check("top10 merge: an identical final group flushes nothing before " &
+        "SESSION_ENDED",
+        eSeal.len == 1 and eSeal[0].eventType == "SESSION_ENDED")
+
+block top10Names:
+  ## The name is the pending generation's preserved stk_nm (the group
+  ## whose membership the fact describes): a nameless row emits no name
+  ## field — the consumer falls back to the symbol, never to a re-parse
+  ## of the raw response.
+  var s = stateAt(recs[0 ..< 2])
+
+  proc feed(r: Record): seq[EventFact] =
+    let (s2, evs) = step(s, r)
+    s = s2
+    evs
+
+  discard feed(restRecordRows(3, "1", @[(code: "000001", nm: "에이")]))
+  discard feed(restRecordRows(4, "3", @[]))
+  discard feed(wsFrame(5, "10:10:00+09:00"))
+  discard feed(restRecordRows(6, "1",
+                              @[(code: "000002", nm: "비"),
+                                (code: "000001", nm: "")]))
+  discard feed(restRecordRows(7, "3", @[]))
+  discard feed(wsFrame(8, "10:20:00+09:00"))
+  discard feed(restRecordRows(9, "1",
+                              @[(code: "000003", nm: "씨"),
+                                (code: "000002", nm: ""),
+                                (code: "000001", nm: "에이")]))
+  let e6 = feed(restRecordRows(10, "3", @[]))
+  check("top10 names: the fact carries the pending generation's name; a " &
+        "nameless pending row emits no name field",
+        e6.top10Facts().top10Summary() ==
+        "TOP10_ENTERED/000002/UP/1/0/비 RANK_CHANGED/000001/UP/2/1/ " and
+        not hasField(eventLine(e6.top10Facts()[1]), "name") and
+        fieldOf(eventLine(e6.top10Facts()[0]), "name") == "비")
+  let e7 = feed(sessionEndRecord(11))
+  check("top10 names: the seal flush's facts name from the final pending " &
+        "generation (nameless row -> absent field)",
+        e7.top10Facts().top10Summary() ==
+        "TOP10_ENTERED/000003/UP/1/0/씨 " &
+        "RANK_CHANGED/000002/UP/2/1/ " &
+        "RANK_CHANGED/000001/UP/3/2/에이 " and
+        not hasField(eventLine(e7.top10Facts()[1]), "name"))
+
+block top10Directions:
+  ## Each direction is judged independently (rank = that direction's
+  ## vendor order); a code entering the top 10 of BOTH directions is
+  ## judged once, in the up direction — the inherited up-first dedup.
+  var s = stateAt(recs[0 ..< 2])
+
+  proc feed(r: Record): seq[EventFact] =
+    let (s2, evs) = step(s, r)
+    s = s2
+    evs
+
+  discard feed(restRecord(3, "1", @["000001"]))
+  discard feed(restRecord(4, "3", @["000002"]))
+  discard feed(wsFrame(5, "10:10:00+09:00"))
+  discard feed(restRecord(6, "1", @["000003", "000001"]))
+  discard feed(restRecord(7, "3", @["000003", "000002"]))
+  discard feed(wsFrame(8, "10:20:00+09:00"))
+  discard feed(restRecord(9, "1", @["000001"]))
+  let e6 = feed(restRecord(10, "3", @["000002"]))
+  check("top10 directions: UP and DOWN are judged independently and a " &
+        "both-directions code is judged once, up first",
+        e6.top10Facts().top10Summary() ==
+        "TOP10_ENTERED/000003/UP/1/0/synthetic " &
+        "RANK_CHANGED/000001/UP/2/1/synthetic " &
+        "RANK_CHANGED/000002/DOWN/2/1/synthetic ")
+  check("top10 directions: the DOWN facts carry the down scope evidence",
+        e6.top10Facts()[2].evidenceRef == "ka10027:stex_tp=1:sort_tp=3")
+  let e7 = feed(sessionEndRecord(11))
+  check("top10 directions: the flush judges both directions and the " &
+        "both-directions exit once, up first (nameless — the code is " &
+        "absent from the final pending tail)",
+        e7.top10Facts().top10Summary() ==
+        "RANK_CHANGED/000001/UP/1/2/synthetic " &
+        "TOP10_EXITED/000003/UP/0/1/ " &
+        "RANK_CHANGED/000002/DOWN/1/2/synthetic " and
+        e7[^1].eventType == "SESSION_ENDED")
 
 # ------------------------------------------------- verify byte comparison
 

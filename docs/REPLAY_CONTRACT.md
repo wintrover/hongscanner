@@ -181,9 +181,12 @@ old format.
 
 `events.hcj.jsonl` fields: `data_quality, event_id, event_type, evidence_ref,
 observed_at, rule_id, rule_version, session_id, severity` — plus `direction`
-and `rank` on candidate-transition facts (EXITED carries no rank) and
-`symbol` on symbol-scoped facts. Closed facts: no record position, no
-verification or delivery state. See §13.
+and `rank` on candidate-transition facts (EXITED carries no rank), `symbol`
+on symbol-scoped facts, and on top10-transition facts (rule
+`top10-transition-v1`) the previous confirmed group's rank as
+`previous_rank` (absent when the symbol was not a candidate before) and the
+vendor row's stock name as `name` (absent when the row carried none). Closed
+facts: no record position, no verification or delivery state. See §13.
 
 `signals.hcj.jsonl` fields: `bar_index, price, reason, session_date, signal,
 symbol`.
@@ -572,10 +575,14 @@ judgment path would be a second definition of the facts. Delivery and
 notification code may filter, order or translate events for transport; it
 may never judge, upgrade, or rewrite them. Read-only presentation
 projections may additionally derive deterministic display views by
-comparing recorded states (e.g. the market-view change history, tools/api
-README §3.7); such views are not events, mint no ids of their own, never
-enter a journal, and never flow back into a fact, an id, or a judgment
-(§13.5).
+translating recorded facts, or — for runs whose config record predates
+`events_contract:"top10-v1"` — by comparing recorded states (the legacy
+market-view change history, tools/api README §3.7); such views are not
+events, mint no ids of their own, never enter a journal, and never flow back
+into a fact, an id, or a judgment (§13.5). TOP10 membership, entry, exit and
+in-group rank changes are judged facts (§13.8, `top10-transition-v1`); a
+presentation layer never re-derives them for runs that declare the
+`events_contract` marker.
 
 ### 13.2 Record-first (write-ahead judgment)
 
@@ -703,6 +710,7 @@ record's canonical line):
 | rule_id | event_type(s) | judged from | severity / data_quality |
 |---|---|---|---|
 | `candidate-transition-v1` | CANDIDATE_ENTERED / UPDATED / EXITED | completed ka10027 up+down chains (`evidence_ref` = `ka10027:stex_tp=1:sort_tp=1` or `…:sort_tp=3`); a code in both directions is judged once, up first; EXITED carries no rank | INFO / OBSERVING |
+| `top10-transition-v1` | TOP10_ENTERED / TOP10_EXITED / RANK_CHANGED | the previous confirmed observation group vs the pending group's final generation, per direction: outside-or-absent → rank 1-10 is TOP10_ENTERED (`previous_rank` present when the symbol was a ranked candidate), rank 1-10 → 11+ is TOP10_EXITED, rank 1-10 → candidate gone is TOP10_EXITED with no `rank`, rank 1-10 → a different rank 1-10 is RANK_CHANGED, all else judges nothing. A group is confirmed only when a pair with a different `observed_at` stamp completes, or at the kSessionEnd record (flushed before SESSION_ENDED); an unsealed stream that never consumed session_end confirms nothing. Same-stamp consecutive pairs merge into one group (intra-group states are never judged). The first confirmed group is the baseline and emits nothing. `observed_at` is the group's own stamp, `transition_seq` is the pending group's pair completion seq, `name` is the vendor row's stk_nm. A symbol in both directions with the same event_type at the same transition is judged once, up first (inherited from the id rule: direction is not in the digest) | INFO / OBSERVING |
 | `feed-disconnected-v1` | FEED_DISCONNECTED | ws_conn `closed_ok` (INFO) / `closed_error` (HIGH); `open` judges nothing | INFO or HIGH / INCOMPLETE |
 | `gap-suspected-v1` | DATA_GAP_SUSPECTED | every gap record | HIGH / INCOMPLETE |
 | `rest-truncated-v1` | REST_TRUNCATED | a gap record whose `what` is `rest_truncated` (second fact of the same record, distinct by event_type) | HIGH / INCOMPLETE |

@@ -1,0 +1,117 @@
+import 'package:flutter/services.dart';
+
+import 'push_service.dart';
+
+/// The Android market-alert path: the `hongscanner/market_alert` method
+/// channel, whose platform end is MainActivity.kt.
+///
+/// Why it exists: firebase_messaging delivers foreground notification
+/// messages to Dart only — the OS does not display them — and taps on
+/// locally posted notifications never arrive through FCM's
+/// `getInitialMessage`/`onMessageOpenedApp`. The channel carries:
+///
+/// * `postNotification` (Dart → platform) — re-posts a foreground
+///   message's **server-assembled** notification title/body (dispatcher:
+///   tools/notify) to the OS channel `market_rank_changes`. The app is a
+///   display courier: it never re-assembles, re-computes or re-judges
+///   the text (M15 — the app projects; the server decides).
+/// * `getPendingTap` (Dart → platform) — the one-shot event id of a
+///   local-notification tap that launched the app, consumed once at
+///   startup.
+/// * `onNotificationTap` (platform → Dart) — a tap on a locally posted
+///   notification while the app is running.
+///
+/// Fail-closed contract: no method throws. A refused or failed post
+/// answers false (the caller falls back to the in-app banner), a
+/// missing platform end (tests, non-Android platforms) answers
+/// false/null — no notification, no invented route. Taps the Dart side
+/// cannot acknowledge stay pending on the platform side and are
+/// consumed by the next `getPendingTap` (the handshake documented in
+/// MainActivity.kt).
+class MarketAlertChannel {
+  const MarketAlertChannel();
+
+  /// The channel MainActivity.kt binds its platform handler to. Tests
+  /// intercept outgoing calls on this name via
+  /// TestDefaultBinaryMessengerBinding.
+  static const MethodChannel channel =
+      MethodChannel('hongscanner/market_alert');
+
+  /// The event_type vocabulary routed to the OS market-alert channel:
+  /// the TOP10 state-change notifications, dispatched with a
+  /// server-assembled title/body. Anything else keeps the in-app banner
+  /// policy.
+  static const Set<String> marketEventTypes = {
+    'TOP10_ENTERED',
+    'TOP10_EXITED',
+    'RANK_CHANGED',
+  };
+
+  /// Whether [message] is a market alert the OS channel should display:
+  /// a TOP10 state-change event whose server-assembled title and body
+  /// both arrived. A market event with missing text is **not** postable
+  /// — the caller falls back to the banner instead of re-assembling the
+  /// text (the app never computes what the server should have said).
+  static bool isMarketAlert(PushMessage message) =>
+      message.eventId != null &&
+      marketEventTypes.contains(message.eventType) &&
+      message.notificationTitle != null &&
+      message.notificationBody != null;
+
+  /// Posts the dispatcher's own title/body as an OS notification on
+  /// `market_rank_changes`. Answers false when the platform refuses or
+  /// cannot post (POST_NOTIFICATIONS off, notifications disabled,
+  /// missing arguments, no platform end) — never throws, so the
+  /// foreground message path always has its banner fallback.
+  Future<bool> postNotification({
+    required String eventId,
+    required String title,
+    required String body,
+  }) async {
+    try {
+      final posted = await channel.invokeMethod<bool>('postNotification', {
+        'eventId': eventId,
+        'title': title,
+        'body': body,
+      });
+      return posted ?? false;
+    } on Object {
+      return false;
+    }
+  }
+
+  /// The one-shot local-notification tap that launched the app, or null
+  /// when there was none. The answer clears the platform-side copy; a
+  /// null never invents a route.
+  Future<String?> getPendingTap() async {
+    try {
+      return await channel.invokeMethod<String>('getPendingTap');
+    } on Object {
+      return null;
+    }
+  }
+
+  /// Registers the live tap path for notifications tapped while the app
+  /// is running. The handler replies `true` — the acknowledgement
+  /// MainActivity.kt uses to clear its pending copy (one tap routes
+  /// exactly once).
+  void setTapHandler(void Function(String eventId) onTap) {
+    channel.setMethodCallHandler((MethodCall call) async {
+      if (call.method == 'onNotificationTap') {
+        final arguments = call.arguments;
+        if (arguments is Map && arguments['event_id'] is String) {
+          onTap(arguments['event_id'] as String);
+          return true;
+        }
+      }
+      return null;
+    });
+  }
+
+  /// Removes the tap handler (the shell's dispose path). Taps arriving
+  /// afterwards stay pending on the platform side and are routed by the
+  /// next [getPendingTap].
+  void clearTapHandler() {
+    channel.setMethodCallHandler(null);
+  }
+}

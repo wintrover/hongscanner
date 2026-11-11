@@ -1,9 +1,12 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hongscanner/main.dart';
 import 'package:hongscanner/services/fcm_push_service.dart';
+import 'package:hongscanner/services/market_alert_channel.dart';
 import 'package:hongscanner/services/noop_push_service.dart';
 import 'package:hongscanner/services/push_permission.dart';
 import 'package:hongscanner/services/push_service.dart';
+
+import 'test_kit.dart';
 
 void main() {
   group('NoopPushService', () {
@@ -65,6 +68,52 @@ void main() {
     final store = defaultAppStore();
     expect(store.pushState.phase, PushPhase.unwired);
     store.dispose();
+  });
+
+  group('MarketAlertChannel', () {
+    test('fail-closed without a platform end: no post, no pending tap',
+        () async {
+      // No mock installed: the channel has no platform end in the test
+      // environment (and none on non-Android platforms) — every call
+      // degrades honestly instead of throwing or inventing a result.
+      TestWidgetsFlutterBinding.ensureInitialized();
+      const channel = MarketAlertChannel();
+      expect(
+        await channel.postNotification(
+            eventId: evUpEnterId, title: 't', body: 'b'),
+        isFalse,
+        reason: 'the caller falls back to the in-app banner',
+      );
+      expect(await channel.getPendingTap(), isNull,
+          reason: 'a null never invents a route');
+    });
+
+    test('isMarketAlert keys on the TOP10 vocabulary and complete server text',
+        () {
+      PushMessage typed(String type, {String? title = 't', String? body = 'b'}) =>
+          PushMessage({
+            'event_id': evUpEnterId,
+            'event_type': type,
+          }, notificationTitle: title, notificationBody: body);
+
+      expect(MarketAlertChannel.isMarketAlert(typed('TOP10_ENTERED')), isTrue);
+      expect(MarketAlertChannel.isMarketAlert(typed('TOP10_EXITED')), isTrue);
+      expect(MarketAlertChannel.isMarketAlert(typed('RANK_CHANGED')), isTrue);
+      expect(MarketAlertChannel.isMarketAlert(typed('CANDIDATE_ENTERED')),
+          isFalse,
+          reason: 'non-market types keep the in-app banner policy');
+      // Market type without the server-assembled text: not postable — the
+      // app never re-assembles text the server did not send.
+      expect(MarketAlertChannel.isMarketAlert(typed('RANK_CHANGED', body: null)),
+          isFalse);
+      // No usable event id: nothing to post or route.
+      expect(
+        MarketAlertChannel.isMarketAlert(PushMessage({
+          'event_type': 'TOP10_ENTERED',
+        }, notificationTitle: 't', notificationBody: 'b')),
+        isFalse,
+      );
+    });
   });
 
   group('PushPermissionLedger', () {

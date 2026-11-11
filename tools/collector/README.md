@@ -494,6 +494,7 @@ durable-completion 프로토콜이 이미 내구를 보장하므로 이 규칙 �
 
 ```json
 {"environment":"demo|real","market":"KRX",
+ "events_contract":"top10-v1",
  "candidate_query":{"mrkt_tp":"000","trde_qty_cnd":"0000","stk_cnd":"0",
    "crd_cnd":"0","updown_incls":"1","pric_cnd":"0","trde_prica_cnd":"0",
    "stex_tp":"1","sort_tp":"1|3 양방향"},
@@ -510,6 +511,13 @@ durable-completion 프로토콜이 이미 내구를 보장하므로 이 규칙 �
 `environment`는 `"demo"`|`"real"` 둘뿐이고("prod"는 폐기된 이름),
 `collector.rest_domain`·`collector.ws_endpoint`는 그 선택에서 파생된
 값이 기록된다(§2.1).
+
+`events_contract`는 이 스트림이 담는 이벤트 판정 계약의 마커다
+(`"top10-v1"`: top10-transition-v1 — 관측 그룹 경계의 TOP10 변화
+팩트). 코어가 이를 다시 읽어 판정을 바꾸는 일은 없다(판정은 기록된
+레코드에서 단일 판정 함수로 재도출된다). serve 표시 분기용 최상위
+키이며, 레거시 스트림에는 키가 없다(그 스트림은 재생 바이트가
+그대로다).
 
 `repoll_seconds`·`page_cap`의 config 선언은 rest_resp.nim이 예약한
 "승인된 확장 경로"다: cadence가 선언된 스트림에서만 같은 스코프의

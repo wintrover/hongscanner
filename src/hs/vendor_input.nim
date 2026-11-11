@@ -244,6 +244,12 @@ type
     down*: seq[string]  ## in-scope stk_cd in vendor order, sort_tp "3"
     upExcluded*: seq[string]   ## out-of-scope stk_cd in vendor order, up leg
     downExcluded*: seq[string] ## out-of-scope stk_cd in vendor order, down leg
+    names*: seq[tuple[code, name: string]]  ## every row's stk_nm the rows
+                               ## carried (a nameless row is collected
+                               ## nowhere), up leg first, first appearance
+                               ## wins — the one place the stock name
+                               ## crosses the vendor-input boundary, so no
+                               ## consumer ever re-parses the raw response
 
 const
   ka10027ApiId* = "ka10027"
@@ -772,12 +778,15 @@ proc normalizeEvents*(cap: VendorCapture;
     result.add(normalizeChain(cap.spec, chain, pageCap))
   result.add(wsEvents(cap.wsPayloads))
 
-proc chainSymbols*(spec: TrSpec; chain: PageChain;
-                   pageCap: int = defaultPageCap;
-                   truncatedOk = false): seq[string] =
-  ## stk_cd of every row, in vendor order. A row without stk_cd cannot yield
-  ## a candidate and rejects the whole chain (fail-closed). truncatedOk
-  ## consumes a cap-closed chain as a declared truncated subset.
+proc chainRows*(spec: TrSpec; chain: PageChain;
+                pageCap: int = defaultPageCap;
+                truncatedOk = false): seq[tuple[code, name: string]] =
+  ## Every row's stk_cd in vendor order with its stk_nm ("" when the row
+  ## carried none — a nameless row is not a failure, the name simply does
+  ## not cross this boundary), the same fail-closed validation path as
+  ## chainSymbols: a row without stk_cd cannot yield a candidate and
+  ## rejects the whole chain. truncatedOk consumes a cap-closed chain as a
+  ## declared truncated subset.
   validateKa10027Query(chain.query)
   validateChainPages(spec, chain.pages, pageCap, truncatedOk)
   for resp in chain.pages:
@@ -786,7 +795,20 @@ proc chainSymbols*(spec: TrSpec; chain: PageChain;
       if cd.isNone:
         raise verr(vfContract,
                    "row without stk_cd cannot yield a candidate (fail-closed)")
-      result.add(cd.get.asStr)
+      var nm = ""
+      let nn = row.getOpt("stk_nm")
+      if nn.isSome and nn.get.kind == hkStr:
+        nm = nn.get.strVal
+      result.add((code: cd.get.asStr, name: nm))
+
+proc chainSymbols*(spec: TrSpec; chain: PageChain;
+                   pageCap: int = defaultPageCap;
+                   truncatedOk = false): seq[string] =
+  ## stk_cd of every row, in vendor order. A row without stk_cd cannot yield
+  ## a candidate and rejects the whole chain (fail-closed). truncatedOk
+  ## consumes a cap-closed chain as a declared truncated subset.
+  for r in chainRows(spec, chain, pageCap, truncatedOk):
+    result.add(r.code)
 
 proc isCandidateCode*(cd: string): bool =
   ## The candidate universe's code shape: exactly 6 digits. The official
@@ -800,6 +822,26 @@ proc isCandidateCode*(cd: string): bool =
   ## evidence stays preserved in the response bytes, and the excluded
   ## lists carry its code; it is never a candidate and never a failure.
   cd.len == 6 and allDigits(cd)
+
+proc addName(names: var seq[tuple[code, name: string]]; code, name: string) =
+  ## First appearance wins (up leg first — the derivation's leg order): the
+  ## vendor rows of one code carry one name, and a later row never
+  ## rewrites an earlier one.
+  if name.len == 0:
+    return
+  for n in names:
+    if n.code == code:
+      return
+  names.add((code: code, name: name))
+
+proc nameOf*(names: seq[tuple[code, name: string]]; code: string): string =
+  ## The preserved stk_nm of one code, "" when the rows carried none — the
+  ## consumer falls back to the symbol, never to a re-parse of the raw
+  ## response (this boundary owns the name).
+  for n in names:
+    if n.code == code:
+      return n.name
+  ""
 
 proc upDownCandidates*(upChain, downChain: PageChain;
                        pageCap: int = defaultPageCap;
@@ -815,7 +857,9 @@ proc upDownCandidates*(upChain, downChain: PageChain;
   ## are partitioned out of the universe into upExcluded/downExcluded in
   ## vendor order: the vendor spec offers no request value that excludes
   ## them, so the shape is the universe boundary. A row without stk_cd
-  ## still rejects the whole chain (fail-closed, unchanged).
+  ## still rejects the whole chain (fail-closed, unchanged). Each row's
+  ## stk_nm is preserved in names (up leg first, first appearance wins) —
+  ## the one place the stock name crosses this boundary.
   if upChain.query.direction != dirUp:
     raise verr(vfContract, "up chain query direction is not up (sort_tp 1)")
   if downChain.query.direction != dirDown:
@@ -823,11 +867,14 @@ proc upDownCandidates*(upChain, downChain: PageChain;
   if upChain.query.stexTp != krxStexTp or downChain.query.stexTp != krxStexTp:
     raise verr(vfContract,
                "candidate queries are KRX-only: stex_tp must be " & krxStexTp)
-  for cd in chainSymbols(ka10027Spec, upChain, pageCap, upTruncated):
-    if isCandidateCode(cd): result.up.add(cd) else: result.upExcluded.add(cd)
-  for cd in chainSymbols(ka10027Spec, downChain, pageCap, downTruncated):
-    if isCandidateCode(cd): result.down.add(cd)
-    else: result.downExcluded.add(cd)
+  for r in chainRows(ka10027Spec, upChain, pageCap, upTruncated):
+    if isCandidateCode(r.code): result.up.add(r.code)
+    else: result.upExcluded.add(r.code)
+    addName(result.names, r.code, r.name)
+  for r in chainRows(ka10027Spec, downChain, pageCap, downTruncated):
+    if isCandidateCode(r.code): result.down.add(r.code)
+    else: result.downExcluded.add(r.code)
+    addName(result.names, r.code, r.name)
 
 # ---------------------------------------------------------------- verification
 

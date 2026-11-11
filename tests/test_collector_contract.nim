@@ -176,6 +176,15 @@ block config:
         "\"environment\":\"demo\"" in canonical(pre[1].raw) and
         "\"repoll_seconds\":300" in canonical(pre[1].raw) and
         "\"page_cap\":10" in canonical(pre[1].raw))
+  check("the config record declares the events contract marker (top-level " &
+        "key, the top10-v1 judgment contract)",
+        pre[1].raw.has("events_contract") and
+        pre[1].raw.get("events_contract").kind == hkStr and
+        pre[1].raw.get("events_contract").strVal == "top10-v1" and
+        "\"events_contract\":\"top10-v1\"" in canonical(pre[1].raw))
+  check("the marker never enters the sidecar init line (the judgment " &
+        "re-derives from the preserved records, never from the marker)",
+        "events_contract" notin newCollector().cfg.initLine())
   proc cfgWithRunId(runId: string): CollectorConfig =
     initCollectorConfig(
       "2026-10-29", "demo", "demo-profile",
