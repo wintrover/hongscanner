@@ -37,6 +37,9 @@
         "CANDIDATE_ENTERED",
         "CANDIDATE_UPDATED",
         "CANDIDATE_EXITED",
+        "TOP10_ENTERED",
+        "TOP10_EXITED",
+        "RANK_CHANGED",
         "FEED_DISCONNECTED",
         "DATA_GAP_SUSPECTED",
         "REST_TRUNCATED",
@@ -55,13 +58,23 @@
       "minLength": 1,
       "type": "string"
     },
+    "name": {
+      "description": "The vendor row's stock name (ka10027 stk_nm) preserved by the vendor-input normalization boundary for the fact's symbol. Absent when the row carried no name; consumers fall back to the symbol, never to a re-parse of the raw response.",
+      "minLength": 1,
+      "type": "string"
+    },
     "observed_at": {
-      "description": "When the transition was observed, in the scanner canonical timestamp form YYYY-MM-DDTHH:MM:SS+HH:MM (numeric offset, the same form the calendar bounds use; see hs/sub_input.validIso8601Offset).",
+      "description": "When the transition was observed, in the scanner canonical timestamp form YYYY-MM-DDTHH:MM:SS+HH:MM (numeric offset, the same form the calendar bounds use; see hs/sub_input.validIso8601Offset). For top10-transition facts this is the confirmed observation group's own stamp, not the emission moment.",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$",
       "type": "string"
     },
+    "previous_rank": {
+      "description": "Rank in the same direction at the end of the previous confirmed observation group. Present only on top10-transition facts (TOP10_ENTERED from outside the candidate universe, and CANDIDATE_ENTERED-style first appearance, carry none); 1 is the first rank.",
+      "minimum": 1,
+      "type": "integer"
+    },
     "rank": {
-      "description": "Candidate rank in the judged direction at the observed moment. Present only for rank-bearing events; 1 is the first rank.",
+      "description": "Candidate rank in the judged direction at the observed moment. Present only for rank-bearing events; 1 is the first rank. Absent on a TOP10_EXITED whose candidate left the universe.",
       "minimum": 1,
       "type": "integer"
     },

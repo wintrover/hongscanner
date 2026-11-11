@@ -145,6 +145,15 @@ type
 
 const collectorConfigSchema* = "hong-scanner-collector-config/1"
 
+const eventsContractMarker* = "top10-v1"
+  ## The config record's events_contract marker (top-level key): names the
+  ## event judgment contract the run's stream carries (the TOP10 market
+  ## alert rules, event_gen.ruleTop10Transition). Recorded on every new
+  ## run — never read back by the core (the judgment itself re-derives
+  ## from the preserved records); the marker is the display/serve
+  ## branching key, absent on legacy streams (which carry no TOP10 facts
+  ## and replay byte-identically).
+
 proc cerr(msg: string): ref CollectorError =
   newException(CollectorError, msg)
 
@@ -251,7 +260,11 @@ proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
   ## seq 1 (calendar, the approved snapshot verbatim) and seq 2 (config
   ## with every approved PH-1 value recorded — README §6.1). run_id is
   ## recorded only when set: an empty runId keeps the config record — and
-  ## therefore every legacy sealed stream — byte-identical.
+  ## therefore every legacy sealed stream — byte-identical. The
+  ## events_contract marker names the event judgment contract the run's
+  ## stream carries (top10-v1); it is recorded on every new run and never
+  ## read back by the judgment (which re-derives from the preserved
+  ## records).
   discard sessionFor(cfg.calendar, cfg.sessionDate)
   let qp = cfg.queryOf(dirUp)
   let qd = cfg.queryOf(dirDown)
@@ -275,6 +288,7 @@ proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
         ("ws_endpoint", hStr(cfg.wsEndpoint)))),
       ("drain_seconds", hInt(cfg.drainSeconds)),
       ("environment", hStr(cfg.environment)),
+      ("events_contract", hStr(eventsContractMarker)),
       ("market", hStr("KRX")),
       ("page_cap", hInt(cfg.pageCap)),
       ("params", hObj(

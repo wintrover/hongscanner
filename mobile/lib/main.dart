@@ -8,6 +8,7 @@ import 'screens/app_scope.dart';
 import 'screens/auth_dialog.dart';
 import 'screens/market_view_screen.dart';
 import 'services/fcm_push_service.dart';
+import 'services/market_alert_channel.dart';
 import 'services/push_service.dart';
 import 'state/app_store.dart';
 
@@ -76,12 +77,18 @@ class RootShell extends StatefulWidget {
 class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
   AppStore? _store;
 
-  /// Event ids already shown as a foreground banner, so a burst of
-  /// repeated deliveries for one event shows one banner, not a stack.
-  /// Bounded: the oldest id drops out once the history is full.
-  final Set<String> _bannerShownEventIds = <String>{};
+  /// The OS market-alert path (MainActivity.kt owns the platform end):
+  /// foreground posting, local-notification taps, the pending cold-start
+  /// tap. One instance per shell; see [MarketAlertChannel].
+  final MarketAlertChannel _marketAlert = const MarketAlertChannel();
 
-  static const int _maxBannerHistory = 64;
+  /// Event ids already surfaced as a foreground OS notification or
+  /// in-app banner, so a burst of repeated deliveries for one event
+  /// shows one alert, not a stack. Bounded: the oldest id drops out
+  /// once the history is full.
+  final Set<String> _surfacedEventIds = <String>{};
+
+  static const int _maxSurfacedHistory = 64;
 
   static const _screens = <Widget>[
     MarketViewScreen(),
@@ -96,9 +103,19 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
       final store = _store;
       if (store == null) return;
       store.bootstrap(
-        onForegroundMessage: _showForegroundBanner,
+        onForegroundMessage: _handleForegroundAlert,
         onUnauthorized: () => _reenterCredentials(store),
       );
+      // Local-notification taps bypass FCM's tap APIs: a tap while the
+      // app runs arrives as "onNotificationTap" on the market-alert
+      // channel, a cold-start tap is consumed once via getPendingTap.
+      // The handler is registered before the pending query so a tap
+      // landing between the two is delivered live, not parked — see the
+      // handshake notes in MarketAlertChannel and MainActivity.kt.
+      _marketAlert.setTapHandler(store.openEvent);
+      _marketAlert.getPendingTap().then((eventId) {
+        if (eventId != null) store.openEvent(eventId);
+      });
       // A cold-start tap can route before the navigator exists (the store
       // may be bootstrapped ahead of the first frame); the deferred route
       // flushes here, once the navigator is guaranteed to be mounted.
@@ -108,6 +125,7 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _marketAlert.clearTapHandler();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -129,23 +147,41 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
   }
 
   /// Foreground delivery policy: with notification+data messages the OS
-  /// does not display the notification while the app is in the foreground,
-  /// so the app shows an in-app banner. Banners dedup by event_id with a
-  /// bounded history, and a new banner replaces the current one instead
-  /// of queueing behind it. Data-only payloads plus local notification
-  /// re-synthesis are forbidden by design — terminated-state display
-  /// stays with the OS notification (the official path).
-  void _showForegroundBanner(PushMessage message) {
+  /// does not display the notification while the app is foregrounded
+  /// (official firebase_messaging behavior), so the app surfaces the
+  /// alert itself. TOP10 state changes (TOP10_ENTERED / TOP10_EXITED /
+  /// RANK_CHANGED) are re-posted to the OS `market_rank_changes` channel
+  /// with the dispatcher's own title/body — display delivery only; the
+  /// app never re-assembles or re-computes the text. A refused post
+  /// (notification permission off, no platform end) falls back to the
+  /// in-app banner. Alerts dedup by event_id with a bounded history,
+  /// and a new banner replaces the current one instead of queueing
+  /// behind it. Data-only payloads plus local notification re-synthesis
+  /// of text the server did not send stay forbidden — terminated-state
+  /// display remains the OS notification (the official path).
+  Future<void> _handleForegroundAlert(PushMessage message) async {
     if (!mounted) return;
     final eventId = message.eventId;
     if (eventId != null) {
-      if (_bannerShownEventIds.contains(eventId)) return;
-      if (_bannerShownEventIds.length >= _maxBannerHistory) {
-        // LinkedHashSet keeps insertion order: drop the oldest shown id.
-        _bannerShownEventIds.remove(_bannerShownEventIds.first);
+      if (_surfacedEventIds.contains(eventId)) return;
+      if (_surfacedEventIds.length >= _maxSurfacedHistory) {
+        // LinkedHashSet keeps insertion order: drop the oldest surfaced id.
+        _surfacedEventIds.remove(_surfacedEventIds.first);
       }
-      _bannerShownEventIds.add(eventId);
+      _surfacedEventIds.add(eventId);
     }
+    final title = message.notificationTitle;
+    final body = message.notificationBody;
+    if (eventId != null && title != null && body != null &&
+        MarketAlertChannel.isMarketAlert(message)) {
+      final posted = await _marketAlert.postNotification(
+        eventId: eventId,
+        title: title,
+        body: body,
+      );
+      if (posted) return; // the OS notification owns the display
+    }
+    if (!mounted) return; // the post awaited: the shell may be gone
     final label = message.eventType ?? message.eventId ?? '페이로드 없음';
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()

@@ -12,7 +12,12 @@ Nim verify binary is outside this process's scope, always. The one
 display classification beyond the fold is the §3.7 opening MA20 mode:
 a time-window filter over a recorded observed_at plus an
 integer-only comparison of recorded prices against recorded close
-sums — recorded values in, tags out, never a market judgment.
+sums — recorded values in, tags out, never a market judgment. The
+§3.7 change history is dual-path: pre-contract runs project the
+state-comparison changes, runs whose config record declares
+events_contract "top10-v1" translate the Core-confirmed TOP10 facts
+already recorded in the journal field-for-field — a display
+conversion, never a judgment either way.
 
 Security boundaries (README §5):
   - binds 127.0.0.1 by default; --bind takes a concrete IPv4 unicast
@@ -146,6 +151,20 @@ MARKET_CHANGE_TYPES = ("CANDIDATE_EXITED", "RANK_CHANGED",
 MARKET_CHANGE_FIELDS = ("change_type", "data_quality", "direction",
                         "event_id", "name", "observed_at", "prev_rank",
                         "rank", "symbol")
+# The §3.7 history dual-path discriminator (README §3.7): a config
+# record raw carrying events_contract "top10-v1" marks a run whose
+# events.hcj.jsonl already holds the Core-confirmed TOP10 change facts
+# — history is their display translation (the fact path). A config
+# without the key is a pre-contract run: the legacy state-comparison
+# projection, unchanged. Any other recorded value is a contract this
+# projection cannot consume — DataFault, never a guess.
+MARKET_EVENTS_CONTRACT = "top10-v1"
+# The TOP10 fact event types the fact path consumes (the Core journal
+# event types of events_contract top10-v1): each translates one-to-one
+# into a MARKET_CHANGE_TYPES change record. A TOP10_* event type
+# outside this set is an unknown future fact — DataFault, fail-closed.
+MARKET_FACT_TYPES = ("RANK_CHANGED", "TOP10_ENTERED", "TOP10_EXITED")
+TOP10_PREFIX = "TOP10_"
 
 
 class DataFault(Exception):
@@ -961,23 +980,93 @@ class Projector:
                   "symbol": item["symbol"]}
         return {field: record[field] for field in MARKET_CHANGE_FIELDS}
 
+    @staticmethod
+    def _market_fact_change(ev, names):
+        """The §3.7 fact-path change record: the display translation of
+        one Core-confirmed TOP10 fact (README §3.7's dual path). The
+        same nine whitelisted fields as _market_change with no
+        classification: change_type is the fact's event_type verbatim,
+        direction, rank and prev_rank are the fact's own optional
+        fields (null when the fact records none — TOP10_EXITED's
+        candidate-disappearance case records no rank), name is the
+        fact's recorded name with the folded ka10027 dictionary as the
+        fallback (null when neither names the symbol). The fact is
+        already the confirmed change — this method mints nothing."""
+        name = ev.get("name")
+        if not isinstance(name, str):
+            name = names.get(ev["symbol"])
+        record = {"change_type": ev["event_type"],
+                  "data_quality": ev["data_quality"],
+                  "direction": ev.get("direction"),
+                  "event_id": ev["event_id"],
+                  "name": name,
+                  "observed_at": ev["observed_at"],
+                  "prev_rank": ev.get("previous_rank"),
+                  "rank": ev.get("rank"),
+                  "symbol": ev["symbol"]}
+        return {field: record[field] for field in MARKET_CHANGE_FIELDS}
+
+    @staticmethod
+    def _fact_history(facts, last_stamp_pos, sealed, names):
+        """The top10-v1 fact-path history (README §3.7): every eligible
+        TOP10 fact translated into a change record, journal order, the
+        last MARKET_HISTORY_N kept (the oldest dropped first — the
+        legacy ring rule). Eligibility is the fact-path equivalent of
+        the legacy unsealed-tail rule: a fact enters history only when
+        the run is sealed OR some journal event with a different
+        observed_at follows it. Derivation: Core journals a group's
+        boundary facts only when the next pair completes, and the
+        emission order is [boundary TOP10 facts -> the new group's
+        CANDIDATE_*], so a different-stamp event always follows a
+        boundary fact — a fact in the journal is already confirmed.
+        The exception is the kSessionEnd flush facts of the final
+        group: nothing but the same-stamp SESSION_ENDED follows them,
+        so the seal is their only confirmation and an unsealed tail is
+        never served complete. Single pass: `last_stamp_pos` maps each
+        stamp to its greatest ledger position (distinct positions, one
+        per stamp), so the sorted entries yield the file's last stamp
+        and the greatest position of any other stamp — the two values
+        that decide every fact. `facts` is the pass's append order:
+        ledger order by construction, never a dict iteration."""
+        if not facts:
+            return []
+        entries = sorted(last_stamp_pos.items(), key=lambda kv: kv[1])
+        last_stamp = entries[-1][0]
+        # the greatest position of any stamp other than the file's last
+        runner_up = entries[-2][1] if len(entries) > 1 else None
+        records = []
+        for pos, ev in facts:
+            if not sealed:
+                stamp = ev["observed_at"]
+                if stamp == last_stamp:
+                    if runner_up is None or runner_up <= pos:
+                        continue  # the unsealed tail: not yet confirmed
+                # a different stamp's event follows the fact: the
+                # boundary that confirmed it is already in the journal
+            records.append(Projector._market_fact_change(ev, names))
+        return records[-MARKET_HISTORY_N:]
+
     def market_view(self):
         """GET /mobile/market-view (README §3.7): the bounded,
         deterministic, read-only projection of the latest ELIGIBLE
         market-collection run. No judgment happens here: ranks are
         recorded facts, and this method only folds them, orders by a
-        recorded field, selects, counts, and classifies TOP10 changes
-        by the contract's state-comparison projection — recorded
-        snapshots are compared, so every value in a change record is a
-        recorded value and the classification follows the §3.7
-        vocabulary. The VS-2 opening MA20 mode is one more recorded
-        projection on the same fold: when the reference group's
-        recorded observed_at falls in the opening window, the top10
-        lists are reconstituted by opening_market_top10 from recorded
-        prices against recorded close sums (§3.7). The runs root is
-        listed once per request and every identity is read from
-        recorded bytes (the committed config record), never the wall
-        clock. The event fold and the response stay per-request
+        recorded field, selects, counts, and projects TOP10 changes —
+        on a pre-contract run by the contract's state-comparison
+        projection (recorded snapshots compared, every value in a
+        change record a recorded value, the classification following
+        the §3.7 vocabulary), on an events_contract "top10-v1" run by
+        the dual path's fact translation (the Core-confirmed TOP10
+        facts already in the journal, translated field-for-field —
+        still no judgment: the facts are the confirmed changes). The
+        VS-2 opening MA20 mode is one more recorded projection on the
+        same fold: when the reference group's recorded observed_at
+        falls in the opening window, the top10 lists are reconstituted
+        by opening_market_top10 from recorded prices against recorded
+        close sums (§3.7) — orthogonal to the history path. The runs
+        root is listed once per request and every identity is read
+        from recorded bytes (the committed config record), never the
+        wall clock. The event fold and the response stay per-request
         locals; the one cached object is the derived market fold
         (§3.7, _market_projection)."""
         names = self._session_names()
@@ -1002,7 +1091,8 @@ class Projector:
             run_id = config.get("run_id")
             eligible.append((name, environment, session_date,
                              run_id if isinstance(run_id, str) else None,
-                             read_last_observed_at(events_path)))
+                             read_last_observed_at(events_path),
+                             config.get("events_contract")))
         if not eligible:
             return {"as_of": None, "history": [], "latest": None,
                     "mode": "core", "run": None, "rising_top10": [],
@@ -1010,8 +1100,18 @@ class Projector:
                     "status": None}
         # Selection (README §3.7): max session_date, then max last
         # committed observed_at (None ranks last), then max dirname.
-        session, environment, session_date, run_id, _ = max(
-            eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        session, environment, session_date, run_id, _, events_contract = \
+            max(eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        # The §3.7 history dual-path discriminator: the selected run's
+        # own recorded config value. Absence is the pre-contract legacy
+        # projection; "top10-v1" is the fact path. Any other value is a
+        # contract this projection cannot consume — fail-closed, never
+        # a guess at which history a run carries.
+        if events_contract is not None \
+                and events_contract != MARKET_EVENTS_CONTRACT:
+            raise DataFault("%s config events_contract is not %s"
+                            % (INPUT_JSONL, MARKET_EVENTS_CONTRACT))
+        fact_path = events_contract == MARKET_EVENTS_CONTRACT
         run_dir = os.path.join(self.runs_root, session)
         stock_names, snapshots, ma20 = self._market_projection(
             os.path.join(run_dir, INPUT_JSONL), session_date)
@@ -1042,19 +1142,26 @@ class Projector:
         confirmed = None  # (group_index, stamp, per-symbol state,
         #                  upserts) of the last CONFIRMED observation
         #                  group — the opening mode's reference group
+        facts = []  # (ledger position, fact) of every TOP10 fact — the
+        #             fact path's history source (top10-v1 runs only)
+        last_stamp_pos = {}  # observed_at -> the greatest ledger
+        #                      position carrying that stamp — the fact
+        #                      path's single-pass eligibility input
 
         def confirm_group():
             """The §3.7 state-comparison projection: derive the TOP10
             change records of the just-closed observation group by
             comparing the previous confirmed snapshot with the live
-            state. The classification follows MARKET_CHANGE_TYPES; every
-            projected value is recorded. The first group (no snapshot)
-            is the baseline and records zero changes. The group is also
-            captured as the opening mode's reference candidate: its
-            per-symbol candidate state (deduplicated over UP/DOWN — the
-            item whose upsert holds the greatest ledger position
-            represents a dual-direction symbol) and the symbols its
-            batch upserted."""
+            state — the pre-contract legacy path only; a top10-v1 run's
+            history is the fact translation, so the derivation never
+            runs there. The classification follows MARKET_CHANGE_TYPES;
+            every projected value is recorded. The first group (no
+            snapshot) is the baseline and records zero changes. The
+            group is also captured as the opening mode's reference
+            candidate in both paths: its per-symbol candidate state
+            (deduplicated over UP/DOWN — the item whose upsert holds
+            the greatest ledger position represents a dual-direction
+            symbol) and the symbols its batch upserted."""
             nonlocal prev_snapshot, confirmed
             per_symbol = {}
             for entry in live.values():
@@ -1063,6 +1170,13 @@ class Projector:
                     per_symbol[entry["symbol"]] = entry
             confirmed = (group_index, group_stamp, per_symbol,
                          set(group_upserts))
+            if fact_path:
+                # Core already confirmed this group's changes as TOP10
+                # facts in the journal — the reference-group capture
+                # above still stands (the opening mode reads it exactly
+                # as in the legacy path), the derivation below does not
+                # run, and the snapshot state it feeds stays unused.
+                return
             recorded = []  # (evidence position, change record)
             if prev_snapshot is not None:
                 # The current TOP10 per direction: the same rule the
@@ -1138,6 +1252,41 @@ class Projector:
                                     % (EVENTS_JSONL, pos, field))
             event_type = ev["event_type"]
             quality[ev["data_quality"]] += 1
+            if fact_path:
+                # The dual path's per-event bookkeeping: every event
+                # feeds the eligibility map, and the TOP10 facts are
+                # collected for the translation (their shape validated
+                # like the candidate fold's own fields — an unknown
+                # TOP10_* type is a future fact this projection cannot
+                # consume, fail-closed).
+                last_stamp_pos[ev["observed_at"]] = pos
+                if event_type in MARKET_FACT_TYPES:
+                    if not isinstance(ev.get("symbol"), str):
+                        raise DataFault("%s record %d has no symbol"
+                                        % (EVENTS_JSONL, pos))
+                    fact_direction = ev.get("direction")
+                    if fact_direction is not None \
+                            and (not isinstance(fact_direction, str)
+                                 or fact_direction not in ("UP", "DOWN")):
+                        raise DataFault("%s record %d direction is not "
+                                        "UP or DOWN" % (EVENTS_JSONL, pos))
+                    for field in ("rank", "previous_rank"):
+                        value = ev.get(field)
+                        if value is not None \
+                                and (not isinstance(value, int)
+                                     or isinstance(value, bool)
+                                     or value < 1):
+                            raise DataFault("%s record %d %s is not >= 1"
+                                            % (EVENTS_JSONL, pos, field))
+                    if ev.get("name") is not None \
+                            and not isinstance(ev.get("name"), str):
+                        raise DataFault("%s record %d name is not a "
+                                        "string" % (EVENTS_JSONL, pos))
+                    facts.append((pos, ev))
+                    continue  # a fact never touches live state or groups
+                if event_type.startswith(TOP10_PREFIX):
+                    raise DataFault("%s record %d is an unknown TOP10 "
+                                    "fact type" % (EVENTS_JSONL, pos))
             if not event_type.startswith(CANDIDATE_PREFIX):
                 continue  # non-candidate events never close a group
             if not isinstance(ev.get("symbol"), str) \
@@ -1176,6 +1325,12 @@ class Projector:
         # group's batch can no longer be partial.
         if group_stamp is not None and sealed:
             confirm_group()
+        if fact_path:
+            # The dual path's history assembly (README §3.7): the
+            # collected facts' translation replaces the state-
+            # comparison records confirm_group never wrote.
+            changes = self._fact_history(facts, last_stamp_pos, sealed,
+                                         stock_names)
         mode, opening_rising, opening_falling = opening_market_top10(
             confirmed, snapshots, ma20)
         if mode == "opening_ma20":

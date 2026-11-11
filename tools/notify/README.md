@@ -31,14 +31,24 @@ Nim Core (src/hs/*, PR-4의 단일 판정 함수 step)
   두 파일 모두 이 프로세스 하나가 쓰되 파일별로 배타 flock을 따로
   잡는다. 생산자 파일을 바이트 오프셋으로 tail해 LF 완결 라인 배치를
   팩트 그대로 검증·추가하고(중복 event_id는 동일 바이트만 멱등 스킵,
-  불일치 중복은 거부), 같은 틱 안에서 정책 필터 → 중복 억제 → FCM
-  HTTP v1 전송 → 전달 기록 append(append-only + fsync)까지 수행한다.
+  불일치 중복은 거부), 같은 틱 안에서 정책 필터(§0의 이벤트 유형
+  허용목록) → 중복 억제 → FCM HTTP v1 전송 → 전달 기록
+  append(append-only + fsync)까지 수행한다.
   시작·종료는 세션 런처(`tools/run_session.sh`)가 명시적으로 관리하고,
   프로세스 감시·재시작은 systemd에 위임한다(§11).
         ↓ 기기 등록 (별도 프로세스)
 Python register 프로세스 (notify_register.py)
   devices.jsonl(레지스트리)의 단일 작성자: bearer 인증 등록
 ```
+
+- **발송 정책은 이벤트 유형 허용목록이다**:
+  `NOTIFIABLE_EVENT_TYPES` = `TOP10_ENTERED` · `TOP10_EXITED` ·
+  `RANK_CHANGED` 3종(사용자 결정 2026-11-11, docs/ASSUMPTIONS.md
+  P27). 허용목록 밖의 팩트(장애·replay·세션 수명·후보 계열 전부)는
+  ledger에 기록되지만 **절대 발송되지 않는다** — 사용자는 고장
+  경보 대신 침묵을 선택했다. severity는 팩트의 운영 심각도 표기일
+  뿐 발송 여부를 결정하지 않는다: CRITICAL 장앜 팩트도 INFO 순위
+  변화와 똑같이 유형으로만 판정된다.
 
 - 3상태 3보금(전달 상태는 이벤트 팩트에 절대 병합되지 않는다,
   스키마 x-separation-rule): 중요도/신뢰는 팩트의 필드, 검증은 세션
@@ -99,9 +109,13 @@ Python register 프로세스 (notify_register.py)
   갈라진 중복은 변형 시도다.
 - `check` 서브커맨드: 전 라인 스키마 검증(엄격, 비-LF 꼬리도 위반).
 - 검증은 event.schema.json의 구조적 거울이다: 닫힌 필드 집합
-  (additionalProperties false), 12종 event_type 열거, severity/
-  data_quality/direction 열거, event_id 64-lowercase-hex,
-  observed_at 캐논 타임스탬프, symbol 6자리, rule_version/rank ≥ 1.
+  (additionalProperties false), **16종 event_type 열거**(후보 3종 +
+  시장 TOP10 전환 3종 TOP10_ENTERED/TOP10_EXITED/RANK_CHANGED +
+  장애 5종 + replay 2종 + 세션 3종), severity/ data_quality/direction
+  열거, event_id 64-lowercase-hex, observed_at 캐논 타임스탬프,
+  symbol 6자리, name 문자열(최소 1자, 없어도 됨), rule_version/
+  rank/previous_rank ≥ 1. previous_rank는 직전 확정 관측군의 같은
+  방향 순위(없어도 됨)다.
   verification_status·전달 계열 필드는 이름으로 거부된다.
 
 ## 3. 전달 ledger (delivery.hcj.jsonl)
@@ -185,20 +199,46 @@ Python register 프로세스 (notify_register.py)
   표시는 비공식 패턴으로 금지):
   `POST https://fcm.googleapis.com/v1/projects/<project>/messages:send`,
   본문 `{"message": {"token", "notification": {"title","body"},
-  "android": {"priority"}, "data": {"event_id","event_type",
-  "severity"}}}`. title =
-  `"Hong Scanner <severity>"`, body = `<event_type>[ <symbol>]` —
-  최소 문구, id는 data로. data 값은 전부 문자열(공식 요건).
+  "android": {"priority", "notification": {"channel_id"}},
+  "data": {str: str}}}`. dispatcher가 허용목록 밖 유형을 먼저 차단하므로
+  실제 도달하는 이벤트는 TOP10 3종이고, 그 조립은:
+  - title = `"홍스캐너 TOP10 변화"`;
+  - body = `<name 또는 symbol> <상승|하락> TOP10 <순위 문안>` — name이
+    없으면 symbol, 둘 다 없으면 event_type(번역은 이름을 발명하지
+    않는다). direction UP→"상승"·DOWN→"하락", direction이 없으면 그
+    단어를 뺀다. 순위 문안은 팩트가 담은 그대로: previous_rank와 rank
+    모두 있으면 `<prev>위 → <rank>위`(기존진입·순위변경·밖이탈),
+    rank만 있으면 `신규 진입 <rank>위`(신규진입), previous_rank만
+    있으면 `<prev>위 → 후보 제외`(후보제외), 둘 다 없으면 순위 문안
+    없음(순위도 발명하지 않는다);
+  - `android.priority` = `"high"`(3종 전용 경로, 심각도와 무관)와
+    `android.notification.channel_id` = `"market_rank_changes"`;
+  - data는 event_id/event_type/severity + direction/symbol/
+    previous_rank(있을 때)/rank(있을 때) — 값은 전부 문자열(공식
+    요건; 정수는 문자열화).
+  허용목록 밖 유형이 build_message에 도달하는 일은 없지만(§0), 방어
+  분기로 종래의 최소 조립(title `"Hong Scanner <severity>"`, body
+  `<event_type>[ <symbol>]`, severity 매핑 priority)을 유지한다 —
+  정책 게이트는 dispatcher 하나뿐이고 전송 계층은 일반형을 유지한다.
 - 페이로드 한도 4096바이트(키·값 포함, 벤더 명시)를 전송 전 검사한다.
 - **Android 우선순위**: 메시지는 `android.priority`를 항상 명시한다 —
-  severity가 HIGH 또는 CRITICAL이면 `"high"`, INFO면 `"normal"`. 기본값에
+  허용목록 3종은 **항상 "high"**이고 `channel_id`를 지정한다. 기본값에
   대해서는 공식 문서가 **상충한다**: REST v1 reference는 HIGH가
   "Default priority for notification messages"라고 쓰고, 가이드는
   "Normal priority. This is the default priority for data and
-  notification messages"라고 쓴다(둘 다 2026-10-28 갱신분,
-  2026-11-02 대조). 미설정 시 실효 priority는 공식 산문만으로는 확정
+  notification messages"라고 쓴다(둘 다 2026-11-11 대조, 가이드
+  2026-11-10 갱신분). 미설정 시 실효 priority는 공식 산문만으로는 확정
   불가이므로 **명시가 유일한 확실 경로**다 — 어느 쪽 기본값 주장도
   하지 않는다.
+- **HIGH는 전달 시도이지 표시 보장이 아니다**(공식 가이드, 2026-11-10
+  갱신분 2026-11-11 대조): "If FCM detects a pattern in which messages
+  don't result in user-facing notifications, your messages may be
+  deprioritized to normal priority or delegated for handling by
+  Google Play services" — 앱 인스턴스별 최근 7일 행동으로 판정한다.
+  TOP10 알림은 사용자에게 보이는 notification이므로 이 요건에 부합
+  한다. `channel_id`는 앱이 그 채널을 **수신 전에 생성**해야 한다
+  (공식: 생성되지 않은 채널 id면 manifest의 값으로 폴백) — 채널
+  생성은 앱 측 책임이다(PR-7, §12).
 - **accepted ≠ delivered**: HTTP 200은 FCM의 접수 증명일 뿐이다.
   도착 시각·순서·기기 표시·열람은 어떤 보장도 없고(REPLAY_CONTRACT
   §13.5) 어떤 기록에도 도착으로 쓰지 않는다.
@@ -218,7 +258,6 @@ Python register 프로세스 (notify_register.py)
   "delivery_path":  "/abs/delivery.hcj.jsonl",
   "registry_path":  "/abs/outside-repo/devices.jsonl",
   "register_bearer_file": "/abs/outside-repo/bearer.secret",
-  "min_severity": "INFO",            // INFO(전부, 기본) | HIGH | CRITICAL
   "retry_min_seconds": 60,           // 라이브 기본 = 벤더 최소 1분
   "backoff_cap_seconds": 900,
   "watch_poll_seconds": 1.0,         // 상주 worker 틱 간격, 0 < x <= 60
@@ -227,6 +266,11 @@ Python register 프로세스 (notify_register.py)
                     "print-access-token"]
 }
 ```
+
+- **`min_severity`는 제거됐다** — 발송 정책은 §0의 이벤트 유형
+  허용목록으로 옮겨갔다. 설정 파일에 키가 남아 있으면 **무시된다**
+  (검증하지도 않는다): 알 수 없는 키 관용 정책은 그대로다. 라이브
+  설정 편집은 운영 단계의 몫이다.
 
 - dispatch는 두 자격 경로 중 **정확히 하나**를 요구한다:
   서비스 계정 JSON(저장소 밖 경로에서 로드, RS256 JWT 교환) 또는
@@ -237,9 +281,10 @@ Python register 프로세스 (notify_register.py)
   `0 < x <= 60` 실수여야 한다 — 위반은 ConfigError(exit 2)다. 0 이하는
   스핀, 상한 초과는 전달 지체를 낳는다. §1의 배치·tail 계약이 주기의
   정확성에 의존하지 않는다(오프셋·LF·dedup이 정확성을 소유한다).
-- 정책(min_severity)에 못 미치는 이벤트는 **전달 기록을 만들지
-  않는다** — 정책은 전송 계층의 결정이지 사실의 변경이 아니다. 기록
-  없는 스킵은 가짜 PENDING을 만들지 않는다.
+- 허용목록 밖의 이벤트 유형은 **전달 기록을 만들지 않는다** — 차단은
+  `type_skipped` 요약 카운터로만 센다(§9). 정책은 전송 계층의 결정이지
+  사실의 변경이 아니다. 기록 없는 스킵은 가짜 PENDING을 만들지
+  않는다.
 - 엔드포인트 오버라이드는 존재하지 않는다: FCM/OAuth URL은 공식
   값으로 고정(fail-closed, collector의 도메인 고정 선례).
 
@@ -265,7 +310,9 @@ Python register 프로세스 (notify_register.py)
 | 4 | 단일 작성자 충돌(다른 프로세스가 lock 보유) / 내부 결함 / ledger 계약 위반 |
 
 - 실패를 성공으로 꾸미는 경로는 존재하지 않는다. dispatcher의 스위프
-  요약(`sweep {...}` JSON 라인)은 세친 사실만 보고한다.
+  요약(`sweep {...}` JSON 라인)은 세친 사실만 보고한다 — 이벤트
+  총수(`events_total`), 허용목록 밖 차단수(`type_skipped`), 전송
+  후보(`pairs_to_send`)와 outcome 카운터가 모두 그 안에 있다.
 
 ### 상주(--watch) 모드의 종료·시그널
 
@@ -286,11 +333,15 @@ Python register 프로세스 (notify_register.py)
 
 - `bash tools/notify/test_notify.sh`: unittest 계약 스위트. 실제
   모듈을 가짜 urllib 전송과 temp ledger로 in-process 구동. RFC 7515
-  A.2 벡터(서명·키 파싱·JWT 형상), 스키마 검증 전표, ledger 멱등·
+  A.2 벡터(서명·키 파싱·JWT 형상), 스키마 검증 전표(16종 event_type,
+  previous_rank/name), ledger 멱등·
   거부 규칙(1회성 ingest와 상주 배치 `ingest_lines` 모두),
   dispatcher 상태기계 전체(정상·중복 억제·429/404/403·영구·전송
-  실패·기록 소실 복구·정책 필터·ledger 순서 소비), android.priority
-  매핑, watch_poll_seconds 경계, 상주 watch 틱 계약(비-LF 꼬리
+  실패·기록 소실 복구·유형 허용목록 필터·ledger 순서 소비), TOP10
+  문안 5케이스(신규진입·기존진입·순위변경·밖이탈·후보제외)+심볼
+  폴백+channel_id·priority=high·data 필드 단언과 방어용 일반 조립,
+  min_severity 미검증, watch_poll_seconds 경계, 상주 watch 틱 계약
+  (비-LF 꼬리
   미소비·배치 all-or-nothing·(dev,ino) 전체 재스캔·틱 사이 재시도
   이연·shrink LedgerFault), 그리고 실 OS 프로세스 1건(SIGTERM 정상
   종료 exit 0 + 재기동 전체 재스캔 멱등 — 같은 events 파일로 중복
@@ -365,7 +416,9 @@ Python register 프로세스 (notify_register.py)
   틱 계약 전반 — 비-LF 꼬리 미소비, 배치 all-or-nothing·멱등,
   (dev,ino) 전체 재스캔, 틱 사이 재시도 이연(429 중 신규 이벤트
   지속), shrink LedgerFault, watch_poll_seconds 검증, SIGTERM 정상
-  종료 + 재기동 멱등(서브프로세스), android.priority 매핑.
+  종료 + 재기동 멱등(서브프로세스), 유형 허용목록 필터(type_skipped·
+  전달 기록 미생성), TOP10 문안 5케이스·channel_id·priority=high·
+  data 필드, min_severity 미검증.
 - 실 FCM 실측 전체: 실 프로젝트에서의 429 Retry-After 실측 값,
   403 실측 본문 형상, message_id 실측 형상, 실 토큰 수명. 404 본문
   형상은 2026-11-03 실측됐다(HTTP 404 + `error.status "NOT_FOUND"`,
@@ -380,7 +433,12 @@ Python register 프로세스 (notify_register.py)
   포함)은 `tools/notify/drill/drill_watch.sh`가 게이트에 등록돼
   있고, 실측 라이브 관측이 남아 있다.
 - android.priority: 미설정 시 실효값은 벤더 문서 상충으로 확정 불가
-  (§6) — 명시값의 실기기 동작도 실측 항목이다.
+  (§6) — 명시값의 실기기 동작도 실측 항목이다. 허용목록 3종이 항상
+  high로 가는 경로의 실기기 도달율·Doze 지연, HIGH 강등 규칙(§6,
+  표시로 이어지지 않는 메시지의 7일 관찰)이 실 트래픽에서 발동하는지,
+  `channel_id market_rank_changes`의 실기기 표시(앱이 채널을
+  생성했는가 — 없으면 manifest 폴백)와 TOP10 문안의 실기기 렌더링도
+  실측 항목이다(앱 측 PR-7과 공유).
 - 앱 측 전제(앱의 event_id 중복 식별)는 PR-7의 구현·실측 대상이다 —
   이 계약은 그 전제를 문서로 요구할 뿐 증명하지 않는다.
 - accepted≠delivered의 실측 경계(접수 후 유실 가능성)는 벤더 문서가

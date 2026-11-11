@@ -60,9 +60,14 @@ class FcmPushService implements PushService, PushMessageSource, PushTokenSource 
 
   /// Pure mapping from the plugin type to our [PushMessage]. Static and
   /// dependency-free so tests can exercise it with constructed
-  /// [RemoteMessage] stubs — no Firebase init needed.
-  static PushMessage messageFromRemote(RemoteMessage message) =>
-      PushMessage.fromData(message.data);
+  /// [RemoteMessage] stubs — no Firebase init needed. The notification
+  /// title/body pass through verbatim (the dispatcher's assembled text —
+  /// the app never re-assembles it).
+  static PushMessage messageFromRemote(RemoteMessage message) => PushMessage(
+        Map<String, dynamic>.from(message.data),
+        notificationTitle: message.notification?.title,
+        notificationBody: message.notification?.body,
+      );
 
   FirebaseMessaging get _messaging {
     if (!_wired) _throwUnwired();

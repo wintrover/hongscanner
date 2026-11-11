@@ -26,6 +26,24 @@
 ##                                                        vendor_input;
 ##                                                        direction+rank
 ##                                                        from vendor order)
+##   top10-transition-v1        1  TOP10_ENTERED /        the pending
+##                                 TOP10_EXITED /         observation
+##                                 RANK_CHANGED           group's tail
+##                                                        confirmed by a
+##                                                        new observation
+##                                                        stamp (or the
+##                                                        session_end
+##                                                        seal): each
+##                                                        direction's top
+##                                                        10 of the vendor
+##                                                        order, compared
+##                                                        with the last
+##                                                        confirmed group's
+##                                                        tail; observed_at
+##                                                        is the confirmed
+##                                                        group's own stamp,
+##                                                        never the emission
+##                                                        moment
 ##   feed-disconnected-v1       1  FEED_DISCONNECTED      ws_conn with
 ##                                                        state closed_ok
 ##                                                        (INFO) /
@@ -79,7 +97,10 @@ type
     ## One judged transition (the immutable fact record of
     ## event.schema.json). `symbol` == "" means not symbol-scoped (the
     ## schema field is absent, the id entity is the wildcard); same for
-    ## `direction` and `rank` == 0.
+    ## `direction` and `rank` == 0. `previousRank` == 0 and `name` == ""
+    ## are absent the same way (top10-transition facts only: the rank in
+    ## the previous confirmed group, and the vendor row's preserved
+    ## stk_nm).
     eventId*: string
     eventType*: string
     observedAt*: string
@@ -92,6 +113,8 @@ type
     symbol*: string
     direction*: string
     rank*: int
+    previousRank*: int
+    name*: string
 
   RestRound = object
     ## One declared page chain of one ka10027 query, assembled in stream
@@ -126,9 +149,22 @@ type
     rounds: seq[RestRound]
     candidates*: UpDownCandidates  ## last derived (fully affirmed) generation
     candidatesKnown*: bool
+    top10Confirmed*: Option[UpDownCandidates]
+                             ## the tail of the last CONFIRMED observation
+                             ## group (top10-transition-v1). None until the
+                             ## second group's first pair completes: the
+                             ## first group is the baseline and emits
+                             ## nothing (a generation with no predecessor
+                             ## has no transition).
+    pendingStamp*: string      ## the observation stamp (fallbackT at the
+                               ## pair's completion) of the pending group —
+                               ## the group whose tail s.candidates holds
+    pendingQ*: int             ## the completing pair's q of the pending
+                               ## group's latest generation
 
 const
   ruleCandidateTransition* = "candidate-transition-v1"
+  ruleTop10Transition* = "top10-transition-v1"
   ruleFeedDisconnected* = "feed-disconnected-v1"
   ruleGapSuspected* = "gap-suspected-v1"
   ruleRestTruncated* = "rest-truncated-v1"
@@ -185,6 +221,8 @@ proc eventIdOf*(sessionId, eventType, ruleId, entity: string;
 proc eventHcj*(e: EventFact): HcjValue =
   ## The fact record exactly as event.schema.json defines it (closed
   ## field set; no verification state, no delivery state, no position).
+  ## previous_rank (>= 1) and name (non-empty) are optional fact fields of
+  ## the top10-transition rule, emitted only when judged.
   result = hObj(
     ("data_quality", hStr(e.dataQuality)),
     ("event_id", hStr(e.eventId)),
@@ -197,6 +235,10 @@ proc eventHcj*(e: EventFact): HcjValue =
     ("severity", hStr(e.severity)))
   if e.direction.len > 0:
     result.pairs.add(("direction", hStr(e.direction)))
+  if e.name.len > 0:
+    result.pairs.add(("name", hStr(e.name)))
+  if e.previousRank > 0:
+    result.pairs.add(("previous_rank", hInt(e.previousRank)))
   if e.rank > 0:
     result.pairs.add(("rank", hInt(e.rank)))
   if e.symbol.len > 0:
@@ -207,7 +249,8 @@ proc eventLine*(e: EventFact): string =
 
 proc judged(s: EventGenState; seqNo: int; eventType, ruleId, symbol,
             observedAt, severity, dataQuality, evidenceRef: string;
-            direction = ""; rank = 0): EventFact =
+            direction = ""; rank = 0; previousRank = 0;
+            name = ""): EventFact =
   ## Build one fact: the id entity is the 6-digit symbol when the
   ## judgment is symbol-scoped and the wildcard "*" otherwise. Fail
   ## closed: a fact without a session or without evidence is never
@@ -231,7 +274,9 @@ proc judged(s: EventGenState; seqNo: int; eventType, ruleId, symbol,
     evidenceRef: evidenceRef,
     symbol: sym,
     direction: direction,
-    rank: rank)
+    rank: rank,
+    previousRank: previousRank,
+    name: name)
 
 proc contentHash(r: Record): string =
   ## Content address of the consumed evidence: the sha256 hex of the
@@ -419,6 +464,78 @@ proc candidateTransitions(s: EventGenState; prev, cur: seq[string];
                         code, s.fallbackT, "INFO", "OBSERVING", evidenceRef,
                         direction = dirName))
 
+proc top10Direction(s: EventGenState; prev, cur: seq[string]; dirName,
+                    observedAt: string; q: int; evidenceRef: string;
+                    names: seq[tuple[code, name: string]];
+                    seen: var seq[tuple[ent, typ: string]];
+                    events: var seq[EventFact]) =
+  ## One direction's TOP10 transitions between the last confirmed group's
+  ## tail (prev) and the pending group's tail (cur), rank = vendor order
+  ## index + 1: ENTERED (into the top 10 — previous_rank only when the
+  ## code ranked 11+ before), EXITED (out of the top 10 — rank only while
+  ## the code still ranks), RANK_CHANGED (inside the top 10 at a different
+  ## rank). Same rank, outside<->outside and absent->absent judge nothing.
+  ## The observed_at is the pending group's own stamp (the group these
+  ## facts describe — never the emission moment) and the id's
+  ## transition_seq is that group's last pair q. The name is the pending generation's preserved
+  ## stk_nm (absent when its rows carried none — the consumer falls back
+  ## to the symbol). The candidate rules' up-first once-per-(entity,
+  ## event_type) dedup is inherited: a code the vendor lists in both
+  ## directions is judged in the up direction, never twice.
+  for i, code in cur:
+    let rank = i + 1
+    let pos = prev.find(code)
+    let prevRank = pos + 1
+    var typ = ""
+    if rank <= 10:
+      if pos < 0 or prevRank > 10:
+        typ = "TOP10_ENTERED"
+      elif prevRank != rank:
+        typ = "RANK_CHANGED"
+    elif pos >= 0 and prevRank <= 10:
+      typ = "TOP10_EXITED"
+    if typ.len == 0:
+      continue
+    if (ent: code, typ: typ) in seen:
+      continue
+    seen.add((ent: code, typ: typ))
+    events.add(judged(s, q, typ, ruleTop10Transition, code, observedAt,
+                      "INFO", "OBSERVING", evidenceRef,
+                      direction = dirName, rank = rank,
+                      previousRank = (if pos < 0: 0 else: prevRank),
+                      name = nameOf(names, code)))
+  for i, code in prev:
+    let prevRank = i + 1
+    if prevRank > 10:
+      continue
+    if code in cur:
+      continue
+    if (ent: code, typ: "TOP10_EXITED") in seen:
+      continue
+    seen.add((ent: code, typ: "TOP10_EXITED"))
+    events.add(judged(s, q, "TOP10_EXITED", ruleTop10Transition, code,
+                      observedAt, "INFO", "OBSERVING", evidenceRef,
+                      direction = dirName, previousRank = prevRank,
+                      name = nameOf(names, code)))
+
+proc top10Transitions(s: EventGenState; confirmed, pending: UpDownCandidates;
+                      observedAt: string; q: int;
+                      upEvidenceRef, downEvidenceRef: string;
+                      seen: var seq[tuple[ent, typ: string]];
+                      events: var seq[EventFact]) =
+  ## The top10-transition-v1 judgment: the last confirmed observation
+  ## group's tail against the pending group's tail, both directions
+  ## independently, up first (vendor order). observed_at is the pending
+  ## group's own stamp and q its last pair's completing record seq; the
+  ## evidence is each direction's declared vendor scope (the pair
+  ## boundary) or the seal record's content address (the session-end
+  ## flush). The names come from the pending generation (the group whose
+  ## membership the facts describe).
+  top10Direction(s, confirmed.up, pending.up, "UP", observedAt, q,
+                 upEvidenceRef, pending.names, seen, events)
+  top10Direction(s, confirmed.down, pending.down, "DOWN", observedAt, q,
+                 downEvidenceRef, pending.names, seen, events)
+
 proc pagesResp(rr: RestRound): seq[RawHttpResp] =
   for a in rr.pages: result.add(a.resp)
 
@@ -434,6 +551,17 @@ proc pairRounds(s: var EventGenState; events: var seq[EventFact]) =
   ## never judged — a partial universe is no candidate generation, and
   ## the truncation fact is the collector's gap record (the
   ## REST_TRUNCATED event), never a silent pass.
+  ##
+  ## The top10-transition-v1 observation groups: pairs completing under
+  ## one observation stamp (fallbackT — rest_resp carries no t, so the
+  ## stamp is the last t observed earlier in the stream) form one group,
+  ## and a pair completing under a NEW stamp confirms the pending group
+  ## (its tail can no longer change). The first group is the baseline:
+  ## confirmed = the pending tail, no facts. Every later boundary judges
+  ## confirmed tail -> pending tail and — THE ORDER CONTRACT — those
+  ## TOP10 facts enter the sequence BEFORE the new group's candidate
+  ## facts of this very pair. The session_end flush (stepInto) confirms
+  ## the last group the same way.
   while true:
     var i = 0
     while i < s.rounds.len:
@@ -469,14 +597,25 @@ proc pairRounds(s: var EventGenState; events: var seq[EventFact]) =
         s.pageCap)
     except VendorInputError:
       continue
+    # An empty pendingStamp is the first generation, not a boundary: the
+    # group starts here and its stamp is pending from this pair on.
+    let boundary = s.pendingStamp.len > 0 and s.fallbackT != s.pendingStamp
     var seen: seq[tuple[ent, typ: string]]
+    if boundary and s.top10Confirmed.isSome:
+      top10Transitions(s, s.top10Confirmed.get, s.candidates, s.pendingStamp,
+                       s.pendingQ, vendorScopeRef(up.pages[0].scope),
+                       vendorScopeRef(down.pages[0].scope), seen, events)
     let prev = s.candidates
     candidateTransitions(s, prev.up, cand.up, "UP",
                          vendorScopeRef(up.pages[0].scope), q, seen, events)
     candidateTransitions(s, prev.down, cand.down, "DOWN",
                          vendorScopeRef(down.pages[0].scope), q, seen, events)
+    if boundary:
+      s.top10Confirmed = some(prev)
     s.candidates = cand
     s.candidatesKnown = true
+    s.pendingStamp = s.fallbackT
+    s.pendingQ = q
 
 proc restEvents(s: var EventGenState; r: Record; events: var seq[EventFact]) =
   ## One recorded REST attempt joins the declared page chain of its
@@ -539,6 +678,19 @@ proc stepInto(s: var EventGenState; r: Record; events: var seq[EventFact]) =
   of kRestResp:
     restEvents(s, r, events)
   of kSessionEnd:
+    # The final group flush (top10-transition-v1): the seal confirms the
+    # pending observation group — the one boundary no successor pair ever
+    # opens — so its confirmed-vs-pending facts are judged here, BEFORE
+    # SESSION_ENDED, with the pending group's own stamp and q; the
+    # evidence is the seal record itself (s.lastEvidence was advanced to
+    # it at the top of this step). A stream whose only group is the
+    # baseline (top10Confirmed none) flushes nothing: a generation with
+    # no predecessor has no transition.
+    if not s.sawEnd and s.top10Confirmed.isSome and s.pendingStamp.len > 0:
+      var seen: seq[tuple[ent, typ: string]]
+      top10Transitions(s, s.top10Confirmed.get, s.candidates, s.pendingStamp,
+                       s.pendingQ, s.lastEvidence, s.lastEvidence, seen,
+                       events)
     s.sawEnd = true
     events.add(judged(s, r.seq, "SESSION_ENDED", ruleSessionClose, "",
                       s.fallbackT, "INFO", "OBSERVING", s.lastEvidence))

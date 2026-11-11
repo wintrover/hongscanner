@@ -34,11 +34,18 @@ or no connection. No real market data enters the app or the repository
 - `lib/screens/auth_dialog.dart` — the one re-entry dialog for API
   credentials (shown on 401)
 - `lib/services/push_service.dart` — `PushService` +
-  `PushMessageSource` abstractions, `PushMessage` payload type
+  `PushMessageSource` abstractions, `PushMessage` payload type (data
+  routing fields + the notification payload's server-assembled
+  title/body, passed through verbatim)
 - `lib/services/noop_push_service.dart` — `NoopPushService` (default;
   reports not-ready, answers null "nothing was asked")
 - `lib/services/fcm_push_service.dart` — `FcmPushService`
   (fail-closed until Firebase is initialized)
+- `lib/services/market_alert_channel.dart` — `MarketAlertChannel`: the
+  `hongscanner/market_alert` method channel to MainActivity.kt
+  (foreground OS re-post of the server's notification text,
+  local-notification tap delivery, one-shot pending cold-start tap;
+  fail-closed — no post and no route without the platform end)
 - `lib/services/push_permission.dart` — persisted ask history
   (KeyValueStore over `shared_preferences`) for the Android 13+
   denied-ambiguity problem
@@ -167,8 +174,13 @@ behavior).
 ## Push flow (notification+data only)
 
 The dispatcher (tools/notify) sends **notification+data** messages with
-data `{event_id, event_type, severity}`. Data-only payloads plus local
-notification re-synthesis are forbidden by design.
+data `{event_id, event_type, severity}` and a server-assembled
+notification title/body. The app treats that text as opaque display
+copy: re-posted verbatim or shown as the banner fallback — never
+re-assembled, re-computed or re-judged (the server's projection
+authority extends to the notification copy). Data-only payloads plus
+local notification re-synthesis (the app inventing title/body the
+server never sent) remain forbidden by design.
 
 - **Permission**: one automatic ask on the first run; the ask count,
   timestamp and decision are persisted (Android 13+ cannot distinguish
@@ -176,22 +188,47 @@ notification re-synthesis are forbidden by design.
   only fact). Denied keeps the app fully functional; there is no push
   UI on screen anymore — the state and the re-ask path live in the
   store, with no silent re-nagging.
-- **Foreground**: the OS does not display notification messages while
-  the app is foregrounded; the app shows an in-app banner (chosen,
-  documented policy). Banners dedup by `event_id` (a bounded history of
-  64 shown ids — a burst of repeated deliveries for one event shows one
-  banner), and a new banner replaces the current one instead of queueing
-  behind it. The dispatcher's `min_severity` policy already bounds what
-  reaches the phone (default INFO; the operator can set HIGH/CRITICAL
-  server-side), so banner volume has two bounds.
+- **Foreground**: firebase_messaging delivers foreground notification
+  messages to Dart only — the OS does not display them while the app is
+  foregrounded (official plugin behavior; that suppression is why the
+  app must surface the alert itself). TOP10 state changes
+  (`TOP10_ENTERED` / `TOP10_EXITED` / `RANK_CHANGED`) are re-posted to
+  the OS channel `market_rank_changes` through the
+  `hongscanner/market_alert` method channel — the dispatcher's own
+  title/body, verbatim. MainActivity.kt creates the channel at startup
+  with IMPORTANCE_HIGH (sound, vibration, heads-up); the user can
+  change importance/sound in the system notification settings, which is
+  OS policy, not app policy. A refused post (POST_NOTIFICATIONS off,
+  notifications disabled, missing platform end) fails closed to the
+  in-app SnackBar banner; so does a market type whose server text did
+  not arrive (the app never re-assembles it). Other event types show
+  the banner directly. Both paths dedup by `event_id` (a bounded
+  history of 64 surfaced ids — a burst of repeated deliveries for one
+  event shows one alert), and a new banner replaces the current one
+  instead of queueing behind it. The dispatcher's `min_severity` policy
+  already bounds what reaches the phone (default INFO; the operator can
+  set HIGH/CRITICAL server-side), so alert volume has two bounds.
 - **Background tap** → `onMessageOpenedApp` → data `event_id` → Event
   Detail route (pushed on the root navigator) with a `/events/{id}`
   fetch. **Cold start** → `getInitialMessage()`, same routing (a tap
   that lands before the first frame is kept pending and flushed after
   it). Payloads without a usable `event_id` are not routed (nothing is
   invented).
+- **Local notification taps** (the foreground posts above) never go
+  through FCM's tap APIs — the plugin routes only its own OS
+  notifications. MainActivity.kt owns this path: the post's content
+  intent carries the `event_id` extra, a tap while the app runs arrives
+  as `onNotificationTap` on the method channel (the Dart handler
+  acknowledges it with `true`; the platform side keeps the id pending
+  until that ack, so one tap routes exactly once), and a cold-start tap
+  is kept pending and consumed once via `getPendingTap()` at bootstrap
+  → `store.openEvent` — the same Event Detail route as FCM taps.
 - **Terminated state display** is the OS notification itself — the
-  official path.
+  official FCM path. It posts to `market_rank_changes` (the manifest's
+  `default_notification_channel_id` meta-data, and the dispatcher's
+  explicit `channel_id`) once MainActivity has created the channel; a
+  first-ever delivery before the app ever ran falls back to the FCM
+  default channel (no sound, no heads-up).
 
 ### Firebase handoff checklist (updated for PR-7)
 
@@ -313,8 +350,13 @@ APK artifacts are gitignored (`/build/`) and never committed.
   honest-absence and offline states), permission flow (first-run ask
   once, denial persistence, manual re-ask, unwired, FID logged to
   logcat instead of rendered), stub-message tap routing (cold start
-  pending→flush, background tap, foreground banner, bad payloads), and
-  resync (single-fetch backoff, recovery, lifecycle resume,
+  pending→flush, background tap, foreground banner, bad payloads), the
+  market-alert channel (notification title/body passthrough, fail-closed
+  posting without a platform end, OS-channel posting of TOP10 alerts
+  with the banner fallback on refusal or missing text, dedup, no
+  routing hijack, cold-start pending-tap consumption, warm-tap delivery
+  — the method channel mocked through TestDefaultBinaryMessengerBinding),
+  and resync (single-fetch backoff, recovery, lifecycle resume,
   pull-to-refresh).
 - `flutter analyze` — clean. NOTE: in this repo's non-ASCII checkout path
   `flutter analyze` crashes (LSP tool bug, exit 255); run it from an

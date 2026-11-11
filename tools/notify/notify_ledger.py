@@ -45,6 +45,7 @@ KST = timezone(timedelta(hours=9))
 
 EVENT_TYPES = (
     "CANDIDATE_ENTERED", "CANDIDATE_UPDATED", "CANDIDATE_EXITED",
+    "TOP10_ENTERED", "TOP10_EXITED", "RANK_CHANGED",
     "FEED_DISCONNECTED", "DATA_GAP_SUSPECTED", "REST_TRUNCATED",
     "SUBSCRIPTION_TRUNCATED", "MARKET_STATE_UNKNOWN", "REPLAY_MATCH",
     "REPLAY_MISMATCH", "SESSION_ENDED", "SESSION_INCOMPLETE",
@@ -57,7 +58,7 @@ DELIVERY_STATES = ("PENDING", "ACCEPTED", "FAILED")
 EVENT_REQUIRED = ("event_id", "event_type", "observed_at", "session_id",
                   "rule_id", "rule_version", "data_quality", "severity",
                   "evidence_ref")
-EVENT_OPTIONAL = ("direction", "rank", "symbol")
+EVENT_OPTIONAL = ("direction", "name", "previous_rank", "rank", "symbol")
 
 DELIVERY_REQUIRED = ("attempts", "device_id", "event_id", "state",
                      "updated_at")
@@ -144,6 +145,10 @@ def validate_event(obj):
     _check_str(obj, "evidence_ref")
     if "direction" in obj:
         _check_enum(obj, "direction", DIRECTIONS)
+    if "name" in obj:
+        _check_str(obj, "name")
+    if "previous_rank" in obj:
+        _check_int(obj, "previous_rank", 1)
     if "rank" in obj:
         _check_int(obj, "rank", 1)
     if "symbol" in obj:
@@ -185,11 +190,6 @@ def validate_delivery(obj):
                 raise LedgerError("delivery PENDING must not carry %s"
                                   % key)
     return obj
-
-
-def severity_rank(severity):
-    """INFO=0, HIGH=1, CRITICAL=2 — the policy filter's scale."""
-    return SEVERITIES.index(severity)
 
 
 def parse_line(line_bytes, validator, path="<memory>", lineno=0):

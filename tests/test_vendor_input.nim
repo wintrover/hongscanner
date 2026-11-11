@@ -406,6 +406,30 @@ block candidates:
   let c = upDown(@[upP], @[downP])
   check("up candidates keep vendor order", c.up == @["005930", "000660"])
   check("down candidates keep vendor order", c.down == @["035420"])
+  check("names: every row's stk_nm is preserved (up leg first, first " &
+        "appearance wins)",
+        c.names == @[(code: "005930", name: "이름005930"),
+                     (code: "000660", name: "이름000660"),
+                     (code: "035420", name: "이름035420")])
+  check("names: the lookup falls back to empty on a nameless row, never " &
+        "to a re-parse",
+        nameOf(c.names, "035420") == "이름035420" and
+        nameOf(c.names, "999999") == "")
+  let namedDown = upDown(@[pg(pageBody(@[rowMap("005930", "+1000", "+1.00")]))],
+                         @[pg(pageBody(@[
+                           rowMap("005930", "-1000", "-1.00"),
+                           rowMap("035420", "-3000", "-3.00")]))])
+  check("names: a code seen on the up leg keeps its first name (the down " &
+        "leg never rewrites it)",
+        namedDown.names == @[(code: "005930", name: "이름005930"),
+                             (code: "035420", name: "이름035420")])
+  let nameless = upDown(@[pg("{\"pred_pre_flu_rt_upper\":[{\"stk_cd\":" &
+                            "\"005930\",\"cur_prc\":\"+1000\"}]," &
+                            "\"return_code\":0}")],
+                        @[pg(pageBody(@[]))])
+  check("names: a row without stk_nm is collected nowhere (a nameless " &
+        "row is not a failure — the consumer falls back to the symbol)",
+        nameless.up == @["005930"] and nameless.names.len == 0)
   let p1u = pg(pageBody(@[rowMap("005930", "+1000", "+1.00")]), "Y", "KEY1")
   let p2u = pg(pageBody(@[rowMap("000660", "+2000", "+2.00")]))
   let c2 = upDown(@[p1u, p2u], @[downP])
