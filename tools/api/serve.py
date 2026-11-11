@@ -367,7 +367,14 @@ def fold_market_projection(path, session_date):
     file order: a completed falling chain closes the pair and appends
     the union of both chains' prices (falling rows win a same-symbol
     collision) as one snapshot; a falling chain completing with no
-    pending rising chain contributes its own prices alone. The ka10081
+    pending rising chain contributes its own prices alone. A pair whose
+    price union is empty contributes no snapshot: a pre-open poll whose
+    response affirms success with no ranking rows still closes a pair,
+    but an empty snapshot can satisfy no correspondence subset and holds
+    no price to project — counting it would drift the snapshot index
+    against the event fold's candidate groups (non-candidate groups
+    open no group index) and break the opening mode's same-index
+    coupling. The snapshot list counts price-bearing pairs only. The ka10081
     fold keeps, per symbol, the first MARKET_MA20_DAYS distinct rows
     with dt < session_date in file order (rows are dt-descending, the
     session's in-progress bar carries dt == session_date and is never
@@ -479,7 +486,8 @@ def fold_market_projection(path, session_date):
                         snapshot = dict(pair_rising) \
                             if pair_rising is not None else {}
                         snapshot.update(chain[1])
-                        snapshots.append(snapshot)
+                        if snapshot:
+                            snapshots.append(snapshot)
                         pair_rising = None
                     chain = None
             elif api_id == MARKET_MA20_API:

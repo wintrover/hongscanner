@@ -599,12 +599,16 @@ def ka10081_record(seq, symbol, close, completed=20):
         query={"base_dt": "", "stk_cd": symbol, "tick_kind": "2"})
 
 
-def om_winner_input(variant):
+def om_winner_input(variant, pre_empty_pairs=0):
     """The winner's recorded rest_resp sequence. `variant` moves the
     reference group's upsert symbols between chain-pair snapshots:
     "0" keeps both in snapshot 2 (offset 0, the measured default),
     "+1" only in snapshot 3, "-1" only in snapshot 1, "none" in no
-    snapshot at all (the correspondence failure — DataFault)."""
+    snapshot at all (the correspondence failure — DataFault).
+    `pre_empty_pairs` prepends that many pre-open polls — both legs
+    affirming success with no ranking rows (the 2026-11-11 live
+    pre-open shape): an empty pair contributes no snapshot and must
+    not drift the snapshot index against the candidate-group index."""
     s1_falling = om_rows(("011060", 90000))
     if variant == "-1":
         s1_falling += om_rows(("006660", 30000))
@@ -614,24 +618,30 @@ def om_winner_input(variant):
     s3_falling = om_rows(("006660", 99000))
     if variant == "+1":
         s3_falling += om_rows(("011060", 99000))
-    records = [
+    records = []
+    seq = 3
+    for _ in range(pre_empty_pairs):
+        records.append(om_chain(seq, "1", []))
+        records.append(om_chain(seq + 1, "3", []))
+        seq += 2
+    for rows, sort_tp, page, cont_yn in (
         # pair 1: snapshot 1 (the offset -1 trap prices)
-        om_chain(3, "1", om_rows(("005930", 50000), ("000660", 60000))),
-        om_chain(4, "3", s1_falling),
+        (om_rows(("005930", 50000), ("000660", 60000)), "1", 1, "N"),
+        (s1_falling, "3", 1, "N"),
         # pair 2: snapshot 2 — the reference chain-pair, two pages per
         # leg (page 1 continues, page 2 completes)
-        om_chain(5, "1", om_rows(("005930", 75000), ("000660", 120000),
-                                 ("009150", 30000)), cont_yn="Y"),
-        om_chain(6, "1", om_rows(("012330", 50000), ("015760", 50000)),
-                 page=2),
-        om_chain(7, "3", s2_falling1, cont_yn="Y"),
-        om_chain(8, "3", om_rows(("006660", 45000), ("001440", 10000)),
-                 page=2),
+        (om_rows(("005930", 75000), ("000660", 120000),
+                 ("009150", 30000)), "1", 1, "Y"),
+        (om_rows(("012330", 50000), ("015760", 50000)), "1", 2, "N"),
+        (s2_falling1, "3", 1, "Y"),
+        (om_rows(("006660", 45000), ("001440", 10000)), "3", 2, "N"),
         # pair 3: snapshot 3 (the offset +1 trap prices)
-        om_chain(9, "1", om_rows(("005930", 40000), ("012330", 20000))),
-        om_chain(10, "3", s3_falling),
-    ]
-    seq = 11
+        (om_rows(("005930", 40000), ("012330", 20000)), "1", 1, "N"),
+        (s3_falling, "3", 1, "N"),
+    ):
+        records.append(om_chain(seq, sort_tp, rows, page=page,
+                                cont_yn=cont_yn))
+        seq += 1
     for symbol in sorted(OM_MA20_CLOSES):
         records.append(ka10081_record(seq, symbol, OM_MA20_CLOSES[symbol]))
         seq += 1
@@ -704,7 +714,8 @@ def om_expected_bodies(ref_stamp):
     return zero, plus_one, minus_one
 
 
-def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0"):
+def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0",
+                          pre_empty_pairs=0):
     """The §3.7 opening-mode fixture tree: the eligible winner run and
     one smoke-like ineligible directory (runs_present stays true while
     selection has exactly one eligible run)."""
@@ -716,7 +727,7 @@ def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0"):
                                    "run_id": OM_WINNER,
                                    "session_date": OM_SESSION_DATE},
          "seq": 2},
-        *om_winner_input(variant)))
+        *om_winner_input(variant, pre_empty_pairs)))
     box.write(os.path.join(run_dir, "events.hcj.jsonl"),
               jsonl(*om_winner_events(ref_stamp)))
     smoke = box.session_dir("smoke-like-2026-11-10")
@@ -1754,8 +1765,9 @@ class MarketViewOpeningSuite(unittest.TestCase):
         self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
         server.assert_gone()
 
-    def opening_server(self, ref_stamp=OM_REF_STAMP, variant="0"):
-        box = build_opening_sandbox(ref_stamp, variant)
+    def opening_server(self, ref_stamp=OM_REF_STAMP, variant="0",
+                       pre_empty_pairs=0):
+        box = build_opening_sandbox(ref_stamp, variant, pre_empty_pairs)
         self.addCleanup(box.cleanup)
         server = ServerProc(box, with_delivery=False)
         self.addCleanup(self._reap, server)
@@ -1892,6 +1904,29 @@ class MarketViewOpeningSuite(unittest.TestCase):
         status, _, raw, _ = server.get_json("/mobile/market-view")
         self.assertEqual(status, 500)
         self.assertIn(b"data_fault", raw)
+
+    def test_opening_mode_pre_open_empty_pairs_do_not_drift(self):
+        # live 2026-11-11 regression: pre-open polls affirm success
+        # with no ranking rows, closing empty pairs ahead of the first
+        # price-bearing pair — the candidate groups still count from
+        # the first upsert batch, so the empty pairs must contribute
+        # no snapshot or the index drifts past the ±1 re-establishment
+        # and the mode fails closed on sound data
+        server = self.opening_server(variant="0", pre_empty_pairs=2)
+        expected, _, _ = om_expected_bodies(OM_REF_STAMP)
+        status, body, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
+
+    def test_opening_mode_pre_open_empty_pairs_keep_the_fault(self):
+        # skipping empty pairs must not weaken the correspondence: the
+        # upserts in no price-bearing snapshot still fail closed
+        server = self.opening_server(variant="none", pre_empty_pairs=2)
+        status, _, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+        self.assertIn(b"chain-pair correspondence failed", raw)
 
     # -- the window -------------------------------------------------------
 
