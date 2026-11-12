@@ -84,9 +84,20 @@ class LedgerFault(Exception):
     """An I/O or internal fault while appending (exit 4 class)."""
 
 
-def now_iso():
-    """The notify tools' clock: ISO 8601 with the numeric KST offset."""
-    return datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+def now_iso(epoch=None):
+    """The notify tools' clock: ISO 8601 with the numeric KST offset.
+    With an epoch (the dispatcher's injectable clock) the same
+    formatting applies to that instant, so `updated_at` and the
+    dispatcher's own clock share one domain in production and tests."""
+    dt = datetime.now(KST) if epoch is None else \
+        datetime.fromtimestamp(epoch, KST)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+
+
+def iso_to_epoch(ts):
+    """Parse a canonical YYYY-MM-DDTHH:MM:SS+HH:MM timestamp to integer
+    epoch seconds."""
+    return int(datetime.fromisoformat(ts).timestamp())
 
 
 def mask_secret(value):

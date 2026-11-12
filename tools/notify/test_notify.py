@@ -1216,11 +1216,13 @@ class TestTop10Message(Base):
         self.assertEqual(inner["notification"]["body"],
                          "종목1 11위→1위 외 1건")
         # The digest is the SILENT form: normal priority, the dedicated
-        # market_rank_digest channel.
+        # market_rank_digest channel, and the one shade slot's tag.
         self.assertEqual(inner["android"],
                          {"priority": "normal",
                           "notification": {"channel_id":
-                                           notify_fcm.DIGEST_CHANNEL_ID}})
+                                           notify_fcm.DIGEST_CHANNEL_ID,
+                                           "tag":
+                                           notify_fcm.DIGEST_TAG}})
         # One tap reaches every fact: the full covered event-id list.
         self.assertEqual(inner["data"], {
             "kind": "digest",
@@ -1984,6 +1986,287 @@ class TestDispatcher(Base):
         second = run("two")
         self.assertEqual(first, second)
         self.assertEqual(len(first), 2)  # one single + one digest
+
+
+class TestGlobalAttentionBudget(Base):
+    """Global Attention Budget v1 (README §0; docs/ASSUMPTIONS.md P28):
+    sound is admitted at most once per audible_cooldown_seconds across
+    the run scope. BOTH clocks must advance — the market observation
+    time (observed_at) and the dispatch time (updated_at / the
+    dispatcher clock). ACCEPTED and PENDING sound records reserve the
+    budget alike, a restart rebuilds it from the ledgers, and time
+    regression is fail-closed into the silent digest without moving
+    the high-water mark backward."""
+
+    def append_events(self, cfg, events):
+        """Append-only staging: the next observation group is appended
+        to the ledger, never rewritten."""
+        path = cfg["ledger_path"]
+        with open(path, "ab") as f:
+            for event in events:
+                f.write(json.dumps(event, ensure_ascii=False,
+                                   separators=(",", ":")).encode("utf-8") +
+                        b"\n")
+
+    def sends_of(self, transport):
+        return [json.loads(r["data"])["message"]
+                for r in transport.requests
+                if r["url"] == FakeTransport.SEND_URL]
+
+    def records_of(self, cfg, event):
+        return [record for record in self.delivery_records(cfg)
+                if record["event_id"] == event["event_id"]]
+
+    def test_cooldown_zero_or_negative_is_refused_in_config(self):
+        # 0 is not "no budget": it is a policy that cannot be expressed,
+        # so the config fails closed (README §7).
+        for value in (0, -1):
+            path, _ = self.config(audible_cooldown_seconds=value)
+            with self.assertRaises(notify_config.ConfigError):
+                notify_config.load_config(path, "dispatch")
+        for value in (True, 1.5, "3600"):
+            path, _ = self.config(audible_cooldown_seconds=value)
+            with self.assertRaises(notify_config.ConfigError):
+                notify_config.load_config(path, "dispatch")
+        path, _ = self.config()
+        cfg = notify_config.load_config(path, "dispatch")
+        self.assertEqual(cfg["audible_cooldown_seconds"], 3600)
+        self.assertEqual(notify_config.AUDIBLE_COOLDOWN_DEFAULT, 3600)
+
+    def test_subsequent_groups_within_60m_fold_immediate_into_digest(self):
+        # Groups 1 and 2 are 5 minutes apart: group 1 rings, group 2's
+        # immediate event folds into its silent digest (with the single
+        # shade tag), and group 3 at +60m on BOTH clocks rings again.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            first = make_event(seq=1,
+                               observed_at="2026-11-12T09:00:00+09:00")
+            self.append_events(cfg, [first])
+            self.assertEqual(dispatcher.sweep(), 0)
+
+            entered = make_event(seq=2,
+                                 observed_at="2026-11-12T09:05:00+09:00")
+            rank = make_event(event_type="RANK_CHANGED",
+                              rule_id="rank-changed", seq=3,
+                              previous_rank=5, rank=2,
+                              observed_at="2026-11-12T09:05:00+09:00")
+            dispatcher._clock_state["now"] += 300
+            self.append_events(cfg, [entered, rank])
+            self.assertEqual(dispatcher.sweep(), 0)
+
+            third = make_event(seq=4,
+                               observed_at="2026-11-12T10:00:00+09:00")
+            dispatcher._clock_state["now"] += 3300
+            self.append_events(cfg, [third])
+            self.assertEqual(dispatcher.sweep(), 0)
+        finally:
+            dispatcher.close()
+
+        sends = self.sends_of(transport)
+        self.assertEqual(len(sends), 3)
+        # Group 1: the single form (no group data fields), sound.
+        self.assertEqual(sends[0]["data"]["event_id"], first["event_id"])
+        self.assertNotIn("kind", sends[0]["data"])
+        self.assertEqual(sends[0]["android"]["priority"], "high")
+        # Group 2: ONE silent digest covering both events, in ledger
+        # order, on the digest channel and its shade tag.
+        self.assertEqual(sends[1]["data"]["kind"], "digest")
+        self.assertEqual(sends[1]["data"]["event_ids"],
+                         "%s,%s" % (entered["event_id"],
+                                    rank["event_id"]))
+        self.assertEqual(sends[1]["android"]["priority"], "normal")
+        self.assertEqual(
+            sends[1]["android"]["notification"],
+            {"channel_id": notify_fcm.DIGEST_CHANNEL_ID,
+             "tag": notify_fcm.DIGEST_TAG})
+        # Group 3: the window reopened on both clocks — sound again.
+        self.assertEqual(sends[2]["data"]["event_id"], third["event_id"])
+        self.assertNotIn("kind", sends[2]["data"])
+        self.assertEqual([r["message_kind"] for r in
+                          self.delivery_records(cfg)],
+                         ["single", "digest", "digest", "single"])
+        self.assertEqual(dispatcher.counts.get("audible_admitted_count"), 2)
+        self.assertEqual(dispatcher.counts.get("silent_digest_update_count"),
+                         1)
+
+    def test_problem_a_dispatch_clock_blocks_sound_even_when_observed_at_exceeds_60m(self):
+        # Problem A: observed_at advanced 61 minutes, but only one
+        # minute passed on the dispatcher clock (a backlog replay) —
+        # the dispatch axis is not satisfied, so B stays silent.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            a = make_event(seq=1,
+                           observed_at="2026-11-12T12:00:00+09:00")
+            self.append_events(cfg, [a])
+            self.assertEqual(dispatcher.sweep(), 0)
+            b = make_event(seq=2,
+                           observed_at="2026-11-12T13:01:00+09:00")
+            dispatcher._clock_state["now"] += 60
+            self.append_events(cfg, [b])
+            self.assertEqual(dispatcher.sweep(), 0)
+        finally:
+            dispatcher.close()
+        sends = self.sends_of(transport)
+        self.assertEqual(len(sends), 2)
+        self.assertNotIn("kind", sends[0]["data"])
+        self.assertEqual(sends[0]["data"]["event_id"], a["event_id"])
+        self.assertEqual(sends[1]["data"]["kind"], "digest")
+        self.assertEqual(sends[1]["data"]["event_ids"], b["event_id"])
+        self.assertEqual([r["message_kind"] for r in
+                          self.records_of(cfg, b)], ["digest"])
+
+    def test_problem_b_pending_audible_reservation_blocks_subsequent_group_and_survives_restart(self):
+        # Problem B: A's 429 PENDING single already reserved the sound
+        # budget. B arrives before A's retry and folds into the silent
+        # digest; across a worker restart the reservation (PENDING
+        # record) still holds, A retries as the audible single it
+        # reserved, and C inside the window stays silent.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        transport = FakeTransport(send_responses=[
+            FakeResponse(429, {"error": {"code": 429,
+                                         "status": "QUOTA_EXCEEDED"}},
+                         headers={"Retry-After": "90"}),
+            FakeResponse(200, {"name": "projects/drill-project/"
+                                       "messages/m-2"}),
+        ])
+        events_path = self._events_path()
+        a_line = self.event_line(session_id="2026-11-12", seq=1,
+                                 observed_at="2026-11-12T09:00:00+09:00")
+        b_line = self.event_line(session_id="2026-11-12", seq=2,
+                                 observed_at="2026-11-12T09:05:00+09:00")
+        c_line = self.event_line(session_id="2026-11-12", seq=3,
+                                 observed_at="2026-11-12T09:10:00+09:00")
+        a = json.loads(a_line)
+        b = json.loads(b_line)
+        c = json.loads(c_line)
+        self._append_lines(events_path, [a_line])
+        worker = self.dispatcher(cfg, transport, resident=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                offset, identity = worker.watch_tick(events_path, 0, None)
+            self.assertEqual(transport.send_count(), 1)
+            self.assertEqual(
+                [(r["state"], r["message_kind"])
+                 for r in self.records_of(cfg, a)],
+                [("PENDING", "single")])
+            # B arrives while A's retry wait is running: no in-sweep
+            # sleep, and the reservation already spent the budget.
+            self._append_lines(events_path, [b_line])
+            with contextlib.redirect_stdout(io.StringIO()):
+                offset, identity = worker.watch_tick(events_path, offset,
+                                                     identity)
+            self.assertEqual(worker._clock_state["now"], 1_000_000.0)
+            self.assertEqual(transport.send_count(), 2)
+            self.assertEqual(self.sends_of(transport)[1]["data"]["kind"],
+                             "digest")
+            self.assertEqual(
+                [(r["state"], r["message_kind"])
+                 for r in self.records_of(cfg, b)],
+                [("ACCEPTED", "digest")])
+        finally:
+            worker.close()
+
+        # Restart: a fresh worker on the same ledgers rebuilds the
+        # budget from the PENDING/ACCEPTED sound records.
+        self._append_lines(events_path, [c_line])
+        transport2 = FakeTransport()
+        restarted = self.dispatcher(cfg, transport2, resident=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                restarted.watch_tick(events_path, 0, None)  # full rescan
+        finally:
+            restarted.close()
+        self.assertEqual(transport2.send_count(), 2)
+        sends = self.sends_of(transport2)
+        # A retries as the audible single it reserved ...
+        self.assertNotIn("kind", sends[0]["data"])
+        self.assertEqual(sends[0]["data"]["event_id"], a["event_id"])
+        self.assertEqual(sends[0]["android"]["priority"], "high")
+        # ... and C, still inside the window, is a silent digest.
+        self.assertEqual(sends[1]["data"]["kind"], "digest")
+        self.assertEqual(sends[1]["data"]["event_ids"], c["event_id"])
+        self.assertEqual(
+            [(r["state"], r["message_kind"], r["attempts"])
+             for r in self.records_of(cfg, a)],
+            [("PENDING", "single", 1), ("ACCEPTED", "single", 2)])
+
+    def test_problem_c_time_regressing_event_is_folded_into_digest_and_watermark_never_regresses(self):
+        # Problem C: B's observed_at is in the past (Δt < 0) — it is
+        # fail-closed into the silent digest. If it had dragged the
+        # high-water mark back to 12:50, C (13:55) would look 65m past
+        # it and ring; the mark stays 13:02, so C is silent too.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            a = make_event(seq=1,
+                           observed_at="2026-11-12T13:02:00+09:00")
+            self.append_events(cfg, [a])
+            self.assertEqual(dispatcher.sweep(), 0)
+            b = make_event(seq=2,
+                           observed_at="2026-11-12T12:50:00+09:00")
+            c = make_event(seq=3,
+                           observed_at="2026-11-12T13:55:00+09:00")
+            dispatcher._clock_state["now"] += 4000
+            self.append_events(cfg, [b, c])
+            self.assertEqual(dispatcher.sweep(), 0)
+            state = dispatcher.delivery.read_state()
+            events = dispatcher.ledger.events(strict=False)
+            last_obs, _last_disp = dispatcher._audible_watermarks(
+                events, state)
+        finally:
+            dispatcher.close()
+        sends = self.sends_of(transport)
+        self.assertEqual(len(sends), 3)
+        self.assertNotIn("kind", sends[0]["data"])
+        self.assertEqual(sends[1]["data"]["kind"], "digest")
+        self.assertEqual(sends[1]["data"]["event_ids"], b["event_id"])
+        self.assertEqual(sends[2]["data"]["kind"], "digest")
+        self.assertEqual(sends[2]["data"]["event_ids"], c["event_id"])
+        self.assertEqual(last_obs, notify_ledger.iso_to_epoch(
+            "2026-11-12T13:02:00+09:00"))
+
+    def test_restart_restores_audible_budget_from_delivery_and_event_ledgers(self):
+        # Worker 1 rings group 1 and stops; worker 2 starts fresh on
+        # the same ledgers — the ACCEPTED sound record is the budget it
+        # restores, so group 2 ten minutes later is only a digest.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        first = make_event(seq=1,
+                           observed_at="2026-11-12T09:00:00+09:00")
+        self.seed_ledger(cfg, [first])
+        worker = self.dispatcher(cfg, FakeTransport())
+        try:
+            self.assertEqual(worker.sweep(), 0)
+        finally:
+            worker.close()
+        second = make_event(seq=2,
+                            observed_at="2026-11-12T09:10:00+09:00")
+        self.append_events(cfg, [second])
+        transport = FakeTransport()
+        restarted = self.dispatcher(cfg, transport)
+        try:
+            self.assertEqual(restarted.sweep(), 0)
+        finally:
+            restarted.close()
+        self.assertEqual(transport.send_count(), 1)
+        self.assertEqual(self.sends_of(transport)[0]["data"]["kind"],
+                         "digest")
+        self.assertEqual([r["message_kind"] for r in
+                          self.records_of(cfg, second)], ["digest"])
 
 
 # ----------------------------------------------------------- register

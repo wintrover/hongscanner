@@ -108,6 +108,10 @@ TOP10_TITLE = "홍스캐너 TOP10 변화"
 TOP10_CHANNEL_ID = "market_rank_changes"
 DIGEST_TITLE = "홍스캐너 TOP10 순위 요약"
 DIGEST_CHANNEL_ID = "market_rank_digest"
+# The digest's notification tag: every silent digest replaces the one
+# shade slot (`notify(tag="market_rank_digest", id=0, ...)` on the
+# app side, README §6). The audible forms never carry it.
+DIGEST_TAG = "market_rank_digest"
 DIRECTION_WORDS = {"UP": "상승", "DOWN": "하락"}
 # The summary body's per-event word: the two immediate TOP10
 # transitions' Korean verbs. A type outside the table (a config-mapped
@@ -529,7 +533,10 @@ def build_digest_message(events, fcm_token):
             "notification": {"title": DIGEST_TITLE, "body": body},
             "android": {
                 "priority": "normal",
-                "notification": {"channel_id": DIGEST_CHANNEL_ID},
+                "notification": {
+                    "channel_id": DIGEST_CHANNEL_ID,
+                    "tag": DIGEST_TAG,
+                },
             },
             "data": {
                 "kind": "digest",
