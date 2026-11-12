@@ -24,6 +24,12 @@ const String evUpUpdateId =
     'c3aa2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e1f2';
 const String evDownExitId =
     'e5cc3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e';
+const String evTopEnterId =
+    'e8b5ea3521ff849b3862621fa23bd789fee4655db5ff6d9148ec4380cc2a6f6e';
+const String evRankChangeId =
+    'bfd9707bf8065c593c89fd123b03835e582e5c8983dc58a8776a1b157d095f2c';
+const String evTopExitId =
+    '98700772ae767a4fbfbb55e0c9e087077891a0b57c453af756e68285c1716bb6';
 
 const String fixtureSession = 'smoke-2026-11-02-885b009';
 
@@ -36,6 +42,8 @@ Map<String, Object?> fixtureEvent(
   String? symbol,
   String severity = 'INFO',
   String dataQuality = 'OBSERVING',
+  String? name,
+  int? previousRank,
 }) =>
     {
       'data_quality': dataQuality,
@@ -43,7 +51,9 @@ Map<String, Object?> fixtureEvent(
       'event_id': eventId,
       'event_type': eventType,
       'evidence_ref': 'ka10027:stex_tp=1:sort_tp=1',
+      'name': ?name,
       'observed_at': observedAt,
+      'previous_rank': ?previousRank,
       'rank': ?rank,
       'rule_id': 'candidate-enter-v1',
       'rule_version': 1,
@@ -81,11 +91,45 @@ final Map<String, Object?> evDownExit = fixtureEvent(evDownExitId,
     symbol: '000660',
     dataQuality: 'INCOMPLETE');
 
+/// Digest-cover fixtures: three TOP10 transition facts — the
+/// market-alert vocabulary a summary/digest covers — each carrying the
+/// `name` and `previous_rank` the digest rows render. Same synthetic
+/// world as the other ledger fixtures.
+final Map<String, Object?> evTopEnter = fixtureEvent(evTopEnterId,
+    eventType: 'TOP10_ENTERED',
+    observedAt: '2026-11-02T09:05:11+09:00',
+    direction: 'UP',
+    rank: 7,
+    symbol: '005930',
+    name: '삼성전자',
+    previousRank: 11);
+
+final Map<String, Object?> evRankChange = fixtureEvent(evRankChangeId,
+    eventType: 'RANK_CHANGED',
+    observedAt: '2026-11-02T09:06:23+09:00',
+    direction: 'DOWN',
+    rank: 2,
+    symbol: '000660',
+    name: 'SK하이닉스',
+    previousRank: 5);
+
+final Map<String, Object?> evTopExit = fixtureEvent(evTopExitId,
+    eventType: 'TOP10_EXITED',
+    observedAt: '2026-11-02T09:07:41+09:00',
+    direction: 'UP',
+    rank: 11,
+    symbol: '005930',
+    name: '삼성전자',
+    previousRank: 8);
+
 final List<Map<String, Object?>> fixtureLedgerEvents = [
   evUpEnter,
   evDownEnter,
   evUpUpdate,
   evDownExit,
+  evTopEnter,
+  evRankChange,
+  evTopExit,
 ];
 
 final Map<String, Object?> fixtureDeliveryRecord = {
@@ -362,6 +406,9 @@ FakeTransport fixtureTransport({Map<String, TransportResponse>? extra}) {
         evDownEnterId,
         evUpUpdateId,
         evDownExitId,
+        evTopEnterId,
+        evRankChangeId,
+        evTopExitId,
       };
       return known.contains(id)
           ? okJson({
@@ -462,14 +509,19 @@ class FakeMessagePushService extends FakePushService
 
 /// Method-channel mock for `hongscanner/market_alert`, installed through
 /// TestDefaultBinaryMessengerBinding: records the app's postNotification
-/// calls and scripts the platform's answer (permission granted/refused),
-/// plus the one-shot pending cold-start tap. Only the Dart→platform
-/// direction is intercepted; incoming platform messages
+/// calls (arguments captured whole, channelId/kind/eventIds included)
+/// and scripts the platform's answer (permission granted/refused),
+/// plus the one-shot pending cold-start tap (the platform's tap payload
+/// shape: event_id, and event_ids on a summary/digest tap). Only the
+/// Dart→platform direction is intercepted; incoming platform messages
 /// ("onNotificationTap" — the warm tap path) still reach the app's real
 /// handler, so both directions are observable in one test.
 class MarketAlertMock {
-  MarketAlertMock({this.postResult = true, this._pendingTap});
-
+  MarketAlertMock({
+    this.postResult = true,
+    this._pendingTap,
+    this._pendingTapEventIds,
+  });
   /// What the platform answers to postNotification: true = posted,
   /// false = refused (notification permission off / bad arguments).
   final bool postResult;
@@ -478,6 +530,7 @@ class MarketAlertMock {
   final List<Map<String, Object?>> posts = <Map<String, Object?>>[];
 
   String? _pendingTap;
+  String? _pendingTapEventIds;
 
   Future<Object?>? handle(MethodCall call) async {
     switch (call.method) {
@@ -485,10 +538,17 @@ class MarketAlertMock {
         posts.add(Map<String, Object?>.from(call.arguments as Map));
         return postResult;
       case 'getPendingTap':
-        // One-shot, like the platform side: answered once, then consumed.
+        // One-shot, like the platform side: answered once, then
+        // consumed. The answer mirrors MainActivity's tap payload:
+        // event_id plus, on a summary/digest tap, event_ids.
         final pending = _pendingTap;
+        final eventIds = _pendingTapEventIds;
         _pendingTap = null;
-        return pending;
+        _pendingTapEventIds = null;
+        if (pending == null) return null;
+        return eventIds == null
+            ? {'event_id': pending}
+            : {'event_id': pending, 'event_ids': eventIds};
     }
     return null;
   }
@@ -496,9 +556,17 @@ class MarketAlertMock {
 
 /// Installs [MarketAlertMock] on the market-alert method channel and
 /// removes the handler on teardown.
-MarketAlertMock mockMarketAlert({bool postResult = true, String? pendingTap}) {
+MarketAlertMock mockMarketAlert({
+  bool postResult = true,
+  String? pendingTap,
+  String? pendingTapEventIds,
+}) {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
-  final mock = MarketAlertMock(postResult: postResult, pendingTap: pendingTap);
+  final mock = MarketAlertMock(
+    postResult: postResult,
+    pendingTap: pendingTap,
+    pendingTapEventIds: pendingTapEventIds,
+  );
   binding.defaultBinaryMessenger.setMockMethodCallHandler(
     MarketAlertChannel.channel,
     mock.handle,
@@ -515,12 +583,17 @@ MarketAlertMock mockMarketAlert({bool postResult = true, String? pendingTap}) {
 /// Simulates MainActivity.onNewIntent → invokeMethod("onNotificationTap"):
 /// delivers the platform→Dart call to whatever real handler the app
 /// registered on the channel (see MarketAlertChannel.setTapHandler).
-Future<void> deliverMarketAlertTap(String eventId) async {
+/// [eventIds] carries the comma-joined cover list a summary/digest tap
+/// intent kept — the same payload shape getPendingTap answers with.
+Future<void> deliverMarketAlertTap(String eventId, {String? eventIds}) async {
   final binding = TestWidgetsFlutterBinding.ensureInitialized();
   await binding.defaultBinaryMessenger.handlePlatformMessage(
     MarketAlertChannel.channel.name,
     const StandardMethodCodec().encodeMethodCall(
-      MethodCall('onNotificationTap', {'event_id': eventId}),
+      MethodCall('onNotificationTap', {
+        'event_id': eventId,
+        'event_ids': ?eventIds,
+      }),
     ),
     (ByteData? data) {},
   );

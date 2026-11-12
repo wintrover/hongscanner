@@ -26,9 +26,12 @@ Simulated behavior (scripted by HSDRILL_FCM_SCRIPT, a JSON file):
     the SEND wirelog marker, so the drill's SIGKILL lands in the
     provider-accepted-but-unrecorded window deterministically.
 
-Wirelog (HSDRILL_WIRELOG): one line per event, timestamps included —
-``OAUTH``, ``SEND <event16> <device> <token-hash>``, ``RESP <status>
-<device>``, ``ANOMALY <what>``. Credential values are NEVER logged:
+Wirelog (HSDRILL_WIRELOG): one line per message, timestamps included —
+``OAUTH``, ``SEND <event16> <device> <token-hash>`` (the single,
+per-event message form) or ``SEND <kind> count=<n> first=<event16>
+<device> <token-hash>`` (the group forms summary/digest: composition
+kind, member count, first covered event), ``RESP <status> <device>``,
+``ANOMALY <what>``. Credential values are NEVER logged:
 tokens appear as sha256 prefixes only (README §8). Any request that is
 not the official endpoint shape, or any unexpected bearer, is recorded
 as ANOMALY and answered 400 — the drill fails on any ANOMALY line.
@@ -132,11 +135,22 @@ if os.environ.get("HSDRILL") == "1":  # drill-only: inert anywhere else
                  ("sha256:" + hashlib.sha256(
                      str(token).encode("utf-8")).hexdigest()[:16]))
             return _FakeResponse(400, _error_body(400, "INVALID_ARGUMENT"))
-        event_id = str((message.get("data") or {}).get("event_id", ""))[:16]
-        _log("SEND %s %s %s" % (
-            event_id, device,
-            "sha256:" + hashlib.sha256(
-                token.encode("utf-8")).hexdigest()[:16]))
+        data = message.get("data") or {}
+        token_hash = "sha256:" + hashlib.sha256(
+            token.encode("utf-8")).hexdigest()[:16]
+        if data.get("event_id"):
+            # The single (per-event) message form — the exact
+            # historical wirelog shape; the W3 timing parser reads it.
+            _log("SEND %s %s %s" % (str(data["event_id"])[:16],
+                                    device, token_hash))
+        else:
+            # The group forms (summary/digest): the composition kind,
+            # the member count and the first covered event — the full
+            # member list travels in the payload's event_ids.
+            event_ids = str(data.get("event_ids", ""))
+            _log("SEND %s count=%s first=%s %s %s" % (
+                data.get("kind", "?"), data.get("count", "?"),
+                event_ids.split(",", 1)[0][:16], device, token_hash))
         if _send_delay > 0:
             time.sleep(_send_delay)  # the SIGKILL window lives here
         script = _state["responses"].get(device) or \

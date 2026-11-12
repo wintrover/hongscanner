@@ -151,6 +151,19 @@ class AppStore extends ChangeNotifier {
   String? selectedEventId;
   Section<EventDetailResponse> eventDetail = const Section();
 
+  /// The cover list of the routed summary/digest notification (the
+  /// digest list view's selection), or null when the current selection
+  /// is a single event. Deliberately independent of
+  /// [selectedEventId]/[eventDetail]: a digest tap never disturbs a
+  /// mounted detail route, and a row tap from the list routes through
+  /// [openEvent] as a single event.
+  List<String>? selectedEventIds;
+
+  /// The digest list section: one fetch per covered event, in cover
+  /// order. Any failed fetch fails the whole section — the view shows
+  /// the error, never a partial list dressed as complete.
+  Section<List<EventDetailResponse>> digestEvents = const Section();
+
   /// Shell tab index: 0 = 후보 (top 10 cards), 1 = 히스토리 (candidate
   /// events). Tab switches never refetch — both tabs read the single
   /// [marketView] section.
@@ -160,6 +173,12 @@ class AppStore extends ChangeNotifier {
   /// landed ahead of the app's first frame): the shell's post-frame
   /// callback turns it into the detail route via [flushPendingEvent].
   String? pendingEventId;
+
+  /// Cover list routed before the navigator existed (a cold-start
+  /// summary/digest tap): flushed into the list route the same way.
+  /// Mutually exclusive with [pendingEventId] — the latest tap's route
+  /// wins.
+  List<String>? pendingEventIds;
 
   PushUiState pushState = const PushUiState(phase: PushPhase.unwired);
 
@@ -354,19 +373,29 @@ class AppStore extends ChangeNotifier {
     final source = _push is PushMessageSource ? _push as PushMessageSource : null;
     if (source == null) return;
     // Cold start: the notification that launched the app routes to its
-    // event detail. Messages without a usable event_id are not routed —
+    // event detail — or, for a summary/digest, to the cover-list view.
+    // Messages without a usable event id or cover list are not routed —
     // inventing a target would be worse than ignoring one bad payload.
-    source.initialMessage().then((message) {
-      final eventId = message?.eventId;
-      if (eventId != null) openEvent(eventId);
-    });
-    _tapSub = source.tapMessages.listen((message) {
-      final eventId = message.eventId;
-      if (eventId != null) openEvent(eventId);
-    });
+    source.initialMessage().then(_routeMessage);
+    _tapSub = source.tapMessages.listen(_routeMessage);
     _foregroundSub = source.foregroundMessages.listen((message) {
       onForegroundMessage?.call(message);
     });
+  }
+
+  /// One tap payload → one routing: a cover list (`event_ids`) routes to
+  /// the digest list view keyed by its first id (the representative —
+  /// the same id a local notification's tap carries as `event_id`); a
+  /// bare `event_id` routes to the detail.
+  void _routeMessage(PushMessage? message) {
+    if (message == null) return;
+    final cover = message.eventIds;
+    if (cover != null && cover.isNotEmpty) {
+      openEvent(cover.first, eventIds: cover);
+      return;
+    }
+    final eventId = message.eventId;
+    if (eventId != null) openEvent(eventId);
   }
 
   // ---- routing ----------------------------------------------------------
@@ -376,35 +405,75 @@ class AppStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Routing target for notification taps and list selections: selects the
-  /// event, fetches the recorded fact, and shows the detail route (a
-  /// mounted detail route updates in place). When the navigator does not
-  /// exist yet — a tap that lands before the app's first frame — the id is
-  /// kept in [pendingEventId] for the shell's post-frame flush; the
-  /// selection and fetch still run immediately either way.
-  Future<void> openEvent(String eventId) async {
-    selectedEventId = eventId;
-    eventDetail = const Section.loading();
-    pendingEventId = showEventDetail() ? null : eventId;
+  /// Routing target for notification taps and list selections. A single
+  /// event (no [eventIds]) selects the event, fetches the recorded fact,
+  /// and shows the detail route (a mounted detail route updates in
+  /// place). A cover list ([eventIds] non-empty — a summary/digest tap,
+  /// [eventId] its representative/first id) routes to the digest list
+  /// view instead: every covered event is fetched with the same
+  /// `GET /events/{id}` path. When the navigator does not exist yet — a
+  /// tap that lands before the app's first frame — the routing is kept
+  /// pending for the shell's post-frame flush; the selection and fetches
+  /// still run immediately either way.
+  Future<void> openEvent(String eventId, {List<String>? eventIds}) async {
+    final cover = eventIds == null || eventIds.isEmpty ? null : eventIds;
+    if (cover == null) {
+      selectedEventId = eventId;
+      eventDetail = const Section.loading();
+      pendingEventId = showEventDetail() ? null : eventId;
+      // The latest tap owns the pending route: a single selection
+      // supersedes a still-pending digest route (and vice versa below).
+      pendingEventIds = null;
+      notifyListeners();
+      try {
+        final detail = await _api.fetchEvent(eventId);
+        if (selectedEventId != eventId) return; // superseded by a newer selection
+        eventDetail = Section.loaded(detail);
+      } on ApiClientException catch (e) {
+        if (selectedEventId != eventId) return;
+        eventDetail = Section.error(_describe(e), offline: e.isConnectivityProblem);
+      }
+      notifyListeners();
+      return;
+    }
+    selectedEventIds = cover;
+    digestEvents = const Section.loading();
+    pendingEventIds = showEventList() ? null : cover;
+    pendingEventId = null;
     notifyListeners();
     try {
-      final detail = await _api.fetchEvent(eventId);
-      if (selectedEventId != eventId) return; // superseded by a newer selection
-      eventDetail = Section.loaded(detail);
+      // One fetch per covered event, in cover order; the first failure
+      // fails the section — a partial list is never shown as complete.
+      final details = await Future.wait(
+        [for (final id in cover) _api.fetchEvent(id)],
+      );
+      if (selectedEventIds != cover) return; // superseded by a newer selection
+      digestEvents = Section.loaded(details);
     } on ApiClientException catch (e) {
-      if (selectedEventId != eventId) return;
-      eventDetail = Section.error(_describe(e), offline: e.isConnectivityProblem);
+      if (selectedEventIds != cover) return;
+      digestEvents =
+          Section.error(_describe(e), offline: e.isConnectivityProblem);
     }
     notifyListeners();
   }
 
+  /// Re-reads the routed digest cover list — the list view's retry path,
+  /// the same per-event fetch path as the original routing.
+  Future<void> refreshDigest() async {
+    final ids = selectedEventIds;
+    if (ids == null || ids.isEmpty) return;
+    await openEvent(ids.first, eventIds: ids);
+  }
+
   /// First-frame flush: turns a pre-frame routed event into the detail
-  /// route. [openEvent] already ran the selection and fetch — this only
-  /// performs the deferred screen transition.
+  /// route, a pre-frame routed cover list into the list route.
+  /// [openEvent] already ran the selection and fetches — this only
+  /// performs the deferred screen transitions.
   void flushPendingEvent() {
+    final pendingIds = pendingEventIds;
+    if (pendingIds != null && showEventList()) pendingEventIds = null;
     final pending = pendingEventId;
-    if (pending == null) return;
-    if (showEventDetail()) pendingEventId = null;
+    if (pending != null && showEventDetail()) pendingEventId = null;
   }
 
   // ---- sync -------------------------------------------------------------

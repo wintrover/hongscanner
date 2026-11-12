@@ -9,8 +9,11 @@
 ##   W1  incremental tail: a full LF line is picked up within N ticks
 ##       and sent; a HALF line (no LF) is never consumed — no send, the
 ##       ledger count unchanged — until its LF arrives, then it is
-##       delivered; a 5-event burst in one write is delivered whole
-##       (zero missing);
+##       delivered; a 5-event burst in one write is delivered as ONE
+##       digest message covering all five (one silent push per
+##       observation group, README §0), and a mixed group (an entry,
+##       an exit and two rank changes, same observed_at) as ONE
+##       summary + ONE digest;
 ##   W2  SIGKILL the worker after ACCEPTED sends, restart it: the full
 ##       rescan is idempotent (no duplicate send, appended=0 dup=2) and
 ##       the restarted worker still tails NEW events;
@@ -179,6 +182,21 @@ with open(path, "a", encoding="utf-8") as f:
 PYEOF
 }
 
+append_events_spec() { # $1 = sandbox, $2 = JSON array of make_event kwargs
+  env -u HSDRILL -u PYTHONPATH "$PY" - "$1/events-src.jsonl" "$2" \
+    "$FAKESITE" <<'PYEOF'
+import json, sys
+path, spec, fixtures = sys.argv[1:4]
+sys.path.insert(0, fixtures)
+import fcm_fixtures as fx
+with open(path, "a", encoding="utf-8") as f:
+    for kwargs in json.loads(spec):
+        ev = fx.make_event(**kwargs)
+        f.write(json.dumps(ev, ensure_ascii=False,
+                           separators=(",", ":")) + "\n")
+PYEOF
+}
+
 half_event() { # $1 = sandbox, $2 = seq, $3 = half|rest
   env -u HSDRILL -u PYTHONPATH "$PY" - "$1/events-src.jsonl" "$2" "$3" \
     "$FAKESITE" <<'PYEOF'
@@ -307,16 +325,83 @@ fi
 check_eq "W1 ledger count follows the completed line" 2 \
   "$(count_lines "$SB/ledger.hcj.jsonl")"
 
-append_events "$SB" 10 5
-if wait_sends "$SB/wire.log" 7 15; then
-  ok "W1 five-event burst delivered whole"
+append_events_spec "$SB" '[
+  {"seq": 10, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
+   "previous_rank": 15, "rank": 10},
+  {"seq": 11, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
+   "previous_rank": 14, "rank": 9},
+  {"seq": 12, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
+   "previous_rank": 13, "rank": 8},
+  {"seq": 13, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
+   "previous_rank": 12, "rank": 7},
+  {"seq": 14, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
+   "previous_rank": 11, "rank": 6}
+]'
+if wait_sends "$SB/wire.log" 3 15; then
+  ok "W1 five-event burst delivered as one digest message"
 else
-  bad "W1 burst was not fully delivered in 15s"
+  bad "W1 burst was not delivered in 15s"
 fi
-check_eq "W1 burst leaves zero missing (7 sends)" 7 \
+check_eq "W1 burst is ONE message (3 sends so far)" 3 \
   "$(count_sends "$SB/wire.log")"
+check_contains "W1 the burst wirelog line covers all five" \
+  "$(cat "$SB/wire.log")" "SEND digest count=5 first="
 check_eq "W1 ledger holds all 7 events" 7 \
   "$(count_lines "$SB/ledger.hcj.jsonl")"
+
+append_events_spec "$SB" '[
+  {"seq": 20, "name": "삼성전자"},
+  {"seq": 21, "event_type": "TOP10_EXITED", "rule_id": "top10-exited",
+   "previous_rank": 9, "rank": null, "direction": "DOWN",
+   "name": "SK하이닉스"},
+  {"seq": 22, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
+   "previous_rank": 12, "rank": 2},
+  {"seq": 23, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
+   "previous_rank": 11, "rank": 1}
+]'
+if wait_sends "$SB/wire.log" 5 15; then
+  ok "W1 a mixed observation group is one summary + one digest"
+else
+  bad "W1 mixed group was not delivered in 15s"
+fi
+check_contains "W1 the immediate pair is one summary" \
+  "$(cat "$SB/wire.log")" "SEND summary count=2 first="
+check_contains "W1 the rank pair is one digest" \
+  "$(cat "$SB/wire.log")" "SEND digest count=2 first="
+check_eq "W1 five messages total for 11 events" 5 \
+  "$(count_sends "$SB/wire.log")"
+check_eq "W1 ledger holds all 11 events" 11 \
+  "$(count_lines "$SB/ledger.hcj.jsonl")"
+
+"$PY" - "$SB" "$FAKESITE" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[2])
+import fcm_fixtures as fx
+records = fx.delivery_summary(sys.argv[1] + "/delivery.hcj.jsonl")
+fails = []
+def ck(name, cond):
+    print(("ok   " if cond else "FAIL ") + "W1 " + name)
+    if not cond:
+        fails.append(name)
+kinds = {}
+by_mid = {}
+for r in records:
+    kinds[r.get("message_kind")] = kinds.get(r.get("message_kind"), 0) + 1
+    by_mid.setdefault(r["provider_message_id"], []).append(r)
+ck("eleven delivery records cover the eleven events once each",
+   len(records) == 11)
+ck("kinds split single 2 / summary 2 / digest 7",
+   kinds == {"single": 2, "summary": 2, "digest": 7})
+ck("every record is ACCEPTED",
+   all(r["state"] == "ACCEPTED" for r in records))
+ck("five messages: group sizes 1,1,2,2,5",
+   sorted(len(v) for v in by_mid.values()) == [1, 1, 2, 2, 5])
+ck("members of one message share its provider id",
+   all(len({r["provider_message_id"] for r in v}) == 1
+       for v in by_mid.values()))
+sys.exit(1 if fails else 0)
+PYEOF
+check_eq "W1 group delivery records contract" 0 $?
 
 stop_worker w1
 check_eq "W1 SIGTERM is a clean exit 0" 0 "$WORKER_RC"
@@ -333,8 +418,8 @@ fcm_script_ok "$SB" 5
 
 start_worker "$SB" w2
 append_events "$SB" 1 2
-if wait_sends "$SB/wire.log" 2 15; then
-  ok "W2 two events delivered before the kill"
+if wait_sends "$SB/wire.log" 1 15; then
+  ok "W2 two same-batch events delivered as one summary before the kill"
 else
   bad "W2 events were not delivered in 15s"
 fi
@@ -345,7 +430,7 @@ check_eq "W2 worker was SIGKILLed" 137 "$KRC"
 
 start_worker "$SB" w2b
 sleep 1.5   # a full rescan at 0.2s poll is several ticks by now
-check_eq "W2 restart resends nothing (ACCEPTED dedup)" 2 \
+check_eq "W2 restart resends nothing (ACCEPTED dedup)" 1 \
   "$(count_sends "$SB/wire.log")"
 check_contains "W2 restart rescan is idempotent (appended=0 dup=2)" \
   "$(cat "$SB/worker-w2b.out")" "appended=0 dup=2"
@@ -353,12 +438,12 @@ check_eq "W2 ledger unchanged by the rescan" 2 \
   "$(count_lines "$SB/ledger.hcj.jsonl")"
 
 append_events "$SB" 100 1
-if wait_sends "$SB/wire.log" 3 15; then
+if wait_sends "$SB/wire.log" 2 15; then
   ok "W2 restarted worker still tails new events"
 else
   bad "W2 restarted worker did not pick up the new event"
 fi
-check_eq "W2 one new send only (3 total)" 3 \
+check_eq "W2 one new send only (2 total)" 2 \
   "$(count_sends "$SB/wire.log")"
 
 stop_worker w2b
@@ -450,8 +535,8 @@ fcm_script_ok "$SB" 5
 
 start_worker "$SB" w4
 append_events "$SB" 1 2
-if wait_sends "$SB/wire.log" 2 15; then
-  ok "W4 two events delivered before the shrink"
+if wait_sends "$SB/wire.log" 1 15; then
+  ok "W4 two same-batch events delivered as one summary before the shrink"
 else
   bad "W4 events were not delivered in 15s"
 fi
@@ -468,7 +553,7 @@ clear_drill_env
 check_eq "W4 shrink exit code is 4 (LedgerFault)" 4 "$WORKER_RC"
 check_contains "W4 the fault names the shrink" \
   "$(cat "$SB/worker-w4.err")" "shrank"
-check_eq "W4 nothing was resent by the failure" 2 \
+check_eq "W4 nothing was resent by the failure" 1 \
   "$(count_sends "$SB/wire.log")"
 collect_evidence "$SB" w4
 

@@ -18,11 +18,17 @@ enum PushPermissionDecision { granted, denied, provisional }
 /// the notification payload's title/body.
 ///
 /// The dispatcher sends notification+data messages; the data payload is
-/// the routing contract (`{event_id, event_type, severity}` — docs plan
-/// PR-6 dispatcher). Tap routing keys on `event_id`. The notification
-/// title/body are the dispatcher's own assembled strings — the app
-/// treats them as opaque display text (passed verbatim to the OS
-/// market-alert post) and never re-derives or overrides them.
+/// the routing contract. Three shapes: a single event
+/// (`{event_id, event_type, severity, …}` — docs plan PR-6 dispatcher),
+/// an immediate ≥2-event summary (`kind="summary"`, `event_ids`,
+/// `count`) and a silent digest roll-up (`kind="digest"`, `event_ids`,
+/// `count`) — all values strings on the wire, `event_ids` a
+/// comma-joined 64-hex list. Tap routing keys on the payload shape: an
+/// `event_id` routes to the event detail, a cover list routes to the
+/// digest list view. The notification title/body are the dispatcher's
+/// own assembled strings — the app treats them as opaque display text
+/// (passed verbatim to the OS market-alert post) and never re-derives
+/// or overrides them.
 class PushMessage {
   const PushMessage(
     this.data, {
@@ -56,6 +62,62 @@ class PushMessage {
   String? get severity {
     final value = data['severity'];
     return value is String ? value : null;
+  }
+
+  /// The dispatcher's message kind: "summary" (immediate, ≥2 events,
+  /// sound), "digest" (silent roll-up) — absent or "single" on the
+  /// per-event message. Routing keys on the payload shape (event_id vs
+  /// event_ids), not on this label; it picks the OS channel and the
+  /// dedup unit.
+  String? get kind {
+    final value = data['kind'];
+    return value is String ? value : null;
+  }
+
+  /// The covered event ids of a summary/digest message: the dispatcher
+  /// sends them as one comma-joined 64-hex string. Null on single
+  /// messages; a non-string or empty value degrades to null — never
+  /// throws, never invents ids.
+  List<String>? get eventIds {
+    final value = data['event_ids'];
+    if (value is! String || value.isEmpty) return null;
+    return value.split(',');
+  }
+
+  /// The cover-list size the dispatcher recorded, when it sent one.
+  /// Data values are strings on the wire ("N"); an unparsable value
+  /// stays null — never a guessed count.
+  int? get count {
+    final value = data['count'];
+    return value is String ? int.tryParse(value) : null;
+  }
+
+  /// The event id this message is addressed by: the single event's own
+  /// `event_id`, or the first covered id of a summary/digest message
+  /// (the representative — the same id the notification's tap carries
+  /// as `event_id`).
+  String? get representativeEventId {
+    final ids = eventIds;
+    if (ids != null && ids.isNotEmpty) return ids.first;
+    return eventId;
+  }
+
+  /// The foreground-alert dedup key: which notification unit this
+  /// delivery belongs to. A single event is one unit keyed by its
+  /// `event_id`; a summary or digest is one unit per kind + first
+  /// covered id, so a re-delivered digest is suppressed while a single
+  /// event covered by that digest still surfaces (a different unit).
+  /// A cover list without a summary/digest kind is malformed — no unit
+  /// key, so nothing dedups against it.
+  String? get dedupKey {
+    final ids = eventIds;
+    if (ids != null && ids.isNotEmpty) {
+      final value = kind;
+      return (value == 'summary' || value == 'digest')
+          ? '$value:${ids.first}'
+          : null;
+    }
+    return eventId;
   }
 }
 

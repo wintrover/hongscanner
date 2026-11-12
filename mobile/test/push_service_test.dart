@@ -1,3 +1,4 @@
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hongscanner/main.dart';
 import 'package:hongscanner/services/fcm_push_service.dart';
@@ -70,6 +71,79 @@ void main() {
     store.dispose();
   });
 
+  group('PushMessage digest parsing', () {
+    test('messageFromRemote parses kind, event_ids and count', () {
+      // The summary/digest wire shape: everything string-valued,
+      // event_ids one comma-joined 64-hex list.
+      final message = FcmPushService.messageFromRemote(RemoteMessage(
+        data: {
+          'kind': 'digest',
+          'event_ids': '$evTopEnterId,$evRankChangeId,$evTopExitId',
+          'count': '3',
+        },
+        notification: RemoteNotification(
+          title: '홍스캐너 TOP10 순위 요약',
+          body: '관측 그룹 요약',
+        ),
+      ));
+      expect(message.kind, 'digest');
+      expect(message.eventIds, [evTopEnterId, evRankChangeId, evTopExitId]);
+      expect(message.count, 3);
+      // A digest carries no single event_id: the cover list is the
+      // routing, its first id the representative.
+      expect(message.eventId, isNull);
+      expect(message.representativeEventId, evTopEnterId);
+      expect(message.notificationTitle, '홍스캐너 TOP10 순위 요약');
+    });
+
+    test('non-string or unparsable values degrade to null, never throw',
+        () {
+      final message = FcmPushService.messageFromRemote(RemoteMessage(data: {
+        'kind': 7,
+        'event_ids': '',
+        'count': 'many',
+      }));
+      expect(message.kind, isNull);
+      expect(message.eventIds, isNull);
+      expect(message.count, isNull);
+      expect(message.representativeEventId, isNull);
+      expect(message.dedupKey, isNull);
+    });
+
+    test('single messages keep the pre-digest shape and dedup unit', () {
+      // kind="single" is the labeled form of the per-event message: no
+      // cover list, the event id remains the routing and the unit key.
+      final message = FcmPushService.messageFromRemote(RemoteMessage(data: {
+        'event_id': evTopEnterId,
+        'event_type': 'TOP10_ENTERED',
+        'kind': 'single',
+      }));
+      expect(message.kind, 'single');
+      expect(message.eventIds, isNull);
+      expect(message.representativeEventId, evTopEnterId);
+      expect(message.dedupKey, evTopEnterId);
+    });
+
+    test('summary, digest and the covered single are distinct units', () {
+      PushMessage covered(String kind) => PushMessage({
+            'kind': kind,
+            'event_ids': evTopEnterId,
+            'count': '1',
+          });
+      expect(covered('summary').dedupKey, 'summary:$evTopEnterId');
+      expect(covered('digest').dedupKey, 'digest:$evTopEnterId');
+      expect(
+        PushMessage.fromData({'event_id': evTopEnterId}).dedupKey,
+        evTopEnterId,
+        reason: 'a single event and a digest covering it are different '
+            'units — both must surface',
+      );
+      // A cover list without a summary/digest kind is malformed: no
+      // unit key, nothing dedups against it.
+      expect(PushMessage({'event_ids': evTopEnterId}).dedupKey, isNull);
+    });
+  });
+
   group('MarketAlertChannel', () {
     test('fail-closed without a platform end: no post, no pending tap',
         () async {
@@ -110,6 +184,52 @@ void main() {
       expect(
         MarketAlertChannel.isMarketAlert(PushMessage({
           'event_type': 'TOP10_ENTERED',
+        }, notificationTitle: 't', notificationBody: 'b')),
+        isFalse,
+      );
+    });
+
+    test('isMarketAlert also admits summary and digest cover messages',
+        () {
+      PushMessage covered(String kind) => PushMessage({
+            'kind': kind,
+            'event_ids': '$evTopEnterId,$evRankChangeId',
+            'count': '2',
+          }, notificationTitle: '홍스캐너 TOP10 변화', notificationBody: '요약');
+
+      expect(MarketAlertChannel.isMarketAlert(covered('summary')), isTrue);
+      expect(MarketAlertChannel.isMarketAlert(covered('digest')), isTrue);
+      // No cover list: the tap contract (the list view of every covered
+      // event) cannot be met — not postable, never degraded to a
+      // single-event tap.
+      expect(
+        MarketAlertChannel.isMarketAlert(PushMessage({
+          'kind': 'digest',
+          'count': '2',
+        }, notificationTitle: 't', notificationBody: 'b')),
+        isFalse,
+      );
+      // No server-assembled text: never re-assembled by the app.
+      expect(
+        MarketAlertChannel.isMarketAlert(PushMessage({
+          'kind': 'summary',
+          'event_ids': evTopEnterId,
+        }, notificationTitle: 't')),
+        isFalse,
+      );
+      // kind="single" keeps the TOP10-vocabulary judgment, and an
+      // unknown kind without an event_type does not become postable.
+      expect(
+        MarketAlertChannel.isMarketAlert(PushMessage({
+          'event_id': evTopEnterId,
+          'event_type': 'TOP10_ENTERED',
+          'kind': 'single',
+        }, notificationTitle: 't', notificationBody: 'b')),
+        isTrue,
+      );
+      expect(
+        MarketAlertChannel.isMarketAlert(PushMessage({
+          'kind': 'single',
         }, notificationTitle: 't', notificationBody: 'b')),
         isFalse,
       );

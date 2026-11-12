@@ -22,6 +22,8 @@ would spin, an unbounded one would stall delivery.
 import json
 import os
 
+import notify_fcm
+
 REPO_ROOT = os.path.realpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
@@ -36,6 +38,22 @@ COMMAND_PATH_KEYS = {
 INT_DEFAULTS = {"retry_min_seconds": 60, "backoff_cap_seconds": 900}
 FLOAT_DEFAULTS = {"watch_poll_seconds": 1.0}
 WATCH_POLL_MAX = 60
+
+# The admission policy (README §0/§7; docs/ASSUMPTIONS.md P28): every
+# event type in the admission universe — the same three TOP10 rank
+# transitions the delivery policy has always allowed
+# (notify_fcm.TOP10_EVENT_TYPES) — gets exactly one verdict mode:
+# "immediate" (sound channel), "digest" (silent channel, batched per
+# observation group) or "suppress" (never pushed; types outside the
+# universe are always suppress — the type_skipped meaning). Plan B is
+# the default; the config's admission section overrides it per type.
+ADMISSION_MODES = ("immediate", "digest", "suppress")
+ADMISSION_UNIVERSE = notify_fcm.TOP10_EVENT_TYPES
+ADMISSION_DEFAULT = {
+    "TOP10_ENTERED": "immediate",
+    "TOP10_EXITED": "immediate",
+    "RANK_CHANGED": "digest",
+}
 
 
 class ConfigError(Exception):
@@ -61,13 +79,68 @@ def _refuse_under_repo(cfg, key):
                           "never enter the repo (README §7)" % key)
 
 
+def _validate_admission(cfg):
+    """The one config section with NO permissive unknown-key policy
+    (README §7): a typo in it would silently change the alert policy,
+    so every key and value is checked. Absent -> the plan-B default
+    (admission_source "default", which the admission report prints);
+    present -> a {event_type: mode} mapping whose keys are admission-
+    universe types and whose values are admission modes. Types the
+    section does not name keep their plan-B default (the section is a
+    per-type override, never a silent re-suppression)."""
+    admission = cfg.get("admission")
+    if admission is None:
+        cfg["admission"] = dict(ADMISSION_DEFAULT)
+        cfg["admission_source"] = "default"
+        return
+    if not isinstance(admission, dict):
+        raise ConfigError("admission must be a JSON object "
+                          "{event_type: mode}")
+    unknown = set(admission) - set(ADMISSION_UNIVERSE)
+    if unknown:
+        raise ConfigError("admission names event types outside the "
+                          "admission universe (%s): %s"
+                          % (", ".join(sorted(ADMISSION_UNIVERSE)),
+                             ", ".join(sorted(unknown))))
+    for event_type, mode in admission.items():
+        if mode not in ADMISSION_MODES:
+            raise ConfigError("admission mode for %s must be one of %s "
+                              "(got %r)" % (event_type,
+                                            ", ".join(ADMISSION_MODES),
+                                            mode))
+    cfg["admission_source"] = "config"
+
+
+def effective_admission(cfg):
+    """The effective {event_type: mode} mapping for a config: the
+    plan-B default overridden by the config's admission section. A
+    config loaded through load_config always carries a validated
+    section; a raw dict built without it (direct construction, tests)
+    gets the default filled in — a missing key must never silently
+    mean suppress."""
+    merged = dict(ADMISSION_DEFAULT)
+    admission = cfg.get("admission")
+    if isinstance(admission, dict):
+        merged.update(admission)
+    return merged
+
+
+def admission_mode(cfg, event_type):
+    """The one admission verdict mode for an event type: "immediate",
+    "digest" or "suppress" (types outside the admission universe are
+    always "suppress"). THE shared verdict: the dispatch path and the
+    --admission-report replay call this same function — replay judges
+    exactly what production judges."""
+    return effective_admission(cfg).get(event_type, "suppress")
+
+
 def load_config(path, for_command):
     """Load and validate the config JSON for one command. Raises
     ConfigError on any deviation; there are no silent defaults except
-    the documented INT/FLOAT_DEFAULTS. Unknown keys (a stale
+    the documented INT/FLOAT/ADMISSION defaults. Unknown keys (a stale
     min_severity among them — the key is removed from the contract,
     README §7) pass through unvalidated: the policy no longer reads
-    them."""
+    them. The admission section is the one validated exception."""
     if not isinstance(path, str) or not path:
         raise ConfigError("no config path (--config or $HSNOTIFY_CONFIG)")
     try:
@@ -125,4 +198,6 @@ def load_config(path, for_command):
             raise ConfigError("%s must be a number with 0 < %s <= %d"
                               % (key, key, WATCH_POLL_MAX))
         cfg[key] = float(value)
+
+    _validate_admission(cfg)
     return cfg

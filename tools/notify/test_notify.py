@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -149,12 +150,12 @@ def event_id(session_id, event_type, rule_id, entity, transition_seq):
 def make_event(session_id="2026-11-01", event_type="TOP10_ENTERED",
                rule_id="top10-entered", seq=17, severity="INFO",
                symbol="005930", name=None, previous_rank=None, rank=3,
-               direction="UP"):
+               direction="UP", observed_at="2026-11-01T09:12:33+09:00"):
     doc = {
         "event_id": event_id(session_id, event_type, rule_id,
                              symbol if symbol else "*", seq),
         "event_type": event_type,
-        "observed_at": "2026-11-01T09:12:33+09:00",
+        "observed_at": observed_at,
         "session_id": session_id,
         "rule_id": rule_id,
         "rule_version": 1,
@@ -393,6 +394,59 @@ class TestConfig(Base):
             loaded = notify_config.load_config(path, "dispatch")
             self.assertEqual(loaded["watch_poll_seconds"], expected)
 
+    def test_admission_defaults_to_plan_b_when_absent(self):
+        # docs/ASSUMPTIONS.md P28: with no admission section the policy
+        # is plan B (enter/exit immediate, rank digest) and the loaded
+        # config states WHERE the policy came from — an absent section
+        # is never conflated with a configured one.
+        path, _ = self.config()
+        loaded = notify_config.load_config(path, "dispatch")
+        self.assertEqual(loaded["admission"],
+                         notify_config.ADMISSION_DEFAULT)
+        self.assertEqual(loaded["admission_source"], "default")
+
+    def test_admission_section_is_validated_strictly(self):
+        # A present section is strict: not an object, a mode outside
+        # the vocabulary, or an event_type outside the admission
+        # universe are refused. A PARTIAL mapping is not refused: the
+        # named types override plan B, the rest keep the default.
+        path, cfg = self.config()
+        for bad in ([], "loud",
+                    {"TOP10_ENTERED": "loud"},
+                    {"CANDIDATE_ENTERED": "immediate"}):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(dict(cfg, admission=bad), f)
+            with self.assertRaises(notify_config.ConfigError):
+                notify_config.load_config(path, "dispatch")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(cfg, admission={"RANK_CHANGED": "suppress"}),
+                      f)
+        loaded = notify_config.load_config(path, "dispatch")
+        self.assertEqual(loaded["admission_source"], "config")
+        self.assertEqual(
+            notify_config.admission_mode(loaded, "RANK_CHANGED"),
+            "suppress")
+        self.assertEqual(
+            notify_config.admission_mode(loaded, "TOP10_ENTERED"),
+            "immediate")  # partial: plan B underneath the override
+
+    def test_admission_full_override_loads(self):
+        path, _ = self.config(admission={
+            "TOP10_ENTERED": "digest", "TOP10_EXITED": "digest",
+            "RANK_CHANGED": "immediate"})
+        loaded = notify_config.load_config(path, "dispatch")
+        self.assertEqual(loaded["admission_source"], "config")
+        for event_type, mode in (("TOP10_ENTERED", "digest"),
+                                 ("TOP10_EXITED", "digest"),
+                                 ("RANK_CHANGED", "immediate")):
+            self.assertEqual(
+                notify_config.admission_mode(loaded, event_type), mode)
+        # Types outside the admission universe are always suppress:
+        # the section can only re-map the universe, never widen it.
+        self.assertEqual(
+            notify_config.admission_mode(loaded, "SESSION_ENDED"),
+            "suppress")
+
 
 # ------------------------------------------------- schema validation
 
@@ -545,6 +599,20 @@ class TestDeliverySchema(Base):
             notify_ledger.validate_delivery(bad)
         bad = self.base_record("PENDING")
         bad["state"] = "SENT"
+        with self.assertRaises(notify_ledger.LedgerError):
+            notify_ledger.validate_delivery(bad)
+
+    def test_message_kind_is_a_closed_optional_enum(self):
+        # The composition kind (README §6/§7): single/summary/digest,
+        # optional so pre-grouping ledgers stay valid, closed so no
+        # fourth form can slip in undocumented.
+        for state in ("PENDING", "ACCEPTED", "FAILED"):
+            for kind in notify_ledger.MESSAGE_KINDS:
+                record = self.base_record(state)
+                record["message_kind"] = kind
+                notify_ledger.validate_delivery(record)
+        bad = self.base_record("ACCEPTED")
+        bad["message_kind"] = "bulk"
         with self.assertRaises(notify_ledger.LedgerError):
             notify_ledger.validate_delivery(bad)
 
@@ -1091,6 +1159,138 @@ class TestTop10Message(Base):
                              ["notification"]["channel_id"],
                              "market_rank_changes")
 
+    # The group assemblies (README §6; docs/ASSUMPTIONS.md P28): the
+    # observation-group send forms the admission policy composes.
+
+    def group_events(self, count, observed_at=None):
+        events = []
+        for seq in range(1, count + 1):
+            events.append(make_event(
+                event_type="RANK_CHANGED", rule_id="rank-changed",
+                seq=seq, name="종목%d" % seq, previous_rank=10 + seq,
+                rank=seq, observed_at=observed_at))
+        return events
+
+    def test_summary_message_shape(self):
+        entered = make_event(seq=17, name="삼성전자", rank=7)
+        exited = make_event(event_type="TOP10_EXITED",
+                            rule_id="top10-exited", seq=19,
+                            name="SK하이닉스", previous_rank=9, rank=None,
+                            direction="DOWN")
+        message = notify_fcm.build_summary_message([entered, exited],
+                                                   FCM_TOKEN)
+        inner = message["message"]
+        self.assertEqual(inner["token"], FCM_TOKEN)
+        self.assertEqual(inner["notification"]["title"],
+                         notify_fcm.TOP10_TITLE)
+        self.assertEqual(inner["notification"]["body"],
+                         "삼성전자 진입·SK하이닉스 이탈")
+        self.assertEqual(inner["android"],
+                         {"priority": "high",
+                          "notification": {"channel_id":
+                                           notify_fcm.TOP10_CHANNEL_ID}})
+        # The group data contract: kind, the FULL member list (ledger
+        # order) and the count — nothing else; the per-event fields
+        # stay on the single message.
+        self.assertEqual(inner["data"], {
+            "kind": "summary",
+            "event_ids": "%s,%s" % (entered["event_id"],
+                                    exited["event_id"]),
+            "count": "2"})
+
+    def test_summary_body_lists_two_then_counts_the_rest(self):
+        events = [make_event(seq=seq, name="종목%d" % seq)
+                  for seq in range(1, 6)]
+        message = notify_fcm.build_summary_message(events, FCM_TOKEN)
+        self.assertEqual(message["message"]["notification"]["body"],
+                         "종목1 진입·종목2 진입 외 3건")
+        self.assertEqual(message["message"]["data"]["count"], "5")
+
+    def test_digest_message_shape(self):
+        events = self.group_events(2)
+        message = notify_fcm.build_digest_message(events, FCM_TOKEN)
+        inner = message["message"]
+        self.assertEqual(inner["token"], FCM_TOKEN)
+        self.assertEqual(inner["notification"]["title"],
+                         notify_fcm.DIGEST_TITLE)
+        self.assertEqual(inner["notification"]["body"],
+                         "종목1 11위→1위 외 1건")
+        # The digest is the SILENT form: normal priority, the dedicated
+        # market_rank_digest channel.
+        self.assertEqual(inner["android"],
+                         {"priority": "normal",
+                          "notification": {"channel_id":
+                                           notify_fcm.DIGEST_CHANNEL_ID}})
+        # One tap reaches every fact: the full covered event-id list.
+        self.assertEqual(inner["data"], {
+            "kind": "digest",
+            "event_ids": "%s,%s" % (events[0]["event_id"],
+                                    events[1]["event_id"]),
+            "count": "2"})
+
+    def test_digest_single_event_has_no_overflow_suffix(self):
+        message = notify_fcm.build_digest_message(self.group_events(1),
+                                                  FCM_TOKEN)
+        self.assertEqual(message["message"]["notification"]["body"],
+                         "종목1 11위→1위")
+
+    def test_digest_never_invents_a_move_the_facts_do_not_carry(self):
+        only_rank = [make_event(event_type="RANK_CHANGED",
+                                rule_id="rank-changed", seq=1,
+                                name="종목1", previous_rank=None, rank=2)]
+        message = notify_fcm.build_digest_message(only_rank, FCM_TOKEN)
+        self.assertEqual(message["message"]["notification"]["body"],
+                         "종목1 신규 진입 2위")
+        only_prev = [make_event(event_type="RANK_CHANGED",
+                                rule_id="rank-changed", seq=2,
+                                name="종목2", previous_rank=5, rank=None)]
+        message = notify_fcm.build_digest_message(only_prev, FCM_TOKEN)
+        self.assertEqual(message["message"]["notification"]["body"],
+                         "종목2 5위→후보 제외")
+        bare = [make_event(event_type="RANK_CHANGED",
+                           rule_id="rank-changed", seq=3, name="종목3",
+                           previous_rank=None, rank=None)]
+        message = notify_fcm.build_digest_message(bare, FCM_TOKEN)
+        self.assertEqual(message["message"]["notification"]["body"],
+                         "종목3")
+
+    def test_group_payload_limit_accepts_forty_and_refuses_hundred(self):
+        # The 4096-byte guard judges the GROUP composition: a 40-event
+        # group fits, a 100-event group is refused before any send —
+        # fail-closed, never a silently truncated composition.
+        self.assertIsNotNone(
+            notify_fcm.build_digest_message(self.group_events(40),
+                                            FCM_TOKEN))
+        with self.assertRaises(notify_fcm.FcmError):
+            notify_fcm.build_digest_message(self.group_events(100),
+                                            FCM_TOKEN)
+        entered = [make_event(seq=seq, name="종목%d" % seq)
+                   for seq in range(1, 101)]
+        self.assertIsNotNone(
+            notify_fcm.build_summary_message(entered[:40], FCM_TOKEN))
+        with self.assertRaises(notify_fcm.FcmError):
+            notify_fcm.build_summary_message(entered, FCM_TOKEN)
+
+    def test_group_assembly_is_deterministic_and_order_bound(self):
+        events = self.group_events(3)
+        first = notify_fcm.build_digest_message(events, FCM_TOKEN)
+        second = notify_fcm.build_digest_message(list(events), FCM_TOKEN)
+        self.assertEqual(json.dumps(first, ensure_ascii=False,
+                                    separators=(",", ":")),
+                         json.dumps(second, ensure_ascii=False,
+                                    separators=(",", ":")))
+        # Order is ledger order: swapping the members changes the
+        # first-named fact, not just the id list.
+        swapped = notify_fcm.build_digest_message(
+            [events[1], events[0], events[2]], FCM_TOKEN)
+        self.assertEqual(
+            swapped["message"]["notification"]["body"],
+            "종목2 12위→2위 외 2건")
+        self.assertEqual(
+            swapped["message"]["data"]["event_ids"],
+            ",".join(event["event_id"]
+                     for event in [events[1], events[0], events[2]]))
+
 
 # ---------------------------------------------------------- dispatcher
 
@@ -1325,8 +1525,10 @@ class TestDispatcher(Base):
                          ("FAILED", "HTTP_418"))
 
     def test_type_allowlist_filters_before_any_send(self):
-        """The delivery policy is the event-type allowlist: the three
-        TOP10 transitions are send candidates; every other type
+        """The delivery policy is the admission gate (plan B by
+        default): the three TOP10 transitions are admitted — the
+        enter/exit pair of one observation batch as ONE sound summary,
+        the rank change as ONE silent digest — and every other type
         (faults, session lifecycle, the candidate series) is counted
         type_skipped and never creates a delivery record. Severity is
         not a send decision — a CRITICAL fault is skipped exactly like
@@ -1361,14 +1563,24 @@ class TestDispatcher(Base):
         finally:
             dispatcher.close()
         self.assertEqual(code, 0)
-        self.assertEqual(transport.send_count(), 3)
+        # One observation group: at most one sound + one silent message.
+        self.assertEqual(transport.send_count(), 2)
         self.assertEqual(dispatcher.counts.get("type_skipped"), 3)
         self.assertEqual(dispatcher.counts.get("events_total"), 6)
-        # No delivery record is ever created for a type-skipped event:
+        # No delivery record is ever created for a suppressed event:
         # the block happens before the pair is formed (no fake
         # PENDING, README §7).
         records = self.delivery_records(cfg)
         self.assertEqual(len(records), 3)
+        by_kind = {}
+        for record in records:
+            by_kind[record["message_kind"]] = \
+                by_kind.get(record["message_kind"], 0) + 1
+        self.assertEqual(by_kind, {"summary": 2, "digest": 1})
+        # The two summary members share ONE provider message id.
+        summary = [r for r in records if r["message_kind"] == "summary"]
+        self.assertEqual(
+            len({r["provider_message_id"] for r in summary}), 1)
         sent_ids = {r["event_id"] for r in records}
         for event in notifiable:
             self.assertIn(event["event_id"], sent_ids)
@@ -1439,9 +1651,10 @@ class TestDispatcher(Base):
         class Recording(FakeTransport):
             def __call__(self, request, timeout=None):
                 if request.full_url == self.SEND_URL:
-                    order.append(json.loads(
+                    data = json.loads(
                         bytes(request.data))["message"]["data"]
-                        ["event_id"])
+                    ids = data.get("event_id") or data.get("event_ids")
+                    order.append(ids.split(","))
                 return super().__call__(request, timeout=timeout)
 
         dispatcher = self.dispatcher(cfg, Recording())
@@ -1449,7 +1662,328 @@ class TestDispatcher(Base):
             dispatcher.sweep()
         finally:
             dispatcher.close()
-        self.assertEqual(order, [first["event_id"], second["event_id"]])
+        # One observation group: the sound unit (the single immediate
+        # event, in ledger order) precedes the silent digest; every
+        # message carries its members in ledger order.
+        self.assertEqual(order, [[first["event_id"]],
+                                 [second["event_id"]]])
+
+    # The admission group contracts (README §0/§6; docs/ASSUMPTIONS.md
+    # P28): one message per composition, one record per covered event.
+
+    def sends_of(self, transport):
+        return [json.loads(r["data"])["message"]
+                for r in transport.requests
+                if r["url"] == FakeTransport.SEND_URL]
+
+    def test_rank_group_sends_one_digest_covering_every_event(self):
+        # Contracts 1+2+3: five rank changes of ONE observation batch
+        # cost ONE silent push; the digest's data carries every event
+        # id (one tap reaches every fact); one record per covered
+        # event, all sharing the provider message id.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        events = [make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=seq,
+                             previous_rank=10 + seq, rank=seq)
+                  for seq in range(1, 6)]
+        self.seed_ledger(cfg, events)
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 1)
+        data = self.sends_of(transport)[0]["data"]
+        self.assertEqual(data["kind"], "digest")
+        self.assertEqual(data["count"], "5")
+        self.assertEqual(data["event_ids"],
+                         ",".join(event["event_id"] for event in events))
+        records = self.delivery_records(cfg)
+        self.assertEqual(len(records), 5)
+        self.assertEqual({r["message_kind"] for r in records}, {"digest"})
+        self.assertEqual(
+            len({r["provider_message_id"] for r in records}), 1)
+
+    def test_mixed_group_sends_one_summary_and_one_digest(self):
+        # Contract 2: one observation batch with two immediate and two
+        # digest events costs one sound + one silent message — the
+        # sound summary first, the silent digest after.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        entered = make_event(seq=17, name="삼성전자", rank=7)
+        exited = make_event(event_type="TOP10_EXITED",
+                            rule_id="top10-exited", seq=19,
+                            name="SK하이닉스", previous_rank=9, rank=None,
+                            direction="DOWN")
+        ranks = [make_event(event_type="RANK_CHANGED",
+                            rule_id="rank-changed", seq=seq,
+                            previous_rank=10 + seq, rank=seq)
+                 for seq in (18, 20)]
+        self.seed_ledger(cfg, [entered, ranks[0], exited, ranks[1]])
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 2)
+        summary, digest = self.sends_of(transport)
+        self.assertEqual(summary["data"]["kind"], "summary")
+        self.assertEqual(digest["data"]["kind"], "digest")
+        self.assertEqual(summary["notification"]["body"],
+                         "삼성전자 진입·SK하이닉스 이탈")
+        self.assertEqual(summary["android"]["priority"], "high")
+        self.assertEqual(digest["android"]["priority"], "normal")
+        self.assertEqual(digest["android"]["notification"]["channel_id"],
+                         "market_rank_digest")
+        self.assertEqual(summary["data"]["event_ids"],
+                         "%s,%s" % (entered["event_id"],
+                                    exited["event_id"]))
+        self.assertEqual(digest["data"]["event_ids"],
+                         ",".join(event["event_id"] for event in ranks))
+        records = self.delivery_records(cfg)
+        self.assertEqual(len(records), 4)
+        summary_records = [r for r in records
+                           if r["message_kind"] == "summary"]
+        digest_records = [r for r in records
+                          if r["message_kind"] == "digest"]
+        self.assertEqual(len(summary_records), 2)
+        self.assertEqual(len(digest_records), 2)
+        self.assertEqual(
+            len({r["provider_message_id"] for r in summary_records}), 1)
+        self.assertEqual(
+            len({r["provider_message_id"] for r in digest_records}), 1)
+
+    def test_single_form_is_unchanged_when_the_group_has_one_immediate(self):
+        # The single message form is EXACTLY build_message: the same
+        # data fields, no kind/event_ids/count — a group whose sound
+        # class has one member keeps the historical wire bytes.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        entered = make_event(seq=17, name="삼성전자", rank=7)
+        rank = make_event(event_type="RANK_CHANGED",
+                          rule_id="rank-changed", seq=18,
+                          previous_rank=5, rank=2)
+        self.seed_ledger(cfg, [entered, rank])
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 2)
+        single, digest = self.sends_of(transport)
+        self.assertEqual({"message": single},
+                         notify_fcm.build_message(entered, FCM_TOKEN))
+        for key in ("kind", "event_ids", "count"):
+            self.assertNotIn(key, single["data"])
+        self.assertEqual(digest["data"]["event_ids"], rank["event_id"])
+        records = self.delivery_records(cfg)
+        self.assertEqual([r["message_kind"] for r in records],
+                         ["single", "digest"])
+
+    def test_digest_members_are_deduped_never_resent(self):
+        # Dedup stays per (event_id, device_id): after the digest is
+        # ACCEPTED, a re-sweep resends nothing — every member is
+        # suppressed exactly like a single event.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        events = [make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=seq,
+                             previous_rank=10 + seq, rank=seq)
+                  for seq in range(1, 6)]
+        self.seed_ledger(cfg, events)
+        self.register("dev-1")
+        transport = FakeTransport()
+        first = self.dispatcher(cfg, transport)
+        try:
+            first.sweep()
+        finally:
+            first.close()
+        second = self.dispatcher(cfg, transport)
+        try:
+            code = second.sweep()
+        finally:
+            second.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 1)
+        self.assertEqual(second.counts.get("dedup_suppressed"), 5)
+        self.assertEqual(len(self.delivery_records(cfg)), 5)
+
+    def test_retry_reassembles_the_whole_group(self):
+        # A deferred UNIT is reassembled with exactly the same members
+        # (they share one next_due): partial delivery of a group is
+        # impossible — the retry message covers all five or nothing.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        events = [make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=seq,
+                             previous_rank=10 + seq, rank=seq)
+                  for seq in range(1, 6)]
+        self.seed_ledger(cfg, events)
+        self.register("dev-1")
+        transport = FakeTransport(send_responses=[
+            FakeResponse(429, {"error": {"code": 429,
+                                         "status": "QUOTA_EXCEEDED"}}),
+            FakeResponse(200, {"name": "projects/drill-project/"
+                                       "messages/m-2"}),
+        ])
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 2)
+        records = self.delivery_records(cfg)
+        self.assertEqual(len(records), 10)  # 5 PENDING + 5 ACCEPTED
+        self.assertEqual([r["state"] for r in records],
+                         ["PENDING"] * 5 + ["ACCEPTED"] * 5)
+        self.assertEqual([r["attempts"] for r in records],
+                         [1] * 5 + [2] * 5)
+        sends = [message["data"] for message in self.sends_of(transport)]
+        self.assertEqual(sends[0]["event_ids"], sends[1]["event_ids"])
+        self.assertEqual(sends[1]["event_ids"],
+                         ",".join(event["event_id"] for event in events))
+
+    def test_404_on_a_group_fails_every_member_and_retires_once(self):
+        # The vendor's 404 retires the token ONCE for the unit, and
+        # every member gets its honest terminal FAILED record.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        events = [make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=seq,
+                             previous_rank=10 + seq, rank=seq)
+                  for seq in (1, 2)]
+        self.seed_ledger(cfg, events)
+        self.register("dev-1")
+        transport = FakeTransport(send_responses=[
+            FakeResponse(404, {"error": {"code": 404,
+                                         "status": "NOT_FOUND"}}),
+        ])
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        records = self.delivery_records(cfg)
+        self.assertEqual([r["state"] for r in records],
+                         ["FAILED", "FAILED"])
+        self.assertEqual({r["error_code"] for r in records},
+                         {"NOT_FOUND"})
+        self.assertEqual(dispatcher.counts.get("token_retired"), 1)
+        registry = notify_ledger.Registry(self.registry_path, lock=False)
+        try:
+            self.assertEqual(registry.devices(), {})
+        finally:
+            registry.close()
+        raw = open(self.registry_path, "r", encoding="utf-8").read()
+        self.assertEqual(raw.count('"token_invalid"'), 1)
+
+    def test_policy_suppress_mode_skips_records_like_type_skipped(self):
+        # A configured suppress mode behaves exactly like a type
+        # outside the admission universe: counted type_skipped, no
+        # record, no send — one shared verdict, not two gates.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        cfg["admission"] = {"RANK_CHANGED": "suppress"}
+        entered = make_event(seq=17)
+        rank = make_event(event_type="RANK_CHANGED",
+                          rule_id="rank-changed", seq=18,
+                          previous_rank=5, rank=2)
+        self.seed_ledger(cfg, [entered, rank])
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 1)
+        self.assertEqual(dispatcher.counts.get("type_skipped"), 1)
+        self.assertEqual([r["event_id"] for r in
+                          self.delivery_records(cfg)],
+                         [entered["event_id"]])
+
+    def test_observation_groups_are_bounded_by_observed_at(self):
+        # The batch boundary is the fact's observed_at: two batches of
+        # the same device are two digests, never one merged message.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        batch_a = [make_event(event_type="RANK_CHANGED",
+                              rule_id="rank-changed", seq=seq,
+                              previous_rank=10 + seq, rank=seq)
+                   for seq in (1, 2)]
+        batch_b = [make_event(event_type="RANK_CHANGED",
+                              rule_id="rank-changed", seq=seq,
+                              previous_rank=10 + seq, rank=seq,
+                              observed_at="2026-11-01T09:12:34+09:00")
+                   for seq in (3, 4)]
+        self.seed_ledger(cfg, batch_a + batch_b)
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 2)
+        sends = [message["data"] for message in self.sends_of(transport)]
+        self.assertEqual(sends[0]["event_ids"],
+                         ",".join(event["event_id"] for event in batch_a))
+        self.assertEqual(sends[1]["event_ids"],
+                         ",".join(event["event_id"] for event in batch_b))
+
+    def test_same_input_and_policy_replay_identical_message_bytes(self):
+        # Contract 4: the same ledger + policy compose byte-identical
+        # request payloads — composition is deterministic replay.
+
+        def run(tag):
+            replay = tempfile.mkdtemp(prefix="notify-replay-%s-" % tag)
+            self.addCleanup(shutil.rmtree, replay, True)
+            cfg = dict(base_cfg)
+            cfg["ledger_path"] = os.path.join(replay, "ledger.hcj.jsonl")
+            cfg["delivery_path"] = os.path.join(replay,
+                                                "delivery.hcj.jsonl")
+            cfg["registry_path"] = os.path.join(replay, "devices.jsonl")
+            self.seed_ledger(cfg, events)
+            registry = notify_ledger.Registry(cfg["registry_path"],
+                                              lock=True)
+            try:
+                registry.add_device("dev-1", FCM_TOKEN)
+            finally:
+                registry.close()
+            transport = FakeTransport()
+            dispatcher = self.dispatcher(cfg, transport)
+            try:
+                dispatcher.sweep()
+            finally:
+                dispatcher.close()
+            return [r["data"] for r in transport.requests
+                    if r["url"] == FakeTransport.SEND_URL]
+
+        events = [make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=seq,
+                             previous_rank=10 + seq, rank=seq)
+                  for seq in range(1, 4)] + \
+                 [make_event(seq=17, name="삼성전자", rank=7)]
+        _, base_cfg = self.config()
+        self.write_service_account(base_cfg)
+        first = run("one")
+        second = run("two")
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 2)  # one single + one digest
 
 
 # ----------------------------------------------------------- register
@@ -1778,6 +2312,269 @@ class TestWatchDispatcher(Base):
             self.assertEqual(self.ledger_lines(cfg), [line])
         finally:
             worker.close()
+
+    def test_group_boundary_in_watch_ticks(self):
+        # The observation group is bounded by observed_at within one
+        # tick, and the dedup boundary comes FIRST: a later member of
+        # an already-sent observed_at forms its own digest — never a
+        # re-send of the accepted members (README §0, the honest
+        # split-arrival boundary).
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        events_path = self._events_path()
+        batch_a = [self.event_line(event_type="RANK_CHANGED",
+                                   rule_id="rank-changed", seq=seq,
+                                   previous_rank=10 + seq, rank=seq)
+                   for seq in (1, 2)]
+        batch_b = [self.event_line(event_type="RANK_CHANGED",
+                                   rule_id="rank-changed", seq=seq,
+                                   previous_rank=10 + seq, rank=seq,
+                                   observed_at="2026-11-01T09:13:33+09:00")
+                   for seq in (3, 4)]
+        late = self.event_line(event_type="RANK_CHANGED",
+                               rule_id="rank-changed", seq=5,
+                               previous_rank=15, rank=5)
+        transport = FakeTransport()
+        worker = self.dispatcher(cfg, transport, resident=True)
+        try:
+            out = io.StringIO()
+            self._append_lines(events_path, batch_a + batch_b)
+            with contextlib.redirect_stdout(out):
+                offset, identity = worker.watch_tick(events_path, 0, None)
+            # Two observation batches in ONE tick: two digests, one per
+            # observed_at — never one merged message.
+            self.assertEqual(transport.send_count(), 2)
+            sends = [json.loads(r["data"])["message"]["data"]
+                     for r in transport.requests
+                     if r["url"] == FakeTransport.SEND_URL]
+            self.assertEqual(sends[0]["event_ids"],
+                             ",".join(json.loads(line)["event_id"]
+                                      for line in batch_a))
+            self.assertEqual(sends[1]["event_ids"],
+                             ",".join(json.loads(line)["event_id"]
+                                      for line in batch_b))
+            # A late member of batch A's observed_at: its own digest.
+            self._append_lines(events_path, [late])
+            with contextlib.redirect_stdout(out):
+                worker.watch_tick(events_path, offset, identity)
+            self.assertEqual(transport.send_count(), 3)
+            records = self.delivery_records(cfg)
+            self.assertEqual(len(records), 5)
+            self.assertEqual({r["message_kind"] for r in records},
+                             {"digest"})
+        finally:
+            worker.close()
+
+
+# ------------------------------------------------ admission report
+
+
+class TestAdmissionReport(Base):
+    """The admission replay tool (README §9; docs/ASSUMPTIONS.md P28):
+    every fact judged with the SAME admission code the dispatch path
+    uses, one verdict line per event, the per-observation-group send
+    plan and the totals — no send, no ledger write, byte-identical for
+    the same file + policy."""
+
+    def report_for(self, events, cfg_overrides=None):
+        path, cfg = self.config(**(cfg_overrides or {}))
+        events_path = os.path.join(self.tmp, "report-events.hcj.jsonl")
+        write_jsonl(events_path, events)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = notify_dispatcher.admission_report(cfg, events_path)
+        return code, out.getvalue(), path, cfg
+
+    def test_every_event_gets_exactly_one_verdict(self):
+        events = [
+            make_event(event_type="TOP10_ENTERED", seq=17, rank=7),
+            make_event(event_type="TOP10_EXITED",
+                       rule_id="top10-exited", seq=19, previous_rank=9,
+                       rank=None, direction="DOWN"),
+            make_event(event_type="RANK_CHANGED", rule_id="rank-changed",
+                       seq=18, previous_rank=5, rank=2),
+            make_event(event_type="CANDIDATE_ENTERED",
+                       rule_id="candidate-entered", seq=33),
+            make_event(event_type="SESSION_ENDED",
+                       rule_id="session-ended", seq=34, symbol=None,
+                       rank=None, direction=None),
+        ]
+        code, out, _path, _cfg = self.report_for(events)
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        # The first line states WHICH policy decided — an absent
+        # section is the default plan B, never a configured one.
+        self.assertEqual(
+            lines[0],
+            "admission policy source=default RANK_CHANGED=digest "
+            "TOP10_ENTERED=immediate TOP10_EXITED=immediate")
+        verdicts = [line for line in lines
+                    if line.startswith("admission event=")]
+        self.assertEqual(len(verdicts), 5)
+        by_id = {}
+        for line in verdicts:
+            fields = dict(part.split("=", 1)
+                          for part in line.split(" ")[1:])
+            by_id[fields["event"]] = fields
+        self.assertEqual(set(by_id), {e["event_id"] for e in events})
+        self.assertEqual(by_id[events[0]["event_id"]],
+                         {"event": events[0]["event_id"],
+                          "type": "TOP10_ENTERED",
+                          "observed_at": "2026-11-01T09:12:33+09:00",
+                          "verdict": "ADMIT", "form": "summary"})
+        self.assertEqual(by_id[events[1]["event_id"]]["verdict"], "ADMIT")
+        self.assertEqual(by_id[events[1]["event_id"]]["form"], "summary")
+        self.assertEqual(by_id[events[2]["event_id"]]["verdict"], "DIGEST")
+        self.assertEqual(by_id[events[2]["event_id"]]["form"], "digest")
+        self.assertEqual(
+            by_id[events[3]["event_id"]]["verdict"], "SUPPRESS")
+        self.assertEqual(
+            by_id[events[3]["event_id"]]["form"], "not_in_admission")
+        self.assertEqual(
+            by_id[events[4]["event_id"]]["verdict"], "SUPPRESS")
+        self.assertEqual(
+            by_id[events[4]["event_id"]]["form"], "not_in_admission")
+        self.assertIn("admission total events=5 groups=1 sound=1 "
+                      "silent=1 admit=2 digest=1 suppress=2 refused=0",
+                      lines)
+
+    def test_plan_lines_mirror_the_composed_messages(self):
+        events = [
+            make_event(event_type="TOP10_ENTERED", seq=17, rank=7),
+            make_event(event_type="RANK_CHANGED", rule_id="rank-changed",
+                       seq=18, previous_rank=5, rank=2),
+        ]
+        code, out, _path, _cfg = self.report_for(events)
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        self.assertIn("admission group observed_at=2026-11-01T09:12:33"
+                      "+09:00 events=2 sound=1 silent=1", lines)
+        plans = [line for line in lines
+                 if line.startswith("admission plan ")]
+        self.assertEqual(len(plans), 2)
+        self.assertIn("kind=single count=1 "
+                      "title=홍스캐너 TOP10 변화", plans[0])
+        self.assertIn("body=005930 상승 TOP10 신규 진입 7위", plans[0])
+        self.assertIn("event_ids=%s" % events[0]["event_id"], plans[0])
+        self.assertIn("kind=digest count=1 "
+                      "title=홍스캐너 TOP10 순위 요약", plans[1])
+        self.assertIn("event_ids=%s" % events[1]["event_id"], plans[1])
+
+    def test_report_is_byte_identical_across_runs(self):
+        events = [make_event(seq=17, rank=7),
+                  make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=18,
+                             previous_rank=5, rank=2)]
+        first = self.report_for(events)
+        second = self.report_for(events)
+        self.assertEqual(first[0], 0)
+        self.assertEqual(first[1], second[1])  # the same bytes
+
+    def test_report_shares_the_dispatch_path_policy(self):
+        # The replay composition IS the dispatch composition: with one
+        # config the report's plan kinds/counts equal the actually
+        # SENT messages' kinds/counts (the compose code is shared).
+        overrides = {"admission": {"TOP10_ENTERED": "digest",
+                                   "TOP10_EXITED": "digest",
+                                   "RANK_CHANGED": "immediate"}}
+        events = [make_event(seq=17, rank=7),
+                  make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=18,
+                             previous_rank=5, rank=2)]
+        code, out, path, cfg = self.report_for(events, overrides)
+        self.assertEqual(code, 0)
+        self.assertIn("admission policy source=config", out.splitlines()[0])
+        plans = []
+        for line in out.splitlines():
+            if line.startswith("admission plan "):
+                match = re.search(r" kind=(\w+) count=(\d+)", line)
+                plans.append((match.group(1), int(match.group(2))))
+        self.assertEqual(plans, [("single", 1), ("digest", 1)])
+        self.write_service_account(cfg)
+        self.seed_ledger(cfg, events)
+        self.register("dev-1")
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        sent = [json.loads(r["data"])["message"]["data"]
+                for r in transport.requests
+                if r["url"] == FakeTransport.SEND_URL]
+        # A single-form message carries NO kind/count (its data stays
+        # the historical per-event fields) — the report's plan and the
+        # wire agree anyway: one single covering one event.
+        sent_forms = []
+        for data in sent:
+            if "kind" in data:
+                sent_forms.append((data["kind"], int(data["count"])))
+            else:
+                sent_forms.append(("single", 1))
+        self.assertEqual(sent_forms, plans)
+
+    def test_report_prints_a_refused_plan_over_the_payload_limit(self):
+        events = [make_event(event_type="RANK_CHANGED",
+                             rule_id="rank-changed", seq=seq,
+                             previous_rank=10 + seq, rank=seq)
+                  for seq in range(1, 101)]
+        code, out, _path, _cfg = self.report_for(events)
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
+        refused = [line for line in lines
+                   if line.startswith("admission plan ")
+                   and "refused=" in line]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("kind=digest count=100 "
+                      "refused=HS_PAYLOAD_OVER_LIMIT", refused[0])
+        self.assertIn("admission total events=100 groups=1 sound=0 "
+                      "silent=0 admit=0 digest=100 suppress=0 "
+                      "refused=1", lines)
+
+    def test_cli_report_prints_and_writes_nothing(self):
+        path, cfg = self.config()
+        self.write_service_account(cfg)
+        events_path = os.path.join(self.tmp, "report-events.hcj.jsonl")
+        write_jsonl(events_path, [make_event(seq=17, rank=7)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = notify_dispatcher._main(
+                ["--config", path, "--admission-report", events_path])
+        self.assertEqual(code, 0)
+        self.assertIn("admission policy source=default", out.getvalue())
+        self.assertIn("verdict=ADMIT", out.getvalue())
+        # No send, no ledger write: neither the delivery file nor the
+        # event ledger copy was ever born.
+        self.assertFalse(os.path.exists(cfg["delivery_path"]))
+        self.assertFalse(os.path.exists(cfg["ledger_path"]))
+        # Usage errors: a relative path, an absent file, and the
+        # --watch combination are all exit 2.
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                notify_dispatcher._main(
+                    ["--config", path, "--admission-report",
+                     "relative.jsonl"]), 2)
+            self.assertEqual(
+                notify_dispatcher._main(
+                    ["--config", path, "--admission-report",
+                     "/absent/events.jsonl"]), 2)
+            self.assertEqual(
+                notify_dispatcher._main(
+                    ["--config", path, "--watch", events_path,
+                     "--admission-report", events_path]), 2)
+        # A torn file (no LF) is a ledger fault: fail-closed exit 4.
+        torn = os.path.join(self.tmp, "torn.hcj.jsonl")
+        with open(torn, "w", encoding="utf-8") as f:
+            f.write(json.dumps(make_event(), separators=(",", ":")))
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(
+                notify_dispatcher._main(
+                    ["--config", path, "--admission-report", torn]), 4)
+        self.assertIn("partial line", err.getvalue())
 
 
 class TestResidentProcess(Base):
