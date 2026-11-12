@@ -88,6 +88,16 @@ python3.13 tools/api/serve.py \
   위임된다. 플랫폼 ingress 뒤가 아닌 0.0.0.0(또는 그 외 비루프백
   인터페이스 주소)의 인터넷 직접 노출은 이 계약 위반이다. 로컬
   운영은 기본값을 쓴다(옵션 없음 = 루프백만).
+- **Private Home Server VS-1(`hongscanner-srv`) 운영도 기본 루프백 바인드(`127.0.0.1:8080`)를 그대로 유지한다.**
+  `serve.py`에 `--bind <tailscale-ip>`나 `--bind 0.0.0.0`을 주지 않음으로써
+  부팅 시 `tailscaled` 인터페이스 준비 전 기동 경합으로 인한
+  `EADDRNOTAVAIL`(exit 4) 실패와 LAN 비인증 노출을 원천 차단한다.
+  헤드리스 재부팅 후 사용자 세션 자동 복구는 호스트의
+  `loginctl enable-linger` (`Linger=yes`)가 담당하고, 원격 TLS 종료와
+  접근 통제는 호스트 실행 어댑터인
+  `tailscale serve --bg --https=443 http://127.0.0.1:8080`과 Tailscale
+  Grants(`"acls": []`, `sm-s938n -> tag:hongscanner-srv` `tcp:443`,
+  Funnel 비활성)에 위임한다(ASSUMPTIONS I10).
 - 기동에 성공하면 stdout에 한 줄 `SERVE <바인드주소>:<port>`를 찍고
   flush한다 — 주소는 OS가 확인한 실제 바인딩이다. 스크립트는 이 줄로
   실제 주소와 포트를 읽는다.
@@ -691,10 +701,16 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
 
 1. **바인딩**: 기본 127.0.0.1(옵션 없음 = 루프백만). `--bind`는 IPv4
    유니캐스트와 0.0.0.0만 수용하고 멀티캐스트·브로드캐스트·예약
-   블록·비IPv4 문자열은 사용법 오류(exit 2)로 거부한다. `0.0.0.0`은
-   Northflank ingress 뒤 컨테이너 전용이며 접근 통제는 플랫폼 Basic
-   Auth에 위임한다 — 직접 공개 금지. 이 API 자체는 인증을 갖지
-   않는다.
+   블록·비IPv4 문자열은 사용법 오류(exit 2)로 거부한다. Private Home
+   Server VS-1(`hongscanner-srv`)은 `serve.py`를 기본 `127.0.0.1:8080`
+   루프백 바인드로 유지해 부팅 시 `tailscaled` 인터페이스 준비 전
+   `EADDRNOTAVAIL`(exit 4) 경합과 LAN 노출을 차단하고, 헤드리스 부팅
+   복구는 `loginctl enable-linger` (`Linger=yes`)에, TLS 종료와 접근
+   통제는 호스트 실행 어댑터인 `tailscale serve` + Tailscale Grants
+   (`"acls": []`, `sm-s938n -> tag:hongscanner-srv` `tcp:443`, Funnel
+   비활성)에 위임한다. `0.0.0.0`은 Northflank ingress 뒤 컨테이너
+   전용이며 접근 통제는 플랫폼 Basic Auth에 위임한다 — 직접 공개 금지.
+   이 API 자체는 인증을 갖지 않는다.
 2. **GET 전용**: 쓰기 경로·POST·PUT·DELETE·PATCH·HEAD·OPTIONS는 전부
    405다. 쓰기 엔드포인트는 존재하지 않는다.
 3. **식별자 검증**: `{event_id}`는 `^[0-9a-f]{64}$`, `{session}`은
@@ -757,9 +773,15 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
 
 ## 7. 범위 밖
 
-- 인증·TLS·WireGuard 앞단 — 별도 계획 없이는 없다(기준안 §8). 원격
-  노출은 이 API 프로세스의 기능이 아니라 플랫폼 ingress(§1)의
-  역할이며, 그 계약 없는 직접 노출은 금지다.
+- 인증·TLS·WireGuard 앞단 — 이 API 프로세스 자체에는 없다(기준안 §8).
+  원격 노출은 `serve.py`의 기능이 아니라 호스트/플랫폼 실행 어댑터(§1)의
+  역할이다: Private Home Server VS-1(`hongscanner-srv`)에서는 `serve.py`가
+  기본 `127.0.0.1:8080` 루프백에만 바인드하고(부팅 시 `EADDRNOTAVAIL`
+  exit 4 경합 및 LAN 노출 방지) `tailscale serve --bg --https=443
+  http://127.0.0.1:8080` + Tailscale Grants(`"acls": []`, `sm-s938n ->
+  tag:hongscanner-srv` `tcp:443`, Funnel 비활성)가 호스트 수준 TLS·접근
+  통제 실행 어댑터를 맡으며, 유예된 클라우드 경로에서는 Northflank
+  ingress가 맡는다. 그 계약 없는 직접 노출은 금지다.
 - 페이지네이션·정렬 옵션·커서 — 개인용 규모에서 요청 시 재검토.
   모바일 규모의 답은 이미 계약돼 있다: §3.7의 유계 투영(아이템 수·
   필드가 유계라 응답 ≤ 64 KiB)이다. 다른 라우트의 페이지네이션은
@@ -768,5 +790,8 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   시장 사전 폴드는 기록 바이트의 순수 파생이라 (path, size, mtime_ns) 키로
   프로세스 내 메모이제이션된다(§1·§3.7의 게시 조건과 한계 참조). ETag·
   압축은 여전히 없다.
-- 데몬화·systemd·자동 기동·헬스체크 인프라 — 명시적 시작만 계약이다.
+- 데몬화·systemd·자동 기동·헬스체크 인프라 — `serve.py` 자체는 명시적
+  시작만 계약이다(Private Home Server VS-1의 헤드리스 부팅 복구는
+  프로세스 밖 호스트 실행 어댑터인 `systemd --user` +
+  `loginctl enable-linger` (`Linger=yes`)가 담당한다).
 - 판정·replay·verify 실행 — 이 프로세스의 역할이 영원히 아니다.
