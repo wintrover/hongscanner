@@ -280,7 +280,7 @@ class MainActivity : FlutterActivity() {
         private const val MARKET_DIGEST_CHANNEL_ID = "market_rank_digest"
         private const val MARKET_DIGEST_CHANNEL_NAME = "시장 순위 요약"
         private const val MARKET_DIGEST_CHANNEL_DESCRIPTION =
-            "관측 그룹별 TOP10 순위 요약 다이제스트 (무음)"
+            "같은 관측 시점의 TOP10 순위 변경을 묶은 무음 요약"
         private const val METHOD_CHANNEL = "hongscanner/market_alert"
         private const val TAP_EVENT_ID_KEY = "event_id"
         private const val TAP_EVENT_IDS_KEY = "event_ids"
