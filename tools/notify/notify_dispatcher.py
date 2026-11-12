@@ -2,30 +2,42 @@
 """notify_dispatcher: the VS-3 notification dispatcher (PR-5).
 
 Contract: tools/notify/README.md; delivery.schema.json; docs/
-REPLAY_CONTRACT.md §13. The dispatcher is transport only: it filters,
-orders and translates events for delivery (§13.1) — it never judges,
-upgrades or rewrites a fact.
+REPLAY_CONTRACT.md §13; docs/ASSUMPTIONS.md P28 (admission). The
+dispatcher is transport only: it filters, orders and translates events
+for delivery (§13.1) — it never judges, upgrades or rewrites a fact.
+The admission gate decides only the DELIVERY policy of a fact (which
+channel, batched or alone, or never); the fact itself is always the
+Core's authoritative output, unchanged.
 
 Two modes (README §0/§1/§11):
 
 One-shot sweep (default; the backward-compatible form):
   1. read the event ledger (read-only; a concurrently-appending tail is
      skipped, never half-consumed);
-  2. apply the notification policy — the event-type allowlist
-     (NOTIFIABLE_EVENT_TYPES: the market TOP10 rank transitions
-     TOP10_ENTERED / TOP10_EXITED / RANK_CHANGED). A fact's severity
-     is its operational importance, never a send decision: every
-     other event type (faults, replay, session lifecycle included)
-     is recorded in the ledgers and never pushed;
+  2. apply the notification policy — the admission gate
+     (notify_config.admission_mode, plan B by default):
+     TOP10_ENTERED / TOP10_EXITED -> "immediate" (sound channel),
+     RANK_CHANGED -> "digest" (silent channel), every other event
+     type (faults, replay, session lifecycle included) -> "suppress"
+     — recorded in the ledgers and never pushed (the old type_skipped
+     meaning, same counter). Severity is a fact field, never a send
+     decision;
   3. suppress duplicates: an ACCEPTED (event_id, device_id) pair is
      never sent again; a FAILED pair is terminal (UNREGISTERED token,
      SENDER_ID_MISMATCH config error, unknown permanent codes);
-  4. send one FCM HTTP v1 notification+data message per remaining pair;
-  5. append one delivery record per outcome (PENDING on retryable
-     failures, ACCEPTED / FAILED otherwise) — append-only, fsynced, so
-     a crash between send and record replays the send on restart:
-     the device may receive a duplicate push. That is FCM reality, not
-     a bug, and the app identifies duplicates by event_id (README §6).
+  4. compose the send units per observation group ((observed_at,
+     device_id); README §0/§6): the group's immediate events share ONE
+     sound message — kind "single" when alone (the exact per-event
+     message form), kind "summary" when two or more — and the group's
+     digest events ONE silent message (kind "digest"): a group never
+     costs more than one sound + one silent push;
+  5. append one delivery record per covered event and outcome
+     (PENDING on retryable failures, ACCEPTED / FAILED otherwise;
+     every record carries message_kind, digest members share the
+     provider_message_id) — append-only, fsynced, so a crash between
+     send and record replays the send on restart: the device may
+     receive a duplicate push. That is FCM reality, not a bug, and the
+     app identifies duplicates by event_id (README §6).
      accepted != delivered: HTTP 200 proves provider acceptance only.
 
 Resident watch (--watch <abs events file>): the process stays alive and
@@ -50,6 +62,15 @@ the event ledger is opened with the writer lock). Each tick
      in-sweep sleep): a 429 Retry-After wait never delays a new event.
      Nothing is parked — the resident worker resumes its own pairs.
 
+Admission report (--admission-report <abs events file>): the replay
+tool (README §9) — no send, no ledger write. The first line states the
+policy source (the config admission section or the default plan B —
+an absent section is never conflated with a configured one) and the
+full mapping; then every fact of the file judged with THE SAME
+admission code the dispatch path uses, one verdict line per event, the
+per-observation-group send plan and the totals. The same file + policy
+always print the same bytes.
+
 SIGTERM/SIGINT request a clean stop: the current tick finishes, the
 single-writer locks are released and the process exits 0. All stdout
 lines of the resident mode carry an ISO timestamp prefix.
@@ -59,7 +80,10 @@ Retry classes (vendor table, tools/notify/README.md §5):
   failure -> stay PENDING, backoff >= max(retry_min_seconds, Retry-After):
   the one-shot sweep retries in-sweep while the wait is within
   backoff_cap_seconds and parks PENDING otherwise (external scheduler
-  resumes); the resident watch defers the pair and keeps serving;
+  resumes); the resident watch defers the pair and keeps serving. A
+  deferred UNIT is reassembled with exactly the same members on the
+  next pass (all members share one next_due — partial delivery of a
+  group is impossible: one message covers the whole unit or nothing);
   404 UNREGISTERED (the REST wire spells it NOT_FOUND — google.rpc
   canonical name for 404; classify_send retires on either) -> FAILED,
   token retired in the registry, no retry;
@@ -68,10 +92,10 @@ Retry classes (vendor table, tools/notify/README.md §5):
   exits 3 — a config error is never a clean success;
   everything else -> FAILED with the provider's status kept verbatim.
 
-Exit codes (README §9): 0 sweep completed / clean shutdown, 2
-usage/config violation, 3 credential failure or fail-closed sender
-mismatch, 4 single-writer conflict / internal fault / ledger contract
-violation (watched file shrank).
+Exit codes (README §9): 0 sweep completed / clean shutdown / report
+printed, 2 usage/config violation, 3 credential failure or fail-closed
+sender mismatch, 4 single-writer conflict / internal fault / ledger
+contract violation (watched file shrank, torn report input).
 """
 
 import json
@@ -84,13 +108,40 @@ import notify_config
 import notify_fcm
 import notify_ledger
 
-# The delivery policy's event-type allowlist (README §0/§6): only the
-# market TOP10 rank transitions are pushed. Severity is a fact field —
-# operational importance — and never gates delivery. The set is
-# notify_fcm's TOP10_EVENT_TYPES so the policy and the message
-# assembly share one truth: a fourth notifiable type changes both
-# together or neither.
+# The delivery policy's event-type universe (README §0/§6): only the
+# market TOP10 rank transitions can be admitted (immediate/digest);
+# every other type is suppress. The set is notify_fcm's
+# TOP10_EVENT_TYPES so the policy, the message assembly and
+# notify_config's admission validation share one truth: a fourth
+# notifiable type changes all of them together or neither.
 NOTIFIABLE_EVENT_TYPES = notify_fcm.TOP10_EVENT_TYPES
+
+
+def compose_admission_units(events, cfg):
+    """The admission send plan for ONE observation group (same
+    observed_at, same device; README §0): the events the policy judges
+    "immediate" become ONE sound unit — kind "single" when the event is
+    alone, "summary" when two or more — and the "digest" events ONE
+    silent unit (kind "digest"); a group never yields more than one
+    sound + one silent unit. Ledger order is preserved inside each unit
+    and the sound unit precedes the silent one. THE SAME function plans
+    the dispatcher's sends and the admission report's output: replay
+    composes exactly what production composes."""
+    immediate = []
+    digest = []
+    for event in events:
+        mode = notify_config.admission_mode(cfg, event["event_type"])
+        if mode == "immediate":
+            immediate.append(event)
+        elif mode == "digest":
+            digest.append(event)
+    units = []
+    if immediate:
+        units.append(("single" if len(immediate) == 1 else "summary",
+                      immediate))
+    if digest:
+        units.append(("digest", digest))
+    return units
 
 
 class Dispatcher:
@@ -139,12 +190,18 @@ class Dispatcher:
 
     def _candidates(self, events, state, devices):
         """The worklist in deterministic order (ledger order, then
-        sorted device id), after the policy filter and dedup. Counters
-        record what the policy and the suppression removed."""
+        sorted device id), after the admission filter and dedup.
+        Counters record what the policy and the suppression removed:
+        type_skipped counts every fact the policy judges suppress —
+        types outside the admission universe and types the config maps
+        to suppress alike (the old type filter's meaning, same
+        counter)."""
         notifyable = 0
         pairs = []
         for event in events:
-            if event["event_type"] not in NOTIFIABLE_EVENT_TYPES:
+            if notify_config.admission_mode(self.cfg,
+                                            event["event_type"]) == \
+                    "suppress":
                 continue
             notifyable += 1
             for device_id in sorted(devices):
@@ -169,7 +226,7 @@ class Dispatcher:
     # ------------------------------------------------------- delivery
 
     def _record(self, event, device_id, state, attempts, error_code=None,
-                provider_message_id=None):
+                provider_message_id=None, message_kind=None):
         record = {
             "attempts": attempts,
             "device_id": device_id,
@@ -181,76 +238,121 @@ class Dispatcher:
             record["error_code"] = error_code
         if provider_message_id is not None:
             record["provider_message_id"] = provider_message_id
+        if message_kind is not None:
+            record["message_kind"] = message_kind
         self.delivery.append(record)  # validates before it writes
         return record
 
-    def _attempt(self, event, device_id, token, attempts, state):
-        """One send + one honest record. The appended record becomes the
-        pair's current state in `state` (append-only: the last record
-        per pair IS the state). Returns (kind, next_wait)."""
-        pair = (event["event_id"], device_id)
+    def _attempt_unit(self, unit, token, state):
+        """One send + honest records for every covered event. The unit
+        (README §0/§6) is the delivery granularity: one FCM message
+        covers ALL its events, so every outcome is recorded once per
+        member event — a group's members share the provider message
+        id — and a retryable failure defers every member together
+        (partial delivery of a group is impossible: the message covers
+        the whole unit or nothing). Returns (outcome_kind, next_wait).
+        """
+        msg_kind = unit["kind"]
+        events = unit["events"]
+        device_id = unit["device_id"]
+        bases = []
+        for event in events:
+            record = state.get((event["event_id"], device_id))
+            bases.append(record["attempts"] if record else 0)
+
+        def tag():
+            # The single unit keeps the historical log line shape
+            # (event/attempts); group units identify themselves.
+            if msg_kind == "single":
+                return "event=%s device=%s" % (events[0]["event_id"],
+                                               device_id)
+            return "kind=%s count=%d first=%s device=%s" % (
+                msg_kind, len(events), events[0]["event_id"], device_id)
+
+        def record_all(delivery_state, error_code=None,
+                       provider_message_id=None):
+            for event, base in zip(events, bases):
+                state[(event["event_id"], device_id)] = self._record(
+                    event, device_id, delivery_state, base + 1,
+                    error_code=error_code,
+                    provider_message_id=provider_message_id,
+                    message_kind=msg_kind)
+
         try:
-            message = notify_fcm.build_message(event, token)
+            if msg_kind == "single":
+                message = notify_fcm.build_message(events[0], token)
+            elif msg_kind == "summary":
+                message = notify_fcm.build_summary_message(events, token)
+            else:
+                message = notify_fcm.build_digest_message(events, token)
         except notify_fcm.FcmError:
             # Refused before send (payload limit): a permanent scanner
-            # refusal, recorded honestly (HS_ codes are synthetic).
-            state[pair] = self._record(event, device_id, "FAILED",
-                                       attempts + 1,
-                                       error_code="HS_PAYLOAD_OVER_LIMIT")
+            # refusal, recorded honestly for every covered event
+            # (HS_ codes are synthetic).
+            record_all("FAILED", error_code="HS_PAYLOAD_OVER_LIMIT")
             self.counts["failed_permanent"] = \
-                self.counts.get("failed_permanent", 0) + 1
-            self._log("dispatch result=permanent event=%s device=%s "
-                      "attempts=%d status=- error=HS_PAYLOAD_OVER_LIMIT"
-                      % (event["event_id"], device_id, attempts + 1))
+                self.counts.get("failed_permanent", 0) + len(events)
+            self._log("dispatch result=permanent %s status=- "
+                      "error=HS_PAYLOAD_OVER_LIMIT" % tag())
             return "permanent", None
 
         if self._resident:
             # Post-observability: one timestamped line when the POST is
             # initiated, so start/answer times are measurable from the
             # log (the result line format below is unchanged).
-            self._log("dispatch attempt_start event=%s device=%s "
-                      "attempts=%d" % (event["event_id"], device_id,
-                                       attempts + 1))
+            if msg_kind == "single":
+                self._log("dispatch attempt_start %s attempts=%d"
+                          % (tag(), bases[0] + 1))
+            else:
+                self._log("dispatch attempt_start %s" % tag())
         outcome = notify_fcm.send_message(self.project_id,
                                           self.tokens.get(self._clock()),
                                           message, opener=self.opener)
-        attempts += 1
 
         if outcome.kind == "accepted":
-            state[pair] = self._record(
-                event, device_id, "ACCEPTED", attempts,
-                provider_message_id=outcome.provider_message_id)
-            self.counts["accepted"] = self.counts.get("accepted", 0) + 1
-            self._log("dispatch result=accepted event=%s device=%s "
-                      "attempts=%d status=200 message=%s" %
-                      (event["event_id"], device_id, attempts,
-                       outcome.provider_message_id))
+            record_all("ACCEPTED",
+                       provider_message_id=outcome.provider_message_id)
+            self.counts["accepted"] = \
+                self.counts.get("accepted", 0) + len(events)
+            if msg_kind == "single":
+                self._log("dispatch result=accepted %s attempts=%d "
+                          "status=200 message=%s" %
+                          (tag(), bases[0] + 1,
+                           outcome.provider_message_id))
+            else:
+                self._log("dispatch result=accepted %s status=200 "
+                          "message=%s" % (tag(),
+                                          outcome.provider_message_id))
             return "accepted", None
 
         if outcome.kind == "unregistered":
             # The vendor's answer: remove this token from the server and
-            # stop sending to it — the delivery is terminal FAILED and
-            # the token is retired (hash only) in the registry.
-            state[pair] = self._record(event, device_id, "FAILED",
-                                       attempts,
-                                       error_code=outcome.error_code)
+            # stop sending to it — the delivery is terminal FAILED for
+            # every covered event and the token is retired (hash only)
+            # in the registry, once for the unit.
+            record_all("FAILED", error_code=outcome.error_code)
             self.registry.mark_invalid(device_id, token)
             self.counts["token_retired"] = \
                 self.counts.get("token_retired", 0) + 1
-            self._log("dispatch result=unregistered event=%s device=%s "
-                      "attempts=%d status=%d error=%s token=%s" %
-                      (event["event_id"], device_id, attempts,
-                       outcome.http_status, outcome.error_code,
-                       notify_ledger.mask_secret(token)))
+            if msg_kind == "single":
+                self._log("dispatch result=unregistered %s attempts=%d "
+                          "status=%d error=%s token=%s" %
+                          (tag(), bases[0] + 1, outcome.http_status,
+                           outcome.error_code,
+                           notify_ledger.mask_secret(token)))
+            else:
+                self._log("dispatch result=unregistered %s status=%d "
+                          "error=%s token=%s" %
+                          (tag(), outcome.http_status, outcome.error_code,
+                           notify_ledger.mask_secret(token)))
             return "unregistered", None
 
         if outcome.kind == "sender_mismatch":
             # Fail-closed: a configuration error (the authenticated
-            # sender is not a sender of this token). No retry, an honest
-            # FAILED record, and exit 3 — never a clean success.
-            state[pair] = self._record(event, device_id, "FAILED",
-                                       attempts,
-                                       error_code=outcome.error_code)
+            # sender is not a sender of this token). No retry, honest
+            # FAILED records for every covered event, and exit 3 —
+            # never a clean success.
+            record_all("FAILED", error_code=outcome.error_code)
             self.mismatch_seen = True
             self.counts["sender_mismatch"] = \
                 self.counts.get("sender_mismatch", 0) + 1
@@ -260,33 +362,45 @@ class Dispatcher:
                   "retry (fail-closed)" %
                   (device_id, notify_ledger.mask_secret(token)),
                   file=sys.stderr)
-            self._log("dispatch result=sender_mismatch event=%s "
-                      "device=%s attempts=%d status=%d error=%s" %
-                      (event["event_id"], device_id, attempts,
-                       outcome.http_status, outcome.error_code))
+            if msg_kind == "single":
+                self._log("dispatch result=sender_mismatch %s attempts=%d "
+                          "status=%d error=%s" %
+                          (tag(), bases[0] + 1, outcome.http_status,
+                           outcome.error_code))
+            else:
+                self._log("dispatch result=sender_mismatch %s status=%d "
+                          "error=%s" % (tag(), outcome.http_status,
+                                        outcome.error_code))
             return "sender_mismatch", None
 
         if outcome.kind == "retry":
-            state[pair] = self._record(event, device_id, "PENDING",
-                                       attempts)
+            record_all("PENDING")
             self.counts["retried_pending"] = \
-                self.counts.get("retried_pending", 0) + 1
+                self.counts.get("retried_pending", 0) + len(events)
             wait = max(self.retry_min, outcome.retry_after_seconds or 0)
-            self._log("dispatch result=retry event=%s device=%s "
-                      "attempts=%d status=%s error=%s wait=%ds" %
-                      (event["event_id"], device_id, attempts,
-                       outcome.http_status, outcome.error_code, wait))
+            if msg_kind == "single":
+                self._log("dispatch result=retry %s attempts=%d status=%s "
+                          "error=%s wait=%ds" %
+                          (tag(), bases[0] + 1, outcome.http_status,
+                           outcome.error_code, wait))
+            else:
+                self._log("dispatch result=retry %s status=%s error=%s "
+                          "wait=%ds" % (tag(), outcome.http_status,
+                                        outcome.error_code, wait))
             return "retry", wait
 
         # permanent: any other provider answer, kept verbatim.
-        state[pair] = self._record(event, device_id, "FAILED", attempts,
-                                   error_code=outcome.error_code)
+        record_all("FAILED", error_code=outcome.error_code)
         self.counts["failed_permanent"] = \
-            self.counts.get("failed_permanent", 0) + 1
-        self._log("dispatch result=permanent event=%s device=%s "
-                  "attempts=%d status=%s error=%s" %
-                  (event["event_id"], device_id, attempts,
-                   outcome.http_status, outcome.error_code))
+            self.counts.get("failed_permanent", 0) + len(events)
+        if msg_kind == "single":
+            self._log("dispatch result=permanent %s attempts=%d status=%s "
+                      "error=%s" % (tag(), bases[0] + 1,
+                                    outcome.http_status,
+                                    outcome.error_code))
+        else:
+            self._log("dispatch result=permanent %s status=%s error=%s"
+                      % (tag(), outcome.http_status, outcome.error_code))
         return "permanent", None
 
     def _log(self, line):
@@ -297,38 +411,70 @@ class Dispatcher:
 
     # ---------------------------------------------------------- sweep
 
+    def _plan_units(self, due):
+        """The send units for the due pairs, deterministically: group
+        by (observed_at, device_id) in ledger first-appearance order,
+        then compose_admission_units per group (sound before silent
+        within a group). The grouping is derived from the ledger on
+        every pass, so a deferred unit is reassembled with exactly the
+        same members (members of one group share one next_due and can
+        never drift into different passes)."""
+        groups = {}
+        order = []
+        for event, device_id in due:
+            key = (event["observed_at"], device_id)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(event)
+        units = []
+        for key in order:
+            for msg_kind, events in compose_admission_units(
+                    groups[key], self.cfg):
+                units.append({"kind": msg_kind, "device_id": key[1],
+                              "events": events})
+        return units
+
     def sweep_pass(self, pairs, state, token_by_device, next_due,
                    park_beyond_cap=True):
-        """One pass over the worklist: send every pair whose retry is
-        due at the current clock reading, in worklist order; returns
-        the number of attempts made. A retryable outcome defers its
-        pair: next_due = now + wait. With park_beyond_cap (the one-shot
+        """One pass over the worklist: the due pairs are composed into
+        observation-group send units (README §0/§6) and every unit is
+        sent; returns the number of MESSAGES attempted (a unit is one
+        message). A retryable outcome defers EVERY member of the unit
+        to the same next_due (one clock reading) — partial delivery of
+        a group is impossible. With park_beyond_cap (the one-shot
         scheduler resume) a wait beyond backoff_cap_seconds parks the
-        pair (next_due None, the record stays PENDING) instead; the
+        unit (next_due None, the records stay PENDING) instead; the
         resident worker passes False — it is its own resume, nothing
         is parked."""
         now = self._clock()
-        sent = 0
+        due = []
         for event, device_id, _attempts in pairs:
             pair = (event["event_id"], device_id)
             due_at = next_due.get(pair)
             if due_at is None or due_at > now:
                 continue
-            record = state.get(pair)
-            base = record["attempts"] if record else 0
-            kind, wait = self._attempt(event, device_id,
-                                       token_by_device[device_id],
-                                       base, state)
+            due.append((event, device_id))
+        sent = 0
+        for unit in self._plan_units(due):
+            device_id = unit["device_id"]
+            kind, wait = self._attempt_unit(unit,
+                                            token_by_device[device_id],
+                                            state)
             sent += 1
             if kind == "retry" and wait is not None and \
                (not park_beyond_cap or wait <= self.backoff_cap):
-                next_due[pair] = self._clock() + wait
+                due_again = self._clock() + wait
+                for event in unit["events"]:
+                    next_due[(event["event_id"], device_id)] = due_again
                 continue
             if kind == "retry":
                 # Beyond the cap (one-shot): parked for external resume.
                 self.counts["pending_parked"] = \
-                    self.counts.get("pending_parked", 0) + 1
-            next_due[pair] = None
+                    self.counts.get("pending_parked", 0) + \
+                    len(unit["events"])
+            for event in unit["events"]:
+                next_due[(event["event_id"], device_id)] = None
         return sent
 
     def sweep(self):
@@ -466,11 +612,14 @@ class Dispatcher:
     def dispatch_tick(self):
         """One resident dispatch pass (README §5): re-read the small
         state files, extend the schedule with the pairs not seen
-        before, and send what is due now. A retryable answer defers
-        its pair (next_due = now + wait) — the wait is spent BETWEEN
-        ticks, never in-sweep, so a 429 Retry-After wait never delays
-        a new event; nothing is parked: the resident worker resumes
-        its own pairs. Returns the number of attempts made."""
+        before, and send what is due now — the due pairs composed into
+        observation-group send units (one message per unit; a
+        retryable answer defers every member of the unit to the same
+        next_due = now + wait, one clock reading). The wait is spent
+        BETWEEN ticks, never in-sweep, so a 429 Retry-After wait never
+        delays a new event; nothing is parked: the resident worker
+        resumes its own pairs. Returns the number of MESSAGES
+        attempted."""
         state = self.delivery.read_state()
         events = self.ledger.events(strict=False)
         devices = self.registry.devices()
@@ -482,7 +631,8 @@ class Dispatcher:
                 next_due[pair] = 0.0
         sent = self.sweep_pass(pairs, state, dict(devices), next_due,
                                park_beyond_cap=False)
-        self.counts["pairs_sent"] = self.counts.get("pairs_sent", 0) + sent
+        self.counts["messages_sent"] = \
+            self.counts.get("messages_sent", 0) + sent
         return sent
 
 
@@ -497,6 +647,136 @@ def _install_signal_handlers(dispatcher):
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _request_stop)
+
+
+# ----------------------------------------------------- admission report
+
+
+def admission_report(cfg, events_path):
+    """The admission replay tool (README §9; docs/ASSUMPTIONS.md P28):
+    read an events file, judge EVERY fact with the same admission code
+    the dispatch path uses (notify_config.admission_mode,
+    compose_admission_units), and print — the policy source FIRST (the
+    config admission section or the default plan B, stated as such: an
+    absent section is never conflated with a configured one), one
+    verdict line per fact (file order), then per observation group the
+    send summary and the composed message plan (title/body/event_ids —
+    the exact composition the dispatcher would send), then the totals.
+    No send, no ledger write, no clock: the same file + policy always
+    prints the same bytes. A plan whose composed payload would exceed
+    the vendor limit is printed as refused (the same
+    HS_PAYLOAD_OVER_LIMIT refusal the dispatcher records) — never a
+    silently truncated composition. Returns 0."""
+    ledger = notify_ledger.EventLedger(events_path, lock=False)
+    try:
+        events = ledger.events(strict=True)
+    finally:
+        ledger.close()
+
+    groups = {}
+    order = []
+    for event in events:
+        key = event["observed_at"]
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(event)
+
+    plans = []
+    forms = {}
+    for key in order:
+        group_plans = []
+        for msg_kind, unit_events in compose_admission_units(
+                groups[key], cfg):
+            plan = {"kind": msg_kind, "count": len(unit_events),
+                    "event_ids": [event["event_id"]
+                                  for event in unit_events]}
+            for event in unit_events:
+                forms[event["event_id"]] = msg_kind
+            try:
+                if msg_kind == "single":
+                    message = notify_fcm.build_message(unit_events[0], "")
+                elif msg_kind == "summary":
+                    message = notify_fcm.build_summary_message(
+                        unit_events, "")
+                else:
+                    message = notify_fcm.build_digest_message(
+                        unit_events, "")
+                plan["title"] = \
+                    message["message"]["notification"]["title"]
+                plan["body"] = message["message"]["notification"]["body"]
+            except notify_fcm.FcmError:
+                # The same refusal class the dispatcher records for an
+                # oversized composition: fail-closed, never truncated.
+                plan["refused"] = "HS_PAYLOAD_OVER_LIMIT"
+            group_plans.append(plan)
+        plans.append((key, group_plans))
+
+    verdicts = {"ADMIT": 0, "DIGEST": 0, "SUPPRESS": 0}
+    lines = []
+    for event in events:
+        event_type = event["event_type"]
+        mode = notify_config.admission_mode(cfg, event_type)
+        if mode == "immediate":
+            verdict = "ADMIT"
+            form = forms.get(event["event_id"], "single")
+        elif mode == "digest":
+            verdict = "DIGEST"
+            form = "digest"
+        else:
+            verdict = "SUPPRESS"
+            form = "not_in_admission" if event_type not in \
+                notify_fcm.TOP10_EVENT_TYPES else "suppress"
+        verdicts[verdict] += 1
+        lines.append("admission event=%s type=%s observed_at=%s "
+                     "verdict=%s form=%s" %
+                     (event["event_id"], event_type,
+                      event["observed_at"], verdict, form))
+
+    sound_total = 0
+    silent_total = 0
+    refused_total = 0
+    for key, group_plans in plans:
+        sound = sum(1 for plan in group_plans
+                    if plan["kind"] in ("single", "summary")
+                    and "refused" not in plan)
+        silent = sum(1 for plan in group_plans
+                     if plan["kind"] == "digest"
+                     and "refused" not in plan)
+        sound_total += sound
+        silent_total += silent
+        lines.append("admission group observed_at=%s events=%d sound=%d "
+                     "silent=%d" % (key, len(groups[key]), sound, silent))
+        for plan in group_plans:
+            if "refused" in plan:
+                refused_total += 1
+                lines.append("admission plan observed_at=%s kind=%s "
+                             "count=%d refused=%s event_ids=%s" %
+                             (key, plan["kind"], plan["count"],
+                              plan["refused"],
+                              ",".join(plan["event_ids"])))
+            else:
+                lines.append("admission plan observed_at=%s kind=%s "
+                             "count=%d title=%s body=%s event_ids=%s" %
+                             (key, plan["kind"], plan["count"],
+                              plan["title"], plan["body"],
+                              ",".join(plan["event_ids"])))
+    lines.append("admission total events=%d groups=%d sound=%d silent=%d "
+                 "admit=%d digest=%d suppress=%d refused=%d" %
+                 (len(events), len(order), sound_total, silent_total,
+                  verdicts["ADMIT"], verdicts["DIGEST"],
+                  verdicts["SUPPRESS"], refused_total))
+    # The first line states WHICH policy decided — the config admission
+    # section or the default plan B — and the full mapping, so an
+    # absent section is never mistaken for a configured one.
+    source = cfg.get("admission_source",
+                     "config" if "admission" in cfg else "default")
+    mapping = notify_config.effective_admission(cfg)
+    lines.insert(0, "admission policy source=%s %s" % (source, " ".join(
+        "%s=%s" % (et, mapping[et]) for et in sorted(mapping))))
+    for line in lines:
+        print(line, flush=True)
+    return 0
 
 
 def _main(argv):
@@ -514,18 +794,50 @@ def _main(argv):
                              "complete lines into the event ledger and "
                              "run one dispatch pass per tick until "
                              "SIGTERM/SIGINT (README §1/§11)")
+    parser.add_argument("--admission-report", metavar="EVENTS_FILE",
+                        default=None,
+                        help="replay tool: judge every fact of this "
+                             "events file (absolute path) with the SAME "
+                             "admission code the dispatch path uses and "
+                             "print the verdicts, the per-observation-"
+                             "group send plan and the totals — no send, "
+                             "no ledger write; byte-identical for the "
+                             "same file + policy (README §0/§9)")
     args = parser.parse_args(argv)
 
     if args.watch and not os.path.isabs(args.watch):
         print("dispatcher: --watch needs an absolute path (got %r)"
               % args.watch, file=sys.stderr)
         return 2
+    if args.admission_report:
+        if args.watch:
+            print("dispatcher: --admission-report replays a file; it "
+                  "cannot run together with --watch", file=sys.stderr)
+            return 2
+        if not os.path.isabs(args.admission_report):
+            print("dispatcher: --admission-report needs an absolute "
+                  "path (got %r)" % args.admission_report, file=sys.stderr)
+            return 2
 
     try:
         cfg = notify_config.load_config(args.config, "dispatch")
     except notify_config.ConfigError as exc:
         print("dispatcher: config refused: %s" % exc, file=sys.stderr)
         return 2
+
+    if args.admission_report:
+        # No Dispatcher is constructed: the report sends nothing and
+        # writes no ledger — it only needs the validated policy.
+        if not os.path.isfile(args.admission_report):
+            print("dispatcher: --admission-report file not found: %s"
+                  % args.admission_report, file=sys.stderr)
+            return 2
+        try:
+            return admission_report(cfg, args.admission_report)
+        except (notify_ledger.LedgerBusy, notify_ledger.LedgerFault,
+                notify_ledger.LedgerError) as exc:
+            print("dispatcher: %s" % exc, file=sys.stderr)
+            return 4
 
     dispatcher = None
     try:

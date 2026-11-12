@@ -43,9 +43,11 @@ The Android priority/channel pages were re-verified 2026-11-11
 - Payload limit: 4096 bytes for most messages, keys and values included.
 - Android priority and channel: every message carries android.priority
   explicitly. The events the dispatcher forwards are the TOP10 rank
-  transitions (notify_dispatcher.NOTIFIABLE_EVENT_TYPES); they are
-  always "high" with android.notification.channel_id
-  "market_rank_changes" — the REST v1 reference: "The app must create
+  transitions (notify_dispatcher.NOTIFIABLE_EVENT_TYPES); the single
+  event message and the multi-event sound summary are always "high"
+  with android.notification.channel_id "market_rank_changes", while
+  the silent digest is "normal" with channel_id "market_rank_digest"
+  (the admission policy's two channels, README §0/§6) — the REST v1 reference: "The app must create
   a channel with this channel ID before any notification with this
   channel ID is received" (the app owns creating that channel; without
   it FCM falls back to the channel id in the app manifest). The
@@ -104,7 +106,14 @@ TOP10_EVENT_TYPES = frozenset(
     ("TOP10_ENTERED", "TOP10_EXITED", "RANK_CHANGED"))
 TOP10_TITLE = "홍스캐너 TOP10 변화"
 TOP10_CHANNEL_ID = "market_rank_changes"
+DIGEST_TITLE = "홍스캐너 TOP10 순위 요약"
+DIGEST_CHANNEL_ID = "market_rank_digest"
 DIRECTION_WORDS = {"UP": "상승", "DOWN": "하락"}
+# The summary body's per-event word: the two immediate TOP10
+# transitions' Korean verbs. A type outside the table (a config-mapped
+# immediate type) uses its own event_type string — never an invented
+# word.
+SUMMARY_WORDS = {"TOP10_ENTERED": "진입", "TOP10_EXITED": "이탈"}
 
 # The SHA-256 DigestInfo prefix of EMSA-PKCS1-v1_5 (RFC 8017 §9.2 note 1):
 # SEQUENCE { SEQUENCE { OID 2.16.840.1.101.3.4.2.1, NULL }, OCTET STRING }.
@@ -390,6 +399,14 @@ def build_message(event, fcm_token):
         message = _top10_message(event, fcm_token)
     else:
         message = _generic_message(event, fcm_token)
+    return _enforce_payload_limit(message)
+
+
+def _enforce_payload_limit(message):
+    """The vendor's 4096-byte payload limit (keys and values included),
+    checked before any send — single, summary and digest messages
+    alike. An oversized group message is REFUSED (the dispatcher
+    records HS_PAYLOAD_OVER_LIMIT), never quietly truncated."""
     size = len(json.dumps(message, ensure_ascii=False,
                           separators=(",", ":")).encode("utf-8"))
     if size > PAYLOAD_LIMIT_BYTES:
@@ -397,6 +414,13 @@ def build_message(event, fcm_token):
                        "(keys and values included)" %
                        (size, PAYLOAD_LIMIT_BYTES))
     return message
+
+
+def _display_of(event):
+    """The notification's display name: the vendor name, falling back
+    to the symbol and (a fact that carries neither, defensively) to
+    the event_type — never an invented name."""
+    return event.get("name") or event.get("symbol") or event["event_type"]
 
 
 def _top10_message(event, fcm_token):
@@ -410,8 +434,7 @@ def _top10_message(event, fcm_token):
     <rank>위", previous only -> "<prev>위 → 후보 제외", neither ->
     no move text (no invented rank). data values are all strings (the
     vendor requires string:string); ints are stringified."""
-    display = event.get("name") or event.get("symbol") or \
-        event["event_type"]
+    display = _display_of(event)
     direction = DIRECTION_WORDS.get(event.get("direction"), "")
     previous = event.get("previous_rank")
     rank = event.get("rank")
@@ -444,6 +467,99 @@ def _top10_message(event, fcm_token):
             "data": data,
         },
     }
+
+
+def build_summary_message(events, fcm_token):
+    """The sound summary for one observation group's immediate events
+    (README §6; docs/ASSUMPTIONS.md P28): two or more TOP10
+    transitions the admission policy judged "immediate" share ONE
+    message, so one observation batch costs at most one sound push.
+    title is TOP10_TITLE; body lists the first two events (ledger
+    order) as "<display> <진입|이탈>" joined with "·", plus " 외 N건"
+    for the remainder — deterministic, never invented. priority stays
+    "high" and the channel market_rank_changes (the sound channel).
+    data carries the mobile contract fields only: kind, event_ids
+    (comma-joined, ledger order) and count — the per-event fields stay
+    on the single message."""
+    body = _summary_body(events)
+    return _enforce_payload_limit({
+        "message": {
+            "token": fcm_token,
+            "notification": {"title": TOP10_TITLE, "body": body},
+            "android": {
+                "priority": "high",
+                "notification": {"channel_id": TOP10_CHANNEL_ID},
+            },
+            "data": {
+                "kind": "summary",
+                "event_ids": ",".join(event["event_id"]
+                                      for event in events),
+                "count": str(len(events)),
+            },
+        },
+    })
+
+
+def _summary_body(events):
+    head = ["%s %s" % (_display_of(event), SUMMARY_WORDS.get(
+        event["event_type"], event["event_type"]))
+        for event in events[:2]]
+    body = "·".join(head)
+    if len(events) > 2:
+        body += " 외 %d건" % (len(events) - 2)
+    return body
+
+
+def build_digest_message(events, fcm_token):
+    """The silent digest for one observation group's digest-classified
+    events (README §6; docs/ASSUMPTIONS.md P28): every event the
+    admission policy judged "digest" in one observation group shares
+    ONE silent message — priority "normal", channel
+    market_rank_digest — so rank churn stays observable without a
+    sound push per change. body names the first event's rank move
+    "<display> <prev>위→<rank>위" plus " 외 N건"; the move text
+    follows the single message's honesty rules (rank only -> "신규
+    진입 <rank>위", previous only -> "<prev>위→후보 제외", neither ->
+    no move text — no invented rank). data carries the full covered
+    event-id list: one tap reaches every fact of the group."""
+    body = _digest_body(events)
+    return _enforce_payload_limit({
+        "message": {
+            "token": fcm_token,
+            "notification": {"title": DIGEST_TITLE, "body": body},
+            "android": {
+                "priority": "normal",
+                "notification": {"channel_id": DIGEST_CHANNEL_ID},
+            },
+            "data": {
+                "kind": "digest",
+                "event_ids": ",".join(event["event_id"]
+                                      for event in events),
+                "count": str(len(events)),
+            },
+        },
+    })
+
+
+def _digest_body(events):
+    first = events[0]
+    body = " ".join(part for part in
+                    (_display_of(first), _digest_move(first)) if part)
+    if len(events) > 1:
+        body += " 외 %d건" % (len(events) - 1)
+    return body
+
+
+def _digest_move(event):
+    previous = event.get("previous_rank")
+    rank = event.get("rank")
+    if previous is not None and rank is not None:
+        return "%d위→%d위" % (previous, rank)
+    if rank is not None:
+        return "신규 진입 %d위" % rank
+    if previous is not None:
+        return "%d위→후보 제외" % previous
+    return ""
 
 
 def _generic_message(event, fcm_token):

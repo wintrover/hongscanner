@@ -34,6 +34,11 @@
       "type": "string",
       "x-ref": "contracts/events/event.schema.json#/properties/event_id"
     },
+    "message_kind": {
+      "description": "Composition kind of the push that covers this event: \"single\" (this event alone in one message), \"summary\" (the sound multi-event message of its observation group's immediate events) or \"digest\" (the silent multi-event message of its observation group's digest events). One message covers many events: every covered event gets its own record and they share the provider_message_id. Absent on records written before the admission policy (docs/ASSUMPTIONS.md P24 evolution rule: absent = pre-contract single send).",
+      "enum": ["single", "summary", "digest"],
+      "type": "string"
+    },
     "provider_message_id": {
       "description": "Provider-assigned message id of the accepted attempt, recorded verbatim. Present only after an ACCEPTED attempt.",
       "minLength": 1,

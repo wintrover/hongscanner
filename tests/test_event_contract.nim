@@ -43,6 +43,7 @@ const
   severities = @["INFO", "HIGH", "CRITICAL"]
   directions = @["UP", "DOWN"]
   deliveryStates = @["PENDING", "ACCEPTED", "FAILED"]
+  messageKinds = @["single", "summary", "digest"]
   eventFields = @["data_quality", "direction", "event_id", "event_type",
                   "evidence_ref", "name", "observed_at", "previous_rank",
                   "rank", "rule_id", "rule_version", "session_id",
@@ -51,7 +52,8 @@ const
                           "evidence_ref", "observed_at", "rule_id",
                           "rule_version", "session_id", "severity"]
   deliveryFields = @["attempts", "device_id", "error_code", "event_id",
-                     "provider_message_id", "state", "updated_at"]
+                     "message_kind", "provider_message_id", "state",
+                     "updated_at"]
   requiredDeliveryFields = @["attempts", "device_id", "event_id", "state",
                              "updated_at"]
   ## The x-event-id-rule pinned at the committed fixture's tuple:
@@ -200,6 +202,10 @@ proc validateDelivery(v: HcjValue): seq[string] =
       let x = v.get(k)
       if x.kind != hkStr or x.strVal.len == 0:
         result.add("delivery: " & k & " is not a non-empty string")
+  if v.has("message_kind"):
+    let x = v.get("message_kind")
+    if x.kind != hkStr or not messageKinds.contains(x.strVal):
+      result.add("delivery: message_kind is not single|summary|digest")
 
 # ---------------------------------------------------------------- builders
 
@@ -318,6 +324,8 @@ block enumCompleteness:
         enumOf(eventSchema, "direction") == directions)
   check("enum: delivery state is PENDING|ACCEPTED|FAILED",
         enumOf(deliverySchema, "state") == deliveryStates)
+  check("enum: message_kind is single|summary|digest",
+        enumOf(deliverySchema, "message_kind") == messageKinds)
   check("schema: the input seq is never an emitted fact field",
         not eventSchema.get("properties").has("transition_seq"))
 
@@ -536,12 +544,31 @@ block eventIdDeterminism:
 # -------------------------------------------------------- delivery record
 
 block deliveryRecord:
+  proc digestDeliveryHcj(): HcjValue =
+    ## A digest-covered event's record: its own (event_id, device_id)
+    ## pair, the shared provider message id and the composition kind.
+    hObj(("attempts", hInt(1)),
+         ("device_id", hStr("hs-device-0001")),
+         ("event_id", hStr(pinnedEventId)),
+         ("message_kind", hStr("digest")),
+         ("provider_message_id",
+          hStr("projects/hong-scanner/messages/8912")),
+         ("state", hStr("ACCEPTED")),
+         ("updated_at", hStr("2026-10-29T09:00:06+09:00")))
   check("delivery: a PENDING record passes structural validation",
         validateDelivery(pendingDeliveryHcj()).len == 0)
   check("delivery: an ACCEPTED record with provider_message_id passes",
         validateDelivery(acceptedDeliveryHcj()).len == 0)
   check("delivery: a FAILED record with error_code passes",
         validateDelivery(failedDeliveryHcj()).len == 0)
+  check("delivery: a digest-covered record with message_kind passes",
+        validateDelivery(digestDeliveryHcj()).len == 0)
+  deliveryRejected("a message_kind outside the enum is rejected",
+             "is not single|summary|digest",
+             proc (): HcjValue =
+               var v = digestDeliveryHcj()
+               setType(v, "message_kind", hStr("bulk"))
+               v)
   deliveryRejected("a state outside the enum is rejected",
              "is not PENDING|ACCEPTED|FAILED",
              proc (): HcjValue =
@@ -611,7 +638,8 @@ block threeStateSeparation:
   let deliveryProps = propNames(deliverySchema)
   const importanceTrust = ["data_quality", "severity"]
   const deliveryFamily = ["state", "attempts", "error_code",
-                          "provider_message_id", "device_id"]
+                          "provider_message_id", "device_id",
+                          "message_kind"]
   const judgmentFields = ["direction", "rank", "rule_id", "rule_version"]
   for f in importanceTrust:
     check("separation: " & f & " is a fact field and never a delivery field",

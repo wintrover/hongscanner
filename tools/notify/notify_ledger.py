@@ -62,7 +62,8 @@ EVENT_OPTIONAL = ("direction", "name", "previous_rank", "rank", "symbol")
 
 DELIVERY_REQUIRED = ("attempts", "device_id", "event_id", "state",
                      "updated_at")
-DELIVERY_OPTIONAL = ("error_code", "provider_message_id")
+DELIVERY_OPTIONAL = ("error_code", "message_kind", "provider_message_id")
+MESSAGE_KINDS = ("single", "summary", "digest")
 
 ID_RE = re.compile(r"^[0-9a-f]{64}$")
 TS_RE = re.compile(
@@ -160,7 +161,10 @@ def validate_delivery(obj):
     """Structural mirror of contracts/events/delivery.schema.json plus
     the documented state pairings: provider_message_id only after an
     ACCEPTED attempt, error_code only after a FAILED attempt, neither
-    while PENDING. Returns the object."""
+    while PENDING. The optional message_kind names the composition of
+    the push that covers the event (single/summary/digest); records
+    written before the admission policy carry none. Returns the
+    object."""
     if not isinstance(obj, dict):
         raise LedgerError("delivery record is not a JSON object")
     unknown = set(obj) - set(DELIVERY_REQUIRED) - set(DELIVERY_OPTIONAL)
@@ -175,6 +179,8 @@ def validate_delivery(obj):
     _check_str(obj, "event_id", ID_RE)
     state = _check_enum(obj, "state", DELIVERY_STATES)
     _check_str(obj, "updated_at", TS_RE)
+    if "message_kind" in obj:
+        _check_enum(obj, "message_kind", MESSAGE_KINDS)
     if state == "ACCEPTED":
         if "error_code" in obj:
             raise LedgerError("delivery ACCEPTED must not carry error_code")

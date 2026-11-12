@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:hongscanner/main.dart';
+import 'package:hongscanner/screens/digest_list_screen.dart';
 import 'package:hongscanner/screens/event_detail_screen.dart';
 import 'package:hongscanner/services/fcm_push_service.dart';
 import 'package:hongscanner/services/market_alert_channel.dart';
@@ -11,16 +12,42 @@ import 'package:hongscanner/state/app_store.dart';
 
 import 'test_kit.dart';
 
-/// Tap-routing tests driven by stub messages. The data payload contract is
-/// {event_id, event_type, severity}; routing keys on event_id only. The
-/// screen transition is a pushed detail route (root navigator), not a tab
+/// Tap-routing tests driven by stub messages. The data payload contract
+/// has three shapes: a single event (`event_id`, …), an immediate
+/// summary and a silent digest (`kind`, `event_ids`, `count` — the
+/// routing keys on the payload shape: an `event_id` routes to the event
+/// detail, a cover list to the digest list view). The screen
+/// transition is a pushed route on the root navigator, not a tab
 /// switch — in store-only tests no navigator exists, so a routed id is
-/// observable as store.pendingEventId until the shell's first-frame flush.
-/// The market-alert group drives the real shell so the OS-notification
-/// posting (MethodChannel "hongscanner/market_alert", mocked via
+/// observable as store.pendingEventId / store.pendingEventIds until
+/// the shell's first-frame flush. The market-alert group drives the
+/// real shell so the OS-notification posting (MethodChannel
+/// "hongscanner/market_alert", mocked via
 /// TestDefaultBinaryMessengerBinding) and its fallbacks are observable
 /// end-to-end.
 void main() {
+  /// The cover list every digest test below uses, and the rows it must
+  /// render: one per covered event, each row the fact's own
+  /// name/direction/rank-change/observed-time.
+  const digestCover = [evTopEnterId, evRankChangeId, evTopExitId];
+  const digestCoverJoined = '$evTopEnterId,$evRankChangeId,$evTopExitId';
+
+  PushMessage digestMessage() => PushMessage.fromData({
+        'kind': 'digest',
+        'event_ids': digestCoverJoined,
+        'count': '3',
+      });
+
+  void expectDigestRows() {
+    expect(find.byType(DigestListScreen), findsOneWidget);
+    // Every covered event is a row — the count equals the cover list.
+    expect(find.byType(ListTile), findsNWidgets(digestCover.length));
+    expect(find.text('삼성전자 · UP · 진입'), findsOneWidget);
+    expect(find.text('SK하이닉스 · DOWN · 5위 → 2위'), findsOneWidget);
+    expect(find.text('삼성전자 · UP · 이탈'), findsOneWidget);
+    expect(find.text('2026-11-02T09:05:11+09:00'), findsOneWidget);
+  }
+
   test('FcmPushService maps a stub RemoteMessage to a PushMessage', () {
     final message = FcmPushService.messageFromRemote(RemoteMessage(data: {
       'event_id': evUpEnterId,
@@ -119,6 +146,41 @@ void main() {
     expect(store.pendingEventId, evDownEnterId);
   });
 
+  test('background digest tap routes the cover list; foreground stays display-only',
+      () async {
+    final push = FakeMessagePushService();
+    final store =
+        makeStore(transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+    final banners = <PushMessage>[];
+    await store.bootstrap(onForegroundMessage: banners.add);
+
+    // Background notification tap on a digest: the cover list routes
+    // (pending — no navigator in a store-only test) and every covered
+    // event is fetched.
+    push.tapController.add(digestMessage());
+    await pumpEventQueue();
+    expect(store.pendingEventIds, digestCover);
+    expect(store.selectedEventIds, digestCover);
+    expect(store.digestEvents.phase, LoadPhase.loaded);
+    expect(
+      store.digestEvents.value?.map((d) => d.event.eventId).toList(),
+      digestCover,
+      reason: 'one fetched fact per covered event, in cover order',
+    );
+    // The digest never disturbs the single-event selection/detail.
+    expect(store.selectedEventId, isNull);
+    expect(store.pendingEventId, isNull);
+
+    // Foreground digest delivery: display only (banner callback), never
+    // routed — no selection change, no fetch, no pending route.
+    push.foregroundController.add(digestMessage());
+    await pumpEventQueue();
+    expect(banners, hasLength(1));
+    expect(banners.single.kind, 'digest');
+    expect(store.pendingEventIds, digestCover,
+        reason: 'unchanged by the foreground delivery');
+  });
+
   test('payload without a usable event_id is not routed (no invention)',
       () async {
     final push = FakeMessagePushService();
@@ -173,6 +235,61 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byType(EventDetailScreen), findsNothing);
     expect(find.text('후보'), findsOneWidget);
+  });
+
+  testWidgets(
+      'digest tap from FCM cold start routes to the cover-list view',
+      (WidgetTester tester) async {
+    final push = FakeMessagePushService(initial: digestMessage());
+    final store =
+        makeStore(transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+    await store.bootstrap();
+    // Routed before any navigator existed: the cover list is pending.
+    // (No pumpEventQueue here: its event-loop hops are timer-based and
+    // never fire in the fake-async zone of a widget test — the fetches
+    // drain during the pumps below instead.)
+    expect(store.pendingEventIds, digestCover);
+
+    await tester.pumpWidget(HongScannerApp(store: store));
+    await tester.pumpAndSettle();
+    expect(store.pendingEventIds, isNull);
+    expectDigestRows();
+
+    // A row tap routes to the existing event detail — the ③ contract
+    // gives every covered event the same detail access a single tap has.
+    await tester.tap(find.text('SK하이닉스 · DOWN · 5위 → 2위'));
+    await tester.pumpAndSettle();
+    expect(store.selectedEventId, evRankChangeId);
+    expect(find.byType(EventDetailScreen), findsOneWidget);
+    expect(find.text('근거 (evidence_ref)'), findsOneWidget);
+    // Back is natural: popping the detail returns to the digest list,
+    // not out of the app.
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(find.byType(EventDetailScreen), findsNothing);
+    expect(find.byType(DigestListScreen), findsOneWidget);
+  });
+
+  testWidgets(
+      'background digest tap while the shell runs routes to the cover-list view',
+      (WidgetTester tester) async {
+    final push = FakeMessagePushService();
+    final store =
+        makeStore(transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+    await tester.pumpWidget(HongScannerApp(store: store));
+    await tester.pumpAndSettle();
+    expect(find.byType(DigestListScreen), findsNothing);
+
+    // onMessageOpenedApp with a digest payload: cover list routed.
+    push.tapController.add(digestMessage());
+    await tester.pumpAndSettle();
+    expect(store.pendingEventIds, isNull);
+    expectDigestRows();
+    // A repeated digest tap reuses the mounted list route (selection
+    // update in place) — no stacked routes.
+    push.tapController.add(digestMessage());
+    await tester.pumpAndSettle();
+    expect(find.byType(DigestListScreen), findsOneWidget);
   });
 
   group('market-alert channel', () {
@@ -320,6 +437,125 @@ void main() {
       expect(store.selectedEventId, evDownEnterId);
       expect(store.pendingEventId, isNull);
       expect(find.byType(EventDetailScreen), findsOneWidget);
+    });
+
+    testWidgets('a warm local digest tap routes to the cover-list view',
+        (tester) async {
+      // The digest notification's tap intent carries event_ids alongside
+      // the representative event_id — the platform→Dart call keeps both,
+      // exactly as MainActivity builds them.
+      mockMarketAlert();
+      final push = FakeMessagePushService();
+      final store = makeStore(
+          transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+      await tester.pumpWidget(HongScannerApp(store: store));
+      await tester.pumpAndSettle();
+
+      await deliverMarketAlertTap(evTopEnterId, eventIds: digestCoverJoined);
+      await tester.pumpAndSettle();
+      expect(store.pendingEventIds, isNull);
+      expectDigestRows();
+      // The pending copy was acknowledged: nothing stays parked.
+      expect(await const MarketAlertChannel().getPendingTap(), isNull);
+    });
+
+    testWidgets(
+      'cold-start pending local digest tap is consumed once and routes to the list view',
+      (tester) async {
+        // pendingTap/pendingTapEventIds: the payload the platform side
+        // kept from the launch intent of a digest notification tap
+        // (MainActivity.configureFlutterEngine).
+        mockMarketAlert(pendingTap: evTopEnterId, pendingTapEventIds: digestCoverJoined);
+        final push = FakeMessagePushService();
+        final store = makeStore(
+            transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+        await tester.pumpWidget(HongScannerApp(store: store));
+        await tester.pumpAndSettle();
+
+        expect(store.pendingEventIds, isNull);
+        expectDigestRows();
+        // One-shot: the consume cleared the platform-side copy.
+        expect(await const MarketAlertChannel().getPendingTap(), isNull);
+      },
+    );
+
+    testWidgets(
+      'foreground digest posts to the silent digest channel with its cover list',
+      (tester) async {
+        final mock = mockMarketAlert();
+        final push = FakeMessagePushService();
+        final store = makeStore(
+            transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+        await tester.pumpWidget(HongScannerApp(store: store));
+        await tester.pumpAndSettle();
+
+        push.foregroundController.add(PushMessage({
+          'kind': 'digest',
+          'event_ids': digestCoverJoined,
+          'count': '3',
+        }, notificationTitle: '홍스캐너 TOP10 순위 요약', notificationBody: '관측 그룹 요약'));
+        await tester.pumpAndSettle();
+        expect(mock.posts, hasLength(1));
+        // The post carries the server's text verbatim plus the message
+        // unit: the representative (first covered) id, the kind, the
+        // comma-joined cover list, and the silent channel.
+        expect(mock.posts.single['eventId'], evTopEnterId);
+        expect(mock.posts.single['title'], '홍스캐너 TOP10 순위 요약');
+        expect(mock.posts.single['body'], '관측 그룹 요약');
+        expect(mock.posts.single['kind'], 'digest');
+        expect(mock.posts.single['eventIds'], digestCoverJoined);
+        expect(mock.posts.single['channelId'], 'market_rank_digest');
+        // The OS notification owns the display: no in-app banner on top.
+        expect(find.byType(SnackBar), findsNothing);
+        // Foreground policy unchanged: no route, no selection hijack.
+        expect(store.selectedEventId, isNull);
+        expect(store.pendingEventIds, isNull);
+        expect(store.digestEvents.phase, LoadPhase.idle);
+
+        // A re-delivery of the same digest is one unit: no second post.
+        push.foregroundController.add(PushMessage({
+          'kind': 'digest',
+          'event_ids': digestCoverJoined,
+          'count': '3',
+        }, notificationTitle: '홍스캐너 TOP10 순위 요약', notificationBody: '관측 그룹 요약'));
+        await tester.pumpAndSettle();
+        expect(mock.posts, hasLength(1));
+
+        // The single event covered by the digest is a different unit:
+        // it still surfaces — on the sound channel (no channelId arg).
+        push.foregroundController.add(marketMessage(evTopEnterId,
+            'TOP10_ENTERED',
+            title: 'TOP10 진입: 삼성전자', body: '순위 11 → 7'));
+        await tester.pumpAndSettle();
+        expect(mock.posts, hasLength(2));
+        expect(mock.posts.last['channelId'], isNull,
+            reason: 'the default sound channel — the pre-digest contract');
+      },
+    );
+
+    testWidgets('foreground summary posts on the sound channel', (tester) async {
+      final mock = mockMarketAlert();
+      final push = FakeMessagePushService();
+      final store = makeStore(
+          transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
+      await tester.pumpWidget(HongScannerApp(store: store));
+      await tester.pumpAndSettle();
+
+      // An immediate ≥2-event summary: sound channel, kind and cover
+      // list carried like the digest's.
+      push.foregroundController.add(PushMessage({
+        'kind': 'summary',
+        'event_ids': digestCoverJoined,
+        'count': '3',
+      }, notificationTitle: '홍스캐너 TOP10 변화', notificationBody: '순위 변화 요약'));
+      await tester.pumpAndSettle();
+      expect(mock.posts, hasLength(1));
+      expect(mock.posts.single['eventId'], evTopEnterId);
+      expect(mock.posts.single['kind'], 'summary');
+      expect(mock.posts.single['eventIds'], digestCoverJoined);
+      expect(mock.posts.single['channelId'], isNull,
+          reason: 'a summary is a sound notification — the default channel');
+      expect(find.byType(SnackBar), findsNothing);
     });
   });
 }

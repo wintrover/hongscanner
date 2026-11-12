@@ -31,9 +31,9 @@ Nim Core (src/hs/*, PR-4의 단일 판정 함수 step)
   두 파일 모두 이 프로세스 하나가 쓰되 파일별로 배타 flock을 따로
   잡는다. 생산자 파일을 바이트 오프셋으로 tail해 LF 완결 라인 배치를
   팩트 그대로 검증·추가하고(중복 event_id는 동일 바이트만 멱등 스킵,
-  불일치 중복은 거부), 같은 틱 안에서 정책 필터(§0의 이벤트 유형
-  허용목록) → 중복 억제 → FCM HTTP v1 전송 → 전달 기록
-  append(append-only + fsync)까지 수행한다.
+  불일치 중복은 거부), 같은 틱 안에서 정책 판정(§0의 어드미션
+  게이트) → 중복 억제 → 관측 그룹 조립(§0·§6) → FCM HTTP v1 전송 →
+  전달 기록 append(append-only + fsync)까지 수행한다.
   시작·종료는 세션 런처(`tools/run_session.sh`)가 명시적으로 관리하고,
   프로세스 감시·재시작은 systemd에 위임한다(§11).
         ↓ 기기 등록 (별도 프로세스)
@@ -41,14 +41,34 @@ Python register 프로세스 (notify_register.py)
   devices.jsonl(레지스트리)의 단일 작성자: bearer 인증 등록
 ```
 
-- **발송 정책은 이벤트 유형 허용목록이다**:
-  `NOTIFIABLE_EVENT_TYPES` = `TOP10_ENTERED` · `TOP10_EXITED` ·
-  `RANK_CHANGED` 3종(사용자 결정 2026-11-11, docs/ASSUMPTIONS.md
-  P27). 허용목록 밖의 팩트(장애·replay·세션 수명·후보 계열 전부)는
-  ledger에 기록되지만 **절대 발송되지 않는다** — 사용자는 고장
-  경보 대신 침묵을 선택했다. severity는 팩트의 운영 심각도 표기일
-  뿐 발송 여부를 결정하지 않는다: CRITICAL 장앜 팩트도 INFO 순위
-  변화와 똑같이 유형으로만 판정된다.
+- **발송 정책은 어드미션 게이트다** (사용자 결정 2026-11-11,
+  docs/ASSUMPTIONS.md P27·P28). 판정은 사건마다 정확히 하나다:
+  - 유니버스: `NOTIFIABLE_EVENT_TYPES` = `TOP10_ENTERED` ·
+    `TOP10_EXITED` · `RANK_CHANGED` 3종. 유니버스 밖의 팩트(장애·
+    replay·세션 수명·후보 계열 전부)는 ledger에 기록되지만 **절대
+    발송되지 않는다** — 사용자는 고장 경보 대신 침묵을 선택했다.
+    severity는 팩트의 운영 심각도 표기일 뿐 발송 여부를 결정하지
+    않는다: CRITICAL 장앜 팩트도 INFO 순위 변화와 똑같이 유형으로만
+    판정된다.
+  - 모드(기본 = 안B): TOP10_ENTERED/TOP10_EXITED → "immediate"
+    (사운드), RANK_CHANGED → "digest"(무음). 설정의 `admission`
+    섹션이 이 매핑을 엄격하게 오버라이드한다(§7). "suppress" 모드는
+    유니버스 밖과 같은 취급이다: `type_skipped`로만 세고 전달 기록을
+    만들지 않는다(§7).
+  - 판정 함수(`notify_config.admission_mode`)와 조립 함수
+    (`compose_admission_units`)는 발송 경로와 재생 도구
+    (`--admission-report`, §9)가 **같이 쓴다** — 재생의 판정·조립이
+    실운용과 같은 코드에서 나온다.
+- **관측 배치(같은 observed_at·같은 기기)당 발송은 사운드 1통 +
+  무음 1통이 상한이다**: immediate로 판정된 사건들은 한 메시지로
+  묶인다 — 1건이면 single(기존 개별 메시지 형식 그대로), 2건 이상이면
+  summary 1통(§6). digest로 판정된 사건들은 digest 1통(§6). 사운드가
+  무음보다 먼저 간다. 재시도 대기 중인 유닛은 멤버 전원이 같은
+  next_due로 이연돼 다음 패스에서 **같은 멤버로 재조립**된다 — 그룹의
+  부분 전달은 불가능하다. 같은 observed_at의 사건들이 서로 다른
+  배치로 도착하면(앞 멤버가 이미 ACCEPTED) dedup이 우선이다: 늦은
+  멤버는 자기 자신의 메시지로 간다 — 관측 그룹 상한이 중복 재전송을
+  이기지 않는다(정직한 경계, test_notify가 핀).
 
 - 3상태 3보금(전달 상태는 이벤트 팩트에 절대 병합되지 않는다,
   스키마 x-separation-rule): 중요도/신뢰는 팩트의 필드, 검증은 세션
@@ -128,6 +148,14 @@ Python register 프로세스 (notify_register.py)
 - `attempts`는 그 쌍의 기록된 전송 시도 수(0 = 아직 아무 것도 보냈던
   적 없음). 전송 후 기록 전 사망한 시도는 기록이 없어 attempts에
   들지 않는다 — ledger는 기록된 상태만 정직하게 센다.
+- **`message_kind`(선택, 닫힌 열거 `single|summary|digest`)**: 그 쌍을
+  덮은 메시지의 조립 형식(§0·§6). summary·digest도 **멤버 사건마다
+  1줄씩** 기록된다 — 같은 메시지에 덮인 멤버들은 같은
+  `provider_message_id`를 공유하고, 유닛의 성공·실패·재시도가 멤버
+  전원의 같은 상태로 기록된다(부분 성공 상태는 존재하지 않는다).
+  그룹화 이전 기록(키 없음)은 그대로 유효하다. 읽기·dedup 판정은
+  이 키를 읽지 않는다 — 상태는 어디까지나 (event_id, device_id)의
+  마지막 기록이 소유한다.
 - `updated_at`은 dispatcher 소유 시계(ISO 8601 숫자 오프셋 KST)다.
 
 ## 4. 기기 레지스트리 (devices.jsonl, 저장소 밖)
@@ -220,9 +248,32 @@ Python register 프로세스 (notify_register.py)
   분기로 종래의 최소 조립(title `"Hong Scanner <severity>"`, body
   `<event_type>[ <symbol>]`, severity 매핑 priority)을 유지한다 —
   정책 게이트는 dispatcher 하나뿐이고 전송 계층은 일반형을 유지한다.
-- 페이로드 한도 4096바이트(키·값 포함, 벤더 명시)를 전송 전 검사한다.
+- **관측 그룹 조립(§0의 상한을 만드는 두 형식)**: 배치의 immediate
+  사건이 2건 이상이면 **summary 1통**이 사운드를 대신한다 — title
+  `"홍스캐너 TOP10 변화"`, body는 앞 2사건(ledger 순서)의
+  `<종목명|심볼> <진입|이탈>`을 "·"로 잇고 나머지는 ` 외 N건`,
+  priority "high"·channel `market_rank_changes`(single과 같은 사운드
+  경로). 배치의 digest 사건들은 **digest 1통**(무음) — title
+  `"홍스캐너 TOP10 순위 요약"`, body는 첫 사건의 `<종목명|심볼>
+  <prev>위→<rank>위`(rank만 있으면 `신규 진입 <rank>위`,
+  previous_rank만 있으면 `<prev>위→후보 제외`, 둘 다 없으면 순위
+  문안 없음 — single과 같은 정직성 규칙, 발명 금지) + ` 외 N건`,
+  priority **"normal"**·channel `market_rank_digest`.
+- **data 계약은 형식별로 다르다**: single은 개별 필드(event_id/
+  event_type/severity/direction/symbol/previous_rank/rank, §6 첫
+  항목)만 실는다. 그룹 메시지(summary·digest)는 **kind / event_ids
+  (쉼표 결합, ledger 순서, 전체 멤버) / count(문자열)**만 실는다 —
+  kind·event_ids·count는 single에 없고, 개별 필드는 그룹에 없다.
+  앱은 다이제스트 1통의 event_ids로 그 배치의 전체 사건에 접근한다
+  (탭 → 전체 사건 목록).
+- **페이로드 한도 4096바이트(키·값 포함, 벤더 명시)는 그룹 조립에도
+  똑같이 적용된다**: 전송 전 검사이며 초과는 전송 전 거부(FAILED
+  `HS_PAYLOAD_OVER_LIMIT`, 멤버 전원 기록, §5) — 잘린 조립을
+  보내지 않는다. 40사건 그룹은 수용되고(합성 게이트 핀) 100사건
+  그룹은 거부된다.
 - **Android 우선순위**: 메시지는 `android.priority`를 항상 명시한다 —
-  허용목록 3종은 **항상 "high"**이고 `channel_id`를 지정한다. 기본값에
+  사운드 경로(single·summary)는 **"high"**, 무음 다이제스트는
+  **"normal"**이고 둘 다 `channel_id`를 지정한다. 기본값에
   대해서는 공식 문서가 **상충한다**: REST v1 reference는 HIGH가
   "Default priority for notification messages"라고 쓰고, 가이드는
   "Normal priority. This is the default priority for data and
@@ -263,12 +314,24 @@ Python register 프로세스 (notify_register.py)
   "watch_poll_seconds": 1.0,         // 상주 worker 틱 간격, 0 < x <= 60
   "service_account_path": "/abs/outside-repo/sa.json",  // 또는 아래
   "token_command": ["gcloud", "auth", "application-default",
-                    "print-access-token"]
+                    "print-access-token"],
+  "admission": {"RANK_CHANGED": "digest"}     // 선택: 안B 위 오버라이드
 }
 ```
 
-- **`min_severity`는 제거됐다** — 발송 정책은 §0의 이벤트 유형
-  허용목록으로 옮겨갔다. 설정 파일에 키가 남아 있으면 **무시된다**
+- **`admission` 섹션(선택)**: 유니버스 3종(TOP10_ENTERED/
+  TOP10_EXITED/RANK_CHANGED)의 모드 매핑 오버라이드. 값은
+  `{"<event_type>": "immediate"|"digest"|"suppress"}` 객체다.
+  검증은 엄격하다 — 객체가 아니거나, 유니버스 밖 event_type 키거나,
+  모드 어휘 밖 값이면 ConfigError(exit 2). **부분 매핑은 거부가
+  아니다**: 명시된 유형만 안B 기본값을 덮고 나머지는 기본값을
+  유지한다(P28 문언: 섹션은 기본 정책의 오버라이드). 섹션이 없으면
+  기본값(안B)으로 동작하고 `--admission-report`(§9)가 그 사실을
+  출력 첫 줄에 명시한다(`admission policy source=default`) — 섹션
+  없음이 설정된 정책과 혼동되지 않는다.
+
+- **`min_severity`는 제거됐다** — 발송 정책은 §0의 어드미션 게이트로
+  옮겨갔다. 설정 파일에 키가 남아 있으면 **무시된다**
   (검증하지도 않는다): 알 수 없는 키 관용 정책은 그대로다. 라이브
   설정 편집은 운영 단계의 몫이다.
 
@@ -281,10 +344,10 @@ Python register 프로세스 (notify_register.py)
   `0 < x <= 60` 실수여야 한다 — 위반은 ConfigError(exit 2)다. 0 이하는
   스핀, 상한 초과는 전달 지체를 낳는다. §1의 배치·tail 계약이 주기의
   정확성에 의존하지 않는다(오프셋·LF·dedup이 정확성을 소유한다).
-- 허용목록 밖의 이벤트 유형은 **전달 기록을 만들지 않는다** — 차단은
-  `type_skipped` 요약 카운터로만 센다(§9). 정책은 전송 계층의 결정이지
-  사실의 변경이 아니다. 기록 없는 스킵은 가짜 PENDING을 만들지
-  않는다.
+- suppress로 판정된 사건(유니버스 밖, 또는 `admission`의 suppress
+  모드)은 **전달 기록을 만들지 않는다** — 차단은 `type_skipped`
+  요약 카운터로만 센다(§9). 정책은 전송 계층의 결정이지 사실의
+  변경이 아니다. 기록 없는 스킵은 가짜 PENDING을 만들지 않는다.
 - 엔드포인트 오버라이드는 존재하지 않는다: FCM/OAuth URL은 공식
   값으로 고정(fail-closed, collector의 도메인 고정 선례).
 
@@ -304,15 +367,31 @@ Python register 프로세스 (notify_register.py)
 
 | 코드 | 의미 |
 |---|---|
-| 0 | 스위프 정상 완료 (보류 PENDING·외부 재개 포함) 또는 상주 worker의 정상 종료(SIGTERM/SIGINT) — 정상이 보류를 숨기지 않는다: 요약 라인이 세어 보인다 |
-| 2 | 사용법·설정 계약 위반 (설정 거부, bearer 거부, 잘못된 device_id) |
+| 0 | 스위프 정상 완료 (보류 PENDING·외부 재개 포함), 상주 worker의 정상 종료(SIGTERM/SIGINT) 또는 admission report 출력 완료 — 정상이 보류를 숨기지 않는다: 요약 라인이 세어 보인다 |
+| 2 | 사용법·설정 계약 위반 (설정 거부, bearer 거부, 잘못된 device_id, --admission-report 상대경로·부재 파일·--watch 병용) |
 | 3 | 자격 경로 실패 또는 fail-closed SENDER_ID_MISMATCH — 설정 오류는 절대 깨끗한 성공이 아니다 |
-| 4 | 단일 작성자 충돌(다른 프로세스가 lock 보유) / 내부 결함 / ledger 계약 위반 |
+| 4 | 단일 작성자 충돌(다른 프로세스가 lock 보유) / 내부 결함 / ledger 계약 위반 (톰 보고 입력 포함) |
 
 - 실패를 성공으로 꾸미는 경로는 존재하지 않는다. dispatcher의 스위프
   요약(`sweep {...}` JSON 라인)은 세친 사실만 보고한다 — 이벤트
-  총수(`events_total`), 허용목록 밖 차단수(`type_skipped`), 전송
-  후보(`pairs_to_send`)와 outcome 카운터가 모두 그 안에 있다.
+  총수(`events_total`), 정책이 suppress로 판정한 수(`type_skipped`),
+  전송 후보 쌍(`pairs_to_send`)과 outcome 카운터가 모두 그 안에
+  있다. 상주 모드의 누적 카운터 `messages_sent`는 **시도한 메시지
+  수**다(사건 수 아님 — 관측 그룹 유닛 1통이 여러 사건을 덮는다).
+- **`--admission-report <abs events 파일>` — 재생 도구**: 발송도
+  원장 기록도 없이(Dispatcher를 만들지도 않는다) 파일의 모든 사건을
+  실운용과 **같은 어드미션 코드**(admission_mode·
+  compose_admission_units)로 판정해 stdout에 출력한다. 출력 구조:
+  첫 줄 `admission policy source=<default|config>` + 전체 매핑(섹션
+  없음이 설정 정책과 혼동되지 않게), 사건별 판정 1줄씩(`verdict=
+  ADMIT|DIGEST|SUPPRESS`, form=single|summary|digest|suppress|
+  not_in_admission, 파일 순서), 관측 그룹별 발송 요약
+  (`admission group ... events=N sound=S silent=D`)과 조립 플랜
+  (`admission plan ... kind=K count=N title=... body=...
+  event_ids=...` — 4096 초과 조립은 `refused=HS_PAYLOAD_OVER_LIMIT`),
+  총계 라인. 시계가 없으므로 **같은 입력·같은 config면 바이트 단위로
+  동일**하다. config 검증은 "dispatch" 역할로 실운용과 같은 경로를
+  지난다(재생==실운용 정책).
 
 ### 상주(--watch) 모드의 종료·시그널
 
@@ -334,16 +413,26 @@ Python register 프로세스 (notify_register.py)
 - `bash tools/notify/test_notify.sh`: unittest 계약 스위트. 실제
   모듈을 가짜 urllib 전송과 temp ledger로 in-process 구동. RFC 7515
   A.2 벡터(서명·키 파싱·JWT 형상), 스키마 검증 전표(16종 event_type,
-  previous_rank/name), ledger 멱등·
-  거부 규칙(1회성 ingest와 상주 배치 `ingest_lines` 모두),
+  previous_rank/name, delivery `message_kind` 닫힌 열거·선택성),
+  ledger 멱등·거부 규칙(1회성 ingest와 상주 배치 `ingest_lines` 모두),
   dispatcher 상태기계 전체(정상·중복 억제·429/404/403·영구·전송
-  실패·기록 소실 복구·유형 허용목록 필터·ledger 순서 소비), TOP10
-  문안 5케이스(신규진입·기존진입·순위변경·밖이탈·후보제외)+심볼
-  폴백+channel_id·priority=high·data 필드 단언과 방어용 일반 조립,
-  min_severity 미검증, watch_poll_seconds 경계, 상주 watch 틱 계약
-  (비-LF 꼬리
-  미소비·배치 all-or-nothing·(dev,ino) 전체 재스캔·틱 사이 재시도
-  이연·shrink LedgerFault), 그리고 실 OS 프로세스 1건(SIGTERM 정상
+  실패·기록 소실 복구·유형 필터·ledger 순서 소비), **admission 섹션
+  검증**(부재 시 안B 기본·출처 명시, 엄격 거부, 부분 매핑 병합),
+  **관측 그룹 상태기계**(다이제스트 1통 전체 event_id 커버·멤버별
+  기록·같은 provider_message_id, 혼합 배치 summary+digest, single
+  형식 불변, dedup 우선·재스윕 무전송, 429 재조립·같은 event_ids,
+  404 유닛 실패·토큰 1회 은퇴, suppress 모드=type_skipped,
+  observed_at 경계, 같은 입력·정책 바이트 재현), **그룹 조립**
+  (summary/digest 문안·data 계약(kind/event_ids/count)·4096 그룹
+  한도(40 수용·100 거부)·결정론·순서 결속), TOP10 문안 5케이스
+  (신규진입·기존진입·순위변경·밖이탈·후보제외)+심볼 폴백+channel_id·
+  priority(single/summary=high, digest=normal)·data 필드 단언과
+  방어용 일반 조립, min_severity 미검증, watch_poll_seconds 경계,
+  상주 watch 틱 계약(비-LF 꼬리 미소비·배치 all-or-nothing·(dev,ino)
+  전체 재스캔·틱 사이 재시도 이연·shrink LedgerFault·관측 그룹 경계),
+  **admission report**(사건별 판정 전표·첫 줄 policy source·플랜
+  미러·바이트 동일 재생·발송 경로와 같은 compose 증명·거부 플랜·CLI
+  exit 0/2/4·ledger 미생성), 그리고 실 OS 프로세스 1건(SIGTERM 정상
   종료 exit 0 + 재기동 전체 재스캔 멱등 — 같은 events 파일로 중복
   append 없음).
 - `bash tools/notify/drill/drill_fcm.sh`: 프로세스쌍 드릴(collector의
@@ -371,15 +460,20 @@ Python register 프로세스 (notify_register.py)
   `notify_dispatcher.py --watch`를 백그라운드 OS 프로세스로 띄워
   생산자 파일(watch_poll_seconds=0.2)을 tail하게 한다. 시나리오:
   - **W1** 증분 tail: 완결 라인 N틱 내 발송, 반쪽 라인(비-LF) 미소비
-    (SEND·ledger 카운트 불변), LF 도달 후 발송, 5건 1회 write 폭주
-    전달(누락 0);
+    (SEND·ledger 카운트 불변), LF 도달 후 발송, 5건 1회 write 폭주는
+    **다이제스트 1통**으로 전달(누락 0, 와이어 `SEND digest
+    count=5`), 혼합 배치(진입+이탈+순위변화 2건, 같은 observed_at)는
+    **summary 1통 + digest 1통** — delivery 기록 11행(single 2·
+    summary 2·digest 7, provider_message_id 그룹 크기 1,1,2,2,5,
+    전부 ACCEPTED);
   - **W2** SIGKILL 후 재시작: 전체 재스캔 멱등(appended=0 dup=2,
-    재전송 0, ledger 불변) + 재시작한 worker가 신규 이벤트 tail 지속;
+    재전송 0, ledger 불변; 살해 전 두 사건은 summary 1통이었음) +
+    재시작한 worker가 신규 이벤트 tail 지속;
   - **W3** 429 Retry-After 3s 이연은 비블로킹: 직후 신규 이벤트 즉시
     발송(와이어 ts 간격 <1.5s), 지연된 재시도는 스케줄대로(≥2s,
-    PENDING→ACCEPTED attempts 1→2);
+    PENDING→ACCEPTED attempts 1→2) — single 와이어 형식 유지;
   - **W4** 감시 파일 축소(st_size < offset) → LedgerFault exit 4,
-    재전송 없음.
+    재전송 없음(두 사건 = summary 1통이므로 SEND 1회).
   증거는 `runs/drill-watch-<ts>/`(gitignored). systemd 유닛 생명주기
   (run_session.sh)는 여기 없다 — 라이브 세션 증거다(§12).
 
@@ -416,9 +510,21 @@ Python register 프로세스 (notify_register.py)
   틱 계약 전반 — 비-LF 꼬리 미소비, 배치 all-or-nothing·멱등,
   (dev,ino) 전체 재스캔, 틱 사이 재시도 이연(429 중 신규 이벤트
   지속), shrink LedgerFault, watch_poll_seconds 검증, SIGTERM 정상
-  종료 + 재기동 멱등(서브프로세스), 유형 허용목록 필터(type_skipped·
-  전달 기록 미생성), TOP10 문안 5케이스·channel_id·priority=high·
-  data 필드, min_severity 미검증.
+  종료 + 재기동 멱등(서브프로세스); **admission 게이트**(기본 안B·
+  admission 섹션 엄격 검증·부분 병합·suppress=type_skipped·전달 기록
+  미생성); **관측 그룹 발송**(배치당 사운드 1+무음 1 상한·summary/
+  digest 조립 문안·그룹 data 계약 kind/event_ids/count·멤버별 기록·
+  같은 provider_message_id·4096 그룹 한도(40 수용·100 거부)·재시도
+  재조립·dedup 우선의 분할 도착 경계·같은 입력·정책 바이트 재현);
+  **--admission-report**(사건별 판정 전표·policy source 첫 줄·플랜
+  미러·바이트 동일 재생·발송 경로와 같은 compose·CLI exit 0/2/4);
+  TOP10 문안 5케이스·channel_id·priority(single/summary=high,
+  digest=normal)·data 필드(single 개별 필드·그룹 kind/event_ids/
+  count), min_severity 미검증.
+- **범위 밖(문서로만 명시, 구현 없음)**: 시간당 총 발송량 제한,
+  왕복(진입↔이탈) 상쇄, 다른 observed_at 배치의 병합 —
+  docs/LIMITS.md가 그 한계를 적는다. 이 슬라이스의 상한은 관측
+  배치 단위다.
 - 실 FCM 실측 전체: 실 프로젝트에서의 429 Retry-After 실측 값,
   403 실측 본문 형상, message_id 실측 형상, 실 토큰 수명. 404 본문
   형상은 2026-11-03 실측됐다(HTTP 404 + `error.status "NOT_FOUND"`,
@@ -433,12 +539,13 @@ Python register 프로세스 (notify_register.py)
   포함)은 `tools/notify/drill/drill_watch.sh`가 게이트에 등록돼
   있고, 실측 라이브 관측이 남아 있다.
 - android.priority: 미설정 시 실효값은 벤더 문서 상충으로 확정 불가
-  (§6) — 명시값의 실기기 동작도 실측 항목이다. 허용목록 3종이 항상
-  high로 가는 경로의 실기기 도달율·Doze 지연, HIGH 강등 규칙(§6,
+  (§6) — 명시값의 실기기 동작도 실측 항목이다. 사운드 경로(single·
+  summary)가 high로 가는 경로의 실기기 도달율·Doze 지연과 무음
+  다이제스트(normal)의 실기기 표시 경로, HIGH 강등 규칙(§6,
   표시로 이어지지 않는 메시지의 7일 관찰)이 실 트래픽에서 발동하는지,
-  `channel_id market_rank_changes`의 실기기 표시(앱이 채널을
-  생성했는가 — 없으면 manifest 폴백)와 TOP10 문안의 실기기 렌더링도
-  실측 항목이다(앱 측 PR-7과 공유).
+  `channel_id market_rank_changes`·`market_rank_digest`의 실기기
+  표시(앱이 채널을 생성했는가 — 없으면 manifest 폴백)와 TOP10
+  문안의 실기기 렌더링도 실측 항목이다(앱 측 PR-7과 공유).
 - 앱 측 전제(앱의 event_id 중복 식별)는 PR-7의 구현·실측 대상이다 —
   이 계약은 그 전제를 문서로 요구할 뿐 증명하지 않는다.
 - accepted≠delivered의 실측 경계(접수 후 유실 가능성)는 벤더 문서가

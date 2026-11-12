@@ -47,6 +47,16 @@ class ApiEvent {
   /// Judged direction; absent when the fact judged no direction.
   String? get direction => _asString(raw['direction']);
 
+  /// The vendor row's stock name preserved by the input normalization
+  /// boundary; absent when the row carried none — the symbol is the
+  /// display fallback, never a re-parse of a raw response.
+  String? get name => _asString(raw['name']);
+
+  /// Rank in the same direction at the end of the previous confirmed
+  /// observation group; present only on top10-transition facts (the
+  /// "from" rank of a rank change or TOP10 in/out transition).
+  int? get previousRank => _asInt(raw['previous_rank']);
+
   /// Candidate rank; absent for rank-free facts.
   int? get rank => _asInt(raw['rank']);
 
