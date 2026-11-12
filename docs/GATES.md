@@ -472,6 +472,21 @@ PR #35~#41 merge분에 대한 attest·설치·검증 재측정(AGENTS.md §2.2)�
 
 한계(2026-11-12 오후, Global Attention Budget v1): (1) 원장이 39.8만 행 규모로 커진 세션 말미에 워커 1틱 중복 검사가 ~4.5초 소요되어 `run_session.sh` 종료 시 `sleep 3` 드레인 창을 넘긴 마지막 3행은 `15:32:01` 추가 1틱 드레인으로 발송 완료했다(원장 누락·손실 0건). (2) `15:12` 시점에 단말(`R3CM60B9AQJ`) USB 케이블이 분리되어 신규 APK(`app-debug.apk`, 포그라운드 `MainActivity.kt` 단일 슬롯 `tag=market_rank_digest, id=0`)의 `adb install`은 미실행 상태이나, 백그라운드 FCM 경로(`notify_fcm.py`의 `android.notification.tag="market_rank_digest"`)는 서버 페이로드에서 즉시 작동하여 `15:17`~`15:32` 무음 요약 4통 모두 단일 슬롯 태그로 발송되었다. (3) 무음 요약 슬롯은 최신 그룹 확인용 단일 진입점이며 전체 사건 보존 정본은 원장 및 앱 히스토리 탭이다; 실제 물리적 소리 재생 여부는 OS 채널 설정 및 DND 상태에 종속된다.
 
+### Evidence log (2026-11-12 야간) — Private Home Server VS-1 (`hongscanner-srv` 루프백 격리 + Tailscale MagicDNS HTTPS + Grants 최소 권한 + LTE·무로그인 재부팅 복구 실측)
+
+| 검증 항목 | 합격 조건 | 실측 결과 |
+|---|---|---|
+| **서버 하드웨어·OS·바이너리(P13)** | 전용 홈 서버에 증명 바이너리 설치 및 `VERDICT MATCH provenance=OK` | HP ProBook 470 G2 (`i7-5500U`, 16GB RAM, `hongscanner-srv`), Ubuntu 24.04.5 LTS Server(`6.8.0-139-generic`), `versions/6e3ad32`(`sha256_hongscanner=8251f56b…`, `sha256_collector=5e276d12…`), `runs/smoke-2026-11-12-6e3ad32` `VERDICT MATCH provenance=OK`, 무인 키움 OAuth(`KIWOOM_OAUTH_OK type=Bearer token_len=86`)·FCM OAuth(`FCM_OAUTH_OK project=hongscanner`)·`hongscanner-session.timer`(`Mon..Fri 08:50:00 KST`) 활성화 |
+| **서버 바인딩 (루프백 격리)** | `127.0.0.1:8080`만 존재 (LAN 직접 노출 차단) | `ss -tlnp \| grep 8080` → `LISTEN 0 5 127.0.0.1:8080 0.0.0.0:* users:(("python3.13",pid=1207,fd=3))`; 워크스테이션(`192.168.0.7`)에서 `curl -m 2 http://192.168.0.82:8080/status` → `Connection refused` (`exit 7`) |
+| **HTTPS 인그레스** | MagicDNS 주소에서 Let's Encrypt 인증서 검증 성공 | `tailscale serve --bg --https=443 http://127.0.0.1:8080` → `https://hongscanner-srv.tail10d26b.ts.net (tailnet only) \|-- / proxy http://127.0.0.1:8080`; 단말 `curl` `ssl_verify_result=0`, APK(`HS_API_BASE=https://hongscanner-srv.tail10d26b.ts.net`, `sha256=6e9b3bb8db5c02ca5dacda8758e096206fffa9c07a862b9eac8ca06c1121a1e7`) 설치 |
+| **권한 및 권한 차단 (Grants)** | 본인 휴대폰(`sm-s938n`)만 `tcp:443` 허용, 비허용 포트·기기 차단 | 정책 파일에 `"tagOwners": {"tag:hongscanner-srv": ["autogroup:owner"]}`, `"hosts": {"sm-s938n": "100.80.46.69/32"}`, `"acls": []`, 단일 `"grants"`(`src: ["sm-s938n"] -> dst: ["tag:hongscanner-srv"]`, `ip: ["tcp:443"]`) 적용. 단말(`100.80.46.69`)에서 `100.125.164.8:443`은 `200`, 비허용 포트 `100.125.164.8:8080`·`:22`는 `Connection timed out (exit 28)` 차단 실측 |
+| **집 Wi-Fi** | `/mobile/market-view` 및 `/events/{id}` HTTP 200 | `SM_S938N`(`R3CY108W5FZ`, `wlan0 192.168.0.16` + `tun0 100.80.46.69`)에서 `WIFI_MARKET_VIEW_HTTP=200 ssl_verify=0`, `WIFI_EVENT_DETAIL_HTTP=200 ssl_verify=0` |
+| **외부 LTE/5G (Wi-Fi OFF)** | Wi-Fi OFF 상태에서 두 API 모두 HTTP 200 | `adb shell svc wifi disable`로 `wlan0` 제거 후(`rmnet_data2@rmnet_ipa0` + `tun0 100.80.46.69`만 존재) `LTE_MARKET_VIEW_HTTP=200 ssl_verify=0`, `LTE_EVENT_DETAIL_HTTP=200 ssl_verify=0` 및 앱 기동 시 서버 저널 `127.0.0.1 - "GET /mobile/market-view HTTP/1.1" 200` 확인 |
+| **무로그인 재부팅 복구** | `Linger=yes` 상태에서 **SSH 로그인 전** 휴대폰 LTE 접근 성공 | `loginctl show-user wintrover -p Linger` = `Linger=yes`. `sudo reboot` 실행(`uptime -s` = `2026-11-12 22:52:40`) → `22:52:57` `systemd --user`가 무로그인 상태에서 `hongscanner-serve.service` 자동 기동 및 `ExecStartPost`로 `/mobile/market-view` 캐시 예열 완료(`22:53:13`) → **SSH 접속 전** `22:53:15`에 휴대폰 LTE에서 `PRE_SSH_LTE_MARKET_VIEW_HTTP=200 SSL=0 time=0.996228s`, `PRE_SSH_LTE_EVENT_DETAIL_HTTP=200 SSL=0 time=3.403071s` 실측 |
+| **네트워크 재연결 및 인터넷 비노출** | 수동 명령 없이 복구, Funnel 비활성·포트포워딩 없음 | `svc wifi enable` 재전환 즉시 `POST_WIFI_RECONNECT_HTTP=200 SSL=0 time=0.806123s`; `tailscale serve status`에 `(tailnet only)` 명시(Funnel 비활성, 공유기 포트포워딩 없음) |
+
+한계(2026-11-12 야간, Private Home Server VS-1): (1) 이 구성은 HP 홈 서버의 전원 및 가정용 인터넷(`CB_WiFi_2G`) 가용성에 종속된다(완전한 외부 클라우드 이관은 `NF-0` 사용자 게이트 대기). (2) Let's Encrypt 인증서 발급에 따라 `hongscanner-srv.tail10d26b.ts.net` 도메인 이름은 공개 Certificate Transparency(CT) 로그에 기록된다(접근 자체는 Tailnet Grants로 차단되며 공개 DNS에 `100.x.y.z` `A` 레코드는 게시되지 않는다). (3) MagicDNS 이름 해석은 단말의 Tailscale DNS(`100.100.100.100`)를 전제하므로, 안드로이드 `private_dns_mode`는 기본값(`null`/`opportunistic`/`off`)을 유지해야 한다(수동 외부 DoT 호스트 지정 시 `*.ts.net` 조회 불가). (4) Tailscale Personal 무료 플랜은 개인 비상업적 사용 범위에서만 유효하다.
+
 ## Completion Evidence
 
 ```bash

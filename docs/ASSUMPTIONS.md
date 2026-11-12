@@ -43,7 +43,7 @@ changeable assumption; treating one as a requirement is what stalled v1–v5.
 | P13 | the commit marker's `t` is the only wall-clock input at the recorder adapter boundary; Core still has none | timestamps in Core (rejected: M1) |
 | P14 | subscription REGs are single-type in the official example form, refresh `"1"`, grp_no `"1"`; `0s` is registered by its own REG and never enters a 0B replacement request; a swap is REMOVE(outgoing) → ack → REG(incoming, refresh `"1"`) → ack; refresh `"0"` is never sent | multi-type REG with 0s auto-added (rejected: no official precedent, V1) |
 | P15 | subscription confirmation records REG/REMOVE acks; `activeSets` reflects ack `return_code` 0 only | trusting requests alone (rejected: a request is not evidence) |
-| P16 | the Northflank deployment is one container (Replica 1) with a Single Read/Write Volume for `/var/lib/hongscanner` | multiple replicas/HA (rejected: M12 needs exactly one writer) |
+| P16 | for Private Home Server VS-1 operation, a single dedicated Linux host (`hongscanner-srv`) is the single writer (`M12`), while the Northflank single-container (Replica 1) policy with a Single Read/Write Volume for `/var/lib/hongscanner` remains the deferred cloud option | multiple replicas/HA (rejected: M12 needs exactly one writer) |
 | P17 | the session window is scanner-side clock policy: KST 08:50 start, 15:30 last start, 15:40 watchdog | vendor-close-driven scheduling (rejected: FID 215 is close evidence, not a start authority — §12.4) |
 | P18 | candidates are re-queried every 300 s during the session (`repollSeconds`, approved PH-1 value) | another cadence (unapproved: §12.1 requires the cadence declared and recorded) |
 | P19 | the cloud path targets demo first: the sidecar refuses any base other than demo/mockapi | prod from day one (rejected: the mock is the documented test stage; prod is a separate confirmation) |
@@ -70,7 +70,7 @@ changeable assumption; treating one as a requirement is what stalled v1–v5.
 | I7 | the container's always-on process is `tools/container/cloud_supervisor.py` — execution adapter: child lifecycle + session scheduling, stdout log only |
 | I8 | cloud OAuth via the sidecar EnvTokenProvider (`token_source=env`); the kiwoomcli Secret Service path stays the default outside the container |
 | I9 | GHCR images are tagged with the immutable convention `main-<sha7>`, one push per exact main sha; tag overwrite and `latest` are forbidden |
-| I10 | mobile keeps its API credential in Android secure storage (Keystore-backed); the API front is Northflank ingress HTTPS + Basic Auth |
+| I10 | in Private Home Server VS-1, `serve.py` stays bound to loopback `127.0.0.1:8080`, `tailscale serve --bg --https=443 http://127.0.0.1:8080` terminates Let's Encrypt MagicDNS HTTPS (`https://hongscanner-srv.<tailnet-name>.ts.net`), and access control is enforced by Tailscale Grants (`"acls": []`, server tagged `tag:hongscanner-srv`, phone identified via `"hosts": {"sm-s938n": "100.x.y.z/32"}` with `"ip": ["tcp:443"]` only, Funnel disabled); Android Keystore Basic Auth (`flutter_secure_storage`) remains supported for authenticating cloud fronts (Northflank ingress HTTPS + Basic Auth) |
 
 ## UNKNOWN (must be measured, not assumed)
 

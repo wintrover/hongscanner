@@ -96,12 +96,38 @@ flutter run --dart-define=HS_API_BASE=http://10.0.2.2:8080   # Android emulator
   certificate validation (no `badCertificateCallback` override — the
   default trust evaluation stays untouched). Plain `http://` local
   development paths behave exactly as before.
+- **Private Home Server VS-1 (Tailscale MagicDNS HTTPS)**: on the
+  dedicated Linux host (`hongscanner-srv`), `serve.py` stays bound to
+  loopback `127.0.0.1:8080` and `tailscale serve --bg --https=443
+  http://127.0.0.1:8080` terminates Let's Encrypt HTTPS for the
+  tailnet. Build the APK against the MagicDNS origin (**without a
+  trailing `/`**):
+  ```sh
+  flutter clean && flutter build apk --dart-define=HS_API_BASE=https://hongscanner-srv.<tailnet-name>.ts.net
+  ```
+  - **Android Private DNS**: on the phone (`sm-s938n`), Android Private
+    DNS must **not** override Tailscale's MagicDNS (`100.100.100.100`)
+    with a custom public DoT server (for example `dns.google` or
+    `one.one.one.one`), or `.ts.net` queries bypass `100.100.100.100`
+    when Tailscale cannot intercept DoT; keep Private DNS set to
+    Off/Automatic so MagicDNS resolves `hongscanner-srv.<tailnet-name>.ts.net`.
+  - **Certificate Transparency & plan boundary**: Let's Encrypt TLS
+    certificates issued for `hongscanner-srv.<tailnet-name>.ts.net` are
+    recorded in public Certificate Transparency (CT) logs (the `.ts.net`
+    hostname is public metadata even though network traffic stays
+    tailnet-only with Funnel disabled), and the Tailscale Personal plan
+    is for non-commercial personal use.
 
-## Basic Auth & HTTPS (Northflank front)
+## Basic Auth & HTTPS (Northflank / Private Home Server VS-1 fronts)
 
 The API server itself has no authentication (`tools/api/README.md` §5);
-remote reachability comes from a deployment front (Northflank HTTPS with
-Basic Auth), which the app supports as follows:
+remote reachability comes from a deployment front — either **Private
+Home Server VS-1** (`tailscale serve` HTTPS + Tailscale Grants:
+`"acls": []`, server tagged `tag:hongscanner-srv`, phone identified via
+`"hosts": {"sm-s938n": "100.x.y.z/32"}` with `"ip": ["tcp:443"]` only,
+Funnel disabled — no HTTP Basic Auth prompt needed) or the deferred
+**Northflank** cloud front (Northflank HTTPS ingress with Basic Auth),
+which the app supports as follows:
 
 - **Every API request** carries `Authorization: Basic
   <base64(user:password)>` once a credential pair is armed; with no pair
@@ -117,8 +143,12 @@ Basic Auth), which the app supports as follows:
   "인증 필요 (401)" error states with no further auth retries. The
   existing bounded resync backoff is unchanged.
 - The stored pair is used for whatever origin `HS_API_BASE` points at;
-  pointing the app at a different (unauthenticated) origin, such as the
-  local loopback API, still works — no 401, no dialog, no header needed.
+  pointing the app at a different (unauthenticated or network-layer
+  authenticated) origin, such as the local loopback API or the Private
+  Home Server VS-1 `https://hongscanner-srv.<tailnet-name>.ts.net`
+  MagicDNS front (where Tailscale Grants enforce device/port access at
+  the WireGuard layer), works without storing Basic Auth credentials —
+  no 401, no dialog, no header needed.
 
 ## Screens — recorded facts only
 
