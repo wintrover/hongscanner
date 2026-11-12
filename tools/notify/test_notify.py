@@ -2367,6 +2367,140 @@ class TestWatchDispatcher(Base):
             worker.close()
 
 
+class TestRunScope(Base):
+    """The resident worker's run scope (README §1): only facts of the
+    watched run's session are dispatched. The historical ledger is
+    never swept, and a cross-session fact stays a ledger-only artifact
+    (no delivery record, no retry schedule)."""
+
+    def test_older_session_facts_are_never_dispatched(self):
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        old = [make_event(session_id="2026-11-11", seq=seq,
+                          observed_at="2026-11-11T15:13:32+09:00")
+               for seq in (1, 2)]
+        self.seed_ledger(cfg, old)
+        # An older session's pair already has a delivery state: the
+        # scope filter must leave it untouched (no new record).
+        write_jsonl(cfg["delivery_path"], [{
+            "attempts": 1, "device_id": "dev-1",
+            "event_id": old[0]["event_id"], "state": "PENDING",
+            "updated_at": "2026-11-11T15:13:33+09:00"}])
+        events_path = self._events_path()
+        new = self.event_line(session_id="2026-11-12", seq=1,
+                              observed_at="2026-11-12T09:12:33+09:00")
+        self._append_lines(events_path, [new])
+        transport = FakeTransport()
+        worker = self.dispatcher(cfg, transport, resident=True)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                worker.watch_tick(events_path, 0, None)
+            self.assertIn("watch scope session=2026-11-12", out.getvalue())
+            self.assertEqual(worker.counts.get("scope_skipped"), 2)
+            self.assertEqual(transport.send_count(), 1)
+            sends = [json.loads(r["data"])["message"]["data"]
+                     for r in transport.requests
+                     if r["url"] == FakeTransport.SEND_URL]
+            self.assertEqual(sends[0]["event_id"],
+                             json.loads(new)["event_id"])
+            records = self.delivery_records(cfg)
+            self.assertEqual(
+                [(r["event_id"], r["state"]) for r in records],
+                [(old[0]["event_id"], "PENDING"),
+                 (json.loads(new)["event_id"], "ACCEPTED")])
+        finally:
+            worker.close()
+
+    def test_tick_before_any_ingest_attempts_zero_sends(self):
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        self.seed_ledger(cfg, [make_event(session_id="2026-11-11", seq=1)])
+        events_path = self._events_path()
+        transport = FakeTransport()
+        worker = self.dispatcher(cfg, transport, resident=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                worker.watch_tick(events_path, 0, None)  # file absent
+            self.assertIsNone(worker._session_id)
+            self.assertEqual(transport.send_count(), 0)
+            self.assertEqual(self.delivery_records(cfg), [])
+            # A file with only an uncommitted (non-LF) line is the same
+            # wait: no session is learned, nothing is dispatched.
+            with open(events_path, "wb") as f:
+                f.write(self.event_line(session_id="2026-11-12", seq=1))
+            with contextlib.redirect_stdout(io.StringIO()):
+                offset, _ = worker.watch_tick(events_path, 0, None)
+            self.assertEqual(offset, 0)
+            self.assertIsNone(worker._session_id)
+            self.assertEqual(transport.send_count(), 0)
+            self.assertEqual(self.delivery_records(cfg), [])
+        finally:
+            worker.close()
+
+    def test_restart_resends_undelivered_pairs_of_the_same_session(self):
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        events_path = self._events_path()
+        a = self.event_line(session_id="2026-11-12", seq=1,
+                            observed_at="2026-11-12T09:12:33+09:00")
+        b = self.event_line(session_id="2026-11-12", seq=2,
+                            observed_at="2026-11-12T09:12:34+09:00")
+        self._append_lines(events_path, [a])
+        first = self.dispatcher(cfg, FakeTransport(), resident=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                first.watch_tick(events_path, 0, None)
+        finally:
+            first.close()
+        self.assertEqual([r["state"] for r in self.delivery_records(cfg)],
+                         ["ACCEPTED"])
+        # b arrives after the worker stopped: the restart's full rescan
+        # re-ingests a (idempotent) and sends only the undelivered b.
+        self._append_lines(events_path, [b])
+        transport = FakeTransport()
+        second = self.dispatcher(cfg, transport, resident=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                second.watch_tick(events_path, 0, None)
+        finally:
+            second.close()
+        self.assertEqual(transport.send_count(), 1)
+        records = self.delivery_records(cfg)
+        self.assertEqual([r["event_id"] for r in records],
+                         [json.loads(a)["event_id"],
+                          json.loads(b)["event_id"]])
+        self.assertEqual([r["state"] for r in records],
+                         ["ACCEPTED", "ACCEPTED"])
+
+    def test_suppressed_fact_of_the_watched_session_stays_suppressed(self):
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        cfg["admission"] = {"RANK_CHANGED": "suppress"}
+        self.register("dev-1")
+        events_path = self._events_path()
+        rank = self.event_line(session_id="2026-11-12", seq=1,
+                               event_type="RANK_CHANGED",
+                               rule_id="rank-changed",
+                               previous_rank=5, rank=2,
+                               observed_at="2026-11-12T09:12:33+09:00")
+        self._append_lines(events_path, [rank])
+        transport = FakeTransport()
+        worker = self.dispatcher(cfg, transport, resident=True)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                worker.watch_tick(events_path, 0, None)
+        finally:
+            worker.close()
+        self.assertEqual(transport.send_count(), 0)
+        self.assertEqual(self.delivery_records(cfg), [])
+        self.assertEqual(worker.counts.get("type_skipped"), 1)
+        self.assertEqual(worker.counts.get("scope_skipped"), 0)
+
+
 # ------------------------------------------------ admission report
 
 

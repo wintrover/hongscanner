@@ -62,6 +62,20 @@ the event ledger is opened with the writer lock). Each tick
      in-sweep sleep): a 429 Retry-After wait never delays a new event.
      Nothing is parked — the resident worker resumes its own pairs.
 
+Run scope (README §1): the resident worker dispatches only facts of
+the run it watches. The scope is the session_id learned from the
+watched file's own ingested bytes (every fact carries it; the file is
+one session) and the first validated batch pins it for the process.
+Until it is known — file absent, empty or without a committed line
+yet — the worklist is EMPTY: the historical ledger is never swept.
+A fact of another session is counted scope_skipped and never forms a
+pair: no delivery record, no retry schedule (it is a ledger-only
+artifact of another run). A stale market fact is not actionable, so
+the cross-session grace window is 0 by default; widening it is a user
+policy decision, not a dispatcher default. The one-shot sweep and
+--admission-report stay unscoped (backward compatibility; the report
+replays exactly the file it is given).
+
 Admission report (--admission-report <abs events file>): the replay
 tool (README §9) — no send, no ledger write. The first line states the
 policy source (the config admission section or the default plan B —
@@ -176,6 +190,12 @@ class Dispatcher:
         # the epoch second a pair becomes due again. Persists across
         # ticks; a one-shot sweep builds its own local map.
         self._next_due = {}
+        # The resident run scope (README §1): the session_id of the
+        # watched run, learned from the watched file's own ingested
+        # bytes and pinned by the first validated batch. None until
+        # then — the resident worklist is empty (fail-closed): the
+        # historical ledger is never swept.
+        self._session_id = None
         # SIGTERM/SIGINT set this between-ticks stop request.
         self._stop = False
 
@@ -188,17 +208,41 @@ class Dispatcher:
 
     # ------------------------------------------------------ selection
 
-    def _candidates(self, events, state, devices):
+    def _candidates(self, events, state, devices, session_id=None,
+                    run_scoped=False):
         """The worklist in deterministic order (ledger order, then
-        sorted device id), after the admission filter and dedup.
-        Counters record what the policy and the suppression removed:
-        type_skipped counts every fact the policy judges suppress —
-        types outside the admission universe and types the config maps
-        to suppress alike (the old type filter's meaning, same
-        counter)."""
+        sorted device id), after the run scope, the admission filter
+        and dedup. With run_scoped (the resident worker) only facts of
+        the watched run's session are candidates: the scope is the
+        session_id learned from the watched file's own ingested bytes
+        (README §1). While it is unknown (file absent, empty or
+        without a committed line yet) the worklist is EMPTY —
+        fail-closed, the historical ledger is never swept. A fact of
+        another session is counted scope_skipped and never forms a
+        pair: it gets no delivery record and no retry schedule (it is
+        a ledger-only artifact of another run). Counters record what
+        the scope and the policy removed: type_skipped counts every
+        in-scope fact the policy judges suppress — types outside the
+        admission universe and types the config maps to suppress alike
+        (the old type filter's meaning, same counter)."""
+        self.counts["events_total"] = len(events)
+        self.counts["devices_active"] = len(devices)
+        if run_scoped and session_id is None:
+            self.counts["scope_skipped"] = 0
+            self.counts["type_skipped"] = 0
+            return []
+        scope_skipped = 0
+        in_scope = []
+        for event in events:
+            if run_scoped and event["session_id"] != session_id:
+                scope_skipped += 1
+                continue
+            in_scope.append(event)
+        if run_scoped:
+            self.counts["scope_skipped"] = scope_skipped
         notifyable = 0
         pairs = []
-        for event in events:
+        for event in in_scope:
             if notify_config.admission_mode(self.cfg,
                                             event["event_type"]) == \
                     "suppress":
@@ -218,9 +262,7 @@ class Dispatcher:
                     continue
                 pairs.append((event, device_id,
                               record["attempts"] if record else 0))
-        self.counts["events_total"] = len(events)
-        self.counts["type_skipped"] = len(events) - notifyable
-        self.counts["devices_active"] = len(devices)
+        self.counts["type_skipped"] = len(in_scope) - notifyable
         return pairs
 
     # ------------------------------------------------------- delivery
@@ -600,6 +642,7 @@ class Dispatcher:
                       "refused=1 offset=%d" % (len(lines), offset))
             # The offset stays: the refused batch is re-read next tick.
         else:
+            self._learn_session(lines, path)
             self._log("watch tick new=%d ingested=%d appended=%d "
                       "dup=%d offset=%d"
                       % (stats["total"], stats["total"],
@@ -608,6 +651,35 @@ class Dispatcher:
             offset = new_offset
         self.dispatch_tick()
         return offset, ident
+
+    def _learn_session(self, lines, path):
+        """Learn the run scope from the watched file's own ingested
+        bytes (README §1): every fact carries session_id and the file
+        is one session, so the first validated batch pins the scope for
+        this process. A batch carrying several session ids is a
+        contract violation: the scope is not learned (fail-closed, no
+        dispatch) and a stderr alarm names it. Once pinned, a later
+        batch of another session never widens the scope — its facts
+        stay ledger-only and are counted scope_skipped."""
+        session_ids = set()
+        for line in lines:
+            session_ids.add(json.loads(line.decode("utf-8"))["session_id"])
+        if len(session_ids) != 1:
+            # The watched file is one session (contract): a mixed batch
+            # cannot teach the run scope. With no scope yet the worker
+            # stays fail-closed (empty worklist); a pinned scope keeps
+            # deciding and the other-session facts are scope_skipped.
+            if self._session_id is None:
+                print("dispatcher: WATCH SCOPE AMBIGUOUS (%s): a batch "
+                      "carries %d session ids; the watched file is one "
+                      "session, so the run scope is not learned and the "
+                      "resident worklist stays empty (fail-closed)"
+                      % (path, len(session_ids)), file=sys.stderr)
+            return
+        session_id = session_ids.pop()
+        if self._session_id is None:
+            self._session_id = session_id
+            self._log("watch scope session=%s" % session_id)
 
     def dispatch_tick(self):
         """One resident dispatch pass (README §5): re-read the small
@@ -623,7 +695,9 @@ class Dispatcher:
         state = self.delivery.read_state()
         events = self.ledger.events(strict=False)
         devices = self.registry.devices()
-        pairs = self._candidates(events, state, devices)
+        pairs = self._candidates(events, state, devices,
+                                 session_id=self._session_id,
+                                 run_scoped=True)
         next_due = self._next_due
         for event, device_id, _attempts in pairs:
             pair = (event["event_id"], device_id)

@@ -34,6 +34,10 @@ Nim Core (src/hs/*, PR-4의 단일 판정 함수 step)
   불일치 중복은 거부), 같은 틱 안에서 정책 판정(§0의 어드미션
   게이트) → 중복 억제 → 관측 그룹 조립(§0·§6) → FCM HTTP v1 전송 →
   전달 기록 append(append-only + fsync)까지 수행한다.
+  **실행 범위(run scope)**: worker는 감시 파일의 ingest된 바이트에서
+  session_id를 학습해 그 세션의 팩트만 발송한다(§1). scope를 알기
+  전(파일 부재·빈 파일·미완결 라인)에는 worklist가 비어 있다 — 과거
+  ledger를 훑지 않는다(fail-closed).
   시작·종료는 세션 런처(`tools/run_session.sh`)가 명시적으로 관리하고,
   프로세스 감시·재시작은 systemd에 위임한다(§11).
         ↓ 기기 등록 (별도 프로세스)
@@ -118,6 +122,27 @@ Python register 프로세스 (notify_register.py)
   않는다. 파일 부재(FileNotFoundError)는 대기 대상이지 오류가 아니다.
   worker는 파일 규모가 작으므로 매 틱 registry·delivery·ledger 상태를
   재읽는다.
+- **실행 범위(run scope) — 상주 worker의 worklist는 감시 중인 실행의
+  세션으로 한정된다**: worker는 감시 파일에서 ingest한 바이트의
+  `session_id`로 scope를 학습하고, 첫 검증 배치가 그 값을 프로세스
+  수명 동안 고정한다(파일은 한 세션이다 — 계약). scope를 알기 전
+  (파일 부재·빈 파일·아직 LF 완결 라인 없음)에는 worklist가 **0쌍**이며
+  과거 ledger를 스윕하지 않는다. 다른 세션의 팩트는 `scope_skipped`로만
+  세고 pair·전달 기록·재시도 스케줄을 만들지 않는다 — 그 팩트는 다른
+  실행의 ledger-only 산출물이고, 오래된 시장 팩트는 실행 가능하지
+  않으며(fail-closed timely delivery 위반) 재분류된 과거 팩트가 오늘의
+  버스트로 나가는 것을 막는다. **cross-session grace window는 기본
+  0이다**: 넓히는 것은 사용자 정책 결정이지 dispatcher 기본값이 아니다.
+  배치가 여러 session_id를 담으면(파일=한 세션 계약 위반) scope를
+  학습하지 않는다 — scope 미확인 상태면 stderr 경고 후 무발송
+  (fail-closed), 이미 고정된 scope가 있으면 그 scope의 팩트만 발송하고
+  나머지는 `scope_skipped`다. 재시작은 같은 세션 파일을 전체 재스캔해
+  scope를 다시 학습하고 **이 세션의 미전달 쌍**을 재시도한다
+  (ACCEPTED dedup·FAILED terminal·PENDING 재시도
+  의미 불변). 감시 경로가 다른 세션 파일로 교체되면 그 팩트는
+  scope_skipped로 남는다 — 새 세션은 새 worker 기동이 계약이다.
+  1회성 스위프와 `--admission-report`는 unscoped다(하위 호환·주어진
+  파일 그대로의 재생).
 
 ## 2. 이벤트 ledger (notify_ledger.py)
 
@@ -378,6 +403,10 @@ Python register 프로세스 (notify_register.py)
   전송 후보 쌍(`pairs_to_send`)과 outcome 카운터가 모두 그 안에
   있다. 상주 모드의 누적 카운터 `messages_sent`는 **시도한 메시지
   수**다(사건 수 아님 — 관측 그룹 유닛 1통이 여러 사건을 덮는다).
+  `scope_skipped`는 마지막 틱에서 실행 범위 밖(다른 세션)으로 걸러진
+  팩트 수다(전달 기록 없음, §1). `type_skipped`는 scope 안에서 정책이
+  suppress로 판정한 수만 센다 — 범위 밖 팩트는 어드미션 판정 전에
+  제외된다.
 - **`--admission-report <abs events 파일>` — 재생 도구**: 발송도
   원장 기록도 없이(Dispatcher를 만들지도 않는다) 파일의 모든 사건을
   실운용과 **같은 어드미션 코드**(admission_mode·
@@ -430,6 +459,8 @@ Python register 프로세스 (notify_register.py)
   방어용 일반 조립, min_severity 미검증, watch_poll_seconds 경계,
   상주 watch 틱 계약(비-LF 꼬리 미소비·배치 all-or-nothing·(dev,ino)
   전체 재스캔·틱 사이 재시도 이연·shrink LedgerFault·관측 그룹 경계),
+  **실행 범위**(과거 세션 팩트 무발송·scope 미확인 틱 0발송·재시작 후
+  같은 세션 미전달 쌍 재전송·세션 내 suppress 유지),
   **admission report**(사건별 판정 전표·첫 줄 policy source·플랜
   미러·바이트 동일 재생·발송 경로와 같은 compose 증명·거부 플랜·CLI
   exit 0/2/4·ledger 미생성), 그리고 실 OS 프로세스 1건(SIGTERM 정상
@@ -510,7 +541,9 @@ Python register 프로세스 (notify_register.py)
   틱 계약 전반 — 비-LF 꼬리 미소비, 배치 all-or-nothing·멱등,
   (dev,ino) 전체 재스캔, 틱 사이 재시도 이연(429 중 신규 이벤트
   지속), shrink LedgerFault, watch_poll_seconds 검증, SIGTERM 정상
-  종료 + 재기동 멱등(서브프로세스); **admission 게이트**(기본 안B·
+  종료 + 재기동 멱등(서브프로세스), **실행 범위**(scope 미확인 0발송·
+  과거 세션 scope_skipped·재시작 미전달 재전송·세션 내 suppress);
+  **admission 게이트**(기본 안B·
   admission 섹션 엄격 검증·부분 병합·suppress=type_skipped·전달 기록
   미생성); **관측 그룹 발송**(배치당 사운드 1+무음 1 상한·summary/
   digest 조립 문안·그룹 data 계약 kind/event_ids/count·멤버별 기록·
