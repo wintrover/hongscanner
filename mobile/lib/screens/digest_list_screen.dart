@@ -23,7 +23,7 @@ class DigestListScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final store = AppScope.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('다이제스트 사건 목록')),
+      appBar: AppBar(title: const Text('TOP10 순위 요약')),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(16),
@@ -32,7 +32,7 @@ class DigestListScreen extends StatelessWidget {
               context,
               store.digestEvents,
               loaded: (context, details) => _DigestBody(details: details),
-              emptyMessage: '다이제스트 기록 없음',
+              emptyMessage: '요약된 사건 없음',
               onRetry: store.refreshDigest,
             ),
           ],
@@ -49,7 +49,7 @@ class _DigestBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (details.isEmpty) return const SectionEmpty(message: '다이제스트 기록 없음');
+    if (details.isEmpty) return const SectionEmpty(message: '요약된 사건 없음');
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
       child: Padding(
