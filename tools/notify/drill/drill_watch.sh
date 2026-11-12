@@ -7,16 +7,20 @@
 ##
 ## Scenarios (the resident contract, tools/notify/README.md §1/§5/§9):
 ##   W1  incremental tail: a full LF line is picked up within N ticks
-##       and sent; a HALF line (no LF) is never consumed — no send, the
-##       ledger count unchanged — until its LF arrives, then it is
-##       delivered; a 5-event burst in one write is delivered as ONE
+##       and sent as the session's first audible single; a HALF line
+##       (no LF) is never consumed — no send, the ledger count
+##       unchanged — until its LF arrives, then it is delivered folded
+##       into a silent digest under the 60-minute Global Attention
+##       Budget; a 5-event burst in one write is delivered as ONE
 ##       digest message covering all five (one silent push per
 ##       observation group, README §0), and a mixed group (an entry,
-##       an exit and two rank changes, same observed_at) as ONE
-##       summary + ONE digest;
-##   W2  SIGKILL the worker after ACCEPTED sends, restart it: the full
-##       rescan is idempotent (no duplicate send, appended=0 dup=2) and
-##       the restarted worker still tails NEW events;
+##       an exit and two rank changes, within the 60-minute cooldown)
+##       folds its immediate pair into ONE silent digest (count=4);
+##   W2  SIGKILL the worker after ACCEPTED summary send, restart it: the
+##       full rescan is idempotent (no duplicate send, appended=0 dup=2)
+##       and the restarted worker restores the audible budget from
+##       delivery.hcj.jsonl and folds a new event within 60m into a
+##       silent digest;
 ##   W3  a 429 with Retry-After=3s defers its pair between ticks (no
 ##       in-sweep sleep): a NEW event appended right after the 429 is
 ##       sent promptly while the deferred pair waits, and the retry
@@ -359,16 +363,14 @@ append_events_spec "$SB" '[
   {"seq": 23, "event_type": "RANK_CHANGED", "rule_id": "rank-changed",
    "previous_rank": 11, "rank": 1}
 ]'
-if wait_sends "$SB/wire.log" 5 15; then
-  ok "W1 a mixed observation group is one summary + one digest"
+if wait_sends "$SB/wire.log" 4 15; then
+  ok "W1 a mixed observation group within the 60m budget folds into one digest"
 else
   bad "W1 mixed group was not delivered in 15s"
 fi
-check_contains "W1 the immediate pair is one summary" \
-  "$(cat "$SB/wire.log")" "SEND summary count=2 first="
-check_contains "W1 the rank pair is one digest" \
-  "$(cat "$SB/wire.log")" "SEND digest count=2 first="
-check_eq "W1 five messages total for 11 events" 5 \
+check_contains "W1 the mixed group is folded into one silent digest (count=4)" \
+  "$(cat "$SB/wire.log")" "SEND digest count=4 first="
+check_eq "W1 four messages total for 11 events (1 sound, 3 silent digests)" 4 \
   "$(count_sends "$SB/wire.log")"
 check_eq "W1 ledger holds all 11 events" 11 \
   "$(count_lines "$SB/ledger.hcj.jsonl")"
@@ -390,12 +392,12 @@ for r in records:
     by_mid.setdefault(r["provider_message_id"], []).append(r)
 ck("eleven delivery records cover the eleven events once each",
    len(records) == 11)
-ck("kinds split single 2 / summary 2 / digest 7",
-   kinds == {"single": 2, "summary": 2, "digest": 7})
+ck("kinds split single 1 / digest 10 under the 60m budget",
+   kinds == {"single": 1, "digest": 10})
 ck("every record is ACCEPTED",
    all(r["state"] == "ACCEPTED" for r in records))
-ck("five messages: group sizes 1,1,2,2,5",
-   sorted(len(v) for v in by_mid.values()) == [1, 1, 2, 2, 5])
+ck("four messages: group sizes 1,1,4,5",
+   sorted(len(v) for v in by_mid.values()) == [1, 1, 4, 5])
 ck("members of one message share its provider id",
    all(len({r["provider_message_id"] for r in v}) == 1
        for v in by_mid.values()))
@@ -423,6 +425,8 @@ if wait_sends "$SB/wire.log" 1 15; then
 else
   bad "W2 events were not delivered in 15s"
 fi
+check_contains "W2 initial batch sent as one audible summary" \
+  "$(cat "$SB/wire.log")" "SEND summary count=2 first="
 
 kill -9 "$WPID" 2>/dev/null || true
 KRC=0; wait "$WPID" 2>/dev/null || KRC=$?
@@ -445,6 +449,8 @@ else
 fi
 check_eq "W2 one new send only (2 total)" 2 \
   "$(count_sends "$SB/wire.log")"
+check_contains "W2 post-restart event within 60m folded into silent digest" \
+  "$(cat "$SB/wire.log")" "SEND digest count=1 first="
 
 stop_worker w2b
 check_eq "W2 second worker SIGTERM exit 0" 0 "$WORKER_RC"

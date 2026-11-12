@@ -30,7 +30,15 @@ One-shot sweep (default; the backward-compatible form):
      sound message — kind "single" when alone (the exact per-event
      message form), kind "summary" when two or more — and the group's
      digest events ONE silent message (kind "digest"): a group never
-     costs more than one sound + one silent push;
+     costs more than one sound + one silent push. Across groups the
+     Global Attention Budget v1 (README §0) admits a sound only when
+     BOTH the market observation time (observed_at) and the dispatch
+     time (updated_at / the dispatcher clock) advanced by
+     audible_cooldown_seconds (default 3600) from the run scope's
+     sound high-water mark (ACCEPTED or PENDING records, all devices,
+     monotonic); inside the window a group's immediate events fold
+     into its silent digest, and a PENDING sound unit keeps the
+     reservation it already made (a retry never bypasses the window);
   5. append one delivery record per covered event and outcome
      (PENDING on retryable failures, ACCEPTED / FAILED otherwise;
      every record carries message_kind, digest members share the
@@ -131,23 +139,28 @@ import notify_ledger
 NOTIFIABLE_EVENT_TYPES = notify_fcm.TOP10_EVENT_TYPES
 
 
-def compose_admission_units(events, cfg):
+def compose_admission_units(events, cfg, allow_audible=True):
     """The admission send plan for ONE observation group (same
     observed_at, same device; README §0): the events the policy judges
     "immediate" become ONE sound unit — kind "single" when the event is
     alone, "summary" when two or more — and the "digest" events ONE
     silent unit (kind "digest"); a group never yields more than one
     sound + one silent unit. Ledger order is preserved inside each unit
-    and the sound unit precedes the silent one. THE SAME function plans
-    the dispatcher's sends and the admission report's output: replay
-    composes exactly what production composes."""
+    and the sound unit precedes the silent one. With allow_audible
+    False (the Global Attention Budget window is spent) every
+    immediate event folds into the silent digest unit instead — the
+    facts stay in the ledger and the digest's event_ids, only the
+    sound is withheld; the caller's sound budget never rings. THE
+    SAME function plans the dispatcher's sends and the admission
+    report's output: replay composes exactly what production
+    composes."""
     immediate = []
     digest = []
     for event in events:
         mode = notify_config.admission_mode(cfg, event["event_type"])
-        if mode == "immediate":
+        if mode == "immediate" and allow_audible:
             immediate.append(event)
-        elif mode == "digest":
+        elif mode in ("immediate", "digest"):
             digest.append(event)
     units = []
     if immediate:
@@ -196,6 +209,11 @@ class Dispatcher:
         # then — the resident worklist is empty (fail-closed): the
         # historical ledger is never swept.
         self._session_id = None
+        # The last in-scope event snapshot (the resident worker's
+        # ledger read, or the one-shot sweep's): the audible watermarks
+        # and a direct sweep_pass call both need the in-scope facts,
+        # not just the due pairs.
+        self._last_events = []
         # SIGTERM/SIGINT set this between-ticks stop request.
         self._stop = False
 
@@ -274,7 +292,11 @@ class Dispatcher:
             "device_id": device_id,
             "event_id": event["event_id"],
             "state": state,
-            "updated_at": notify_ledger.now_iso(),
+            # The dispatcher's own clock domain (README §3): the same
+            # `_clock()` the retry schedule and the audible budget read,
+            # so production (time.time) and tests (fake clock) agree on
+            # what `updated_at` means.
+            "updated_at": notify_ledger.now_iso(self._clock()),
         }
         if error_code is not None:
             record["error_code"] = error_code
@@ -356,6 +378,12 @@ class Dispatcher:
                        provider_message_id=outcome.provider_message_id)
             self.counts["accepted"] = \
                 self.counts.get("accepted", 0) + len(events)
+            if msg_kind in ("single", "summary"):
+                self.counts["audible_admitted_count"] = \
+                    self.counts.get("audible_admitted_count", 0) + 1
+            elif msg_kind == "digest":
+                self.counts["silent_digest_update_count"] = \
+                    self.counts.get("silent_digest_update_count", 0) + 1
             if msg_kind == "single":
                 self._log("dispatch result=accepted %s attempts=%d "
                           "status=200 message=%s" %
@@ -451,16 +479,96 @@ class Dispatcher:
         prefix = notify_ledger.now_iso() + " " if self._resident else ""
         print(prefix + line, flush=True)
 
+    # ---------------------------------------------------- audible budget
+
+    def _is_audible_record(self, rec, event):
+        """True when the delivery record is a sound admission: a
+        'single'/'summary' record — or a pre-message_kind record whose
+        event type the policy judges immediate (the legacy audible
+        form) — in ACCEPTED or PENDING state (README §0 Global
+        Attention Budget v1). Both states reserve/consume the sound
+        budget: a retry can never bypass the 60-minute window."""
+        if rec is None:
+            return False
+        if rec.get("state") not in ("ACCEPTED", "PENDING"):
+            return False
+        if rec.get("message_kind") in ("single", "summary"):
+            return True
+        if "message_kind" not in rec and \
+           notify_config.admission_mode(self.cfg,
+                                        event["event_type"]) == \
+           "immediate":
+            return True
+        return False
+
+    def _is_pending_audible(self, rec, event):
+        """A sound admission still awaiting its retry: it already
+        reserved the budget in the earlier attempt."""
+        return rec is not None and rec.get("state") == "PENDING" and \
+            self._is_audible_record(rec, event)
+
+    def _audible_watermarks(self, events, state):
+        """The Global Attention Budget's high-water marks across the
+        whole run scope (all devices: the budget is global, README
+        §0): the latest observed_at of a sound-admitted fact and the
+        latest dispatch time (updated_at) of a sound delivery record.
+        max() keeps both marks monotonic — an out-of-order event never
+        moves a mark backward. Returns (last_obs_epoch,
+        last_disp_epoch), each None when no sound record exists."""
+        in_scope = [event for event in events
+                    if not (self._resident and
+                            self._session_id is not None) or
+                    event["session_id"] == self._session_id]
+        event_by_id = {event["event_id"]: event for event in in_scope}
+        last_obs_epoch = None
+        last_disp_epoch = None
+        for (event_id, _device_id), rec in state.items():
+            event = event_by_id.get(event_id)
+            if event is None or not self._is_audible_record(rec, event):
+                continue
+            obs_epoch = notify_ledger.iso_to_epoch(event["observed_at"])
+            disp_epoch = notify_ledger.iso_to_epoch(rec["updated_at"])
+            last_obs_epoch = obs_epoch if last_obs_epoch is None else \
+                max(last_obs_epoch, obs_epoch)
+            last_disp_epoch = disp_epoch if last_disp_epoch is None else \
+                max(last_disp_epoch, disp_epoch)
+        return last_obs_epoch, last_disp_epoch
+
     # ---------------------------------------------------------- sweep
 
-    def _plan_units(self, due):
+    def _plan_units(self, due, events=None, state=None, now_epoch=None):
         """The send units for the due pairs, deterministically: group
         by (observed_at, device_id) in ledger first-appearance order,
         then compose_admission_units per group (sound before silent
         within a group). The grouping is derived from the ledger on
         every pass, so a deferred unit is reassembled with exactly the
         same members (members of one group share one next_due and can
-        never drift into different passes)."""
+        never drift into different passes).
+
+        The Global Attention Budget v1 gate (README §0): a fresh
+        group's sound is admitted only when BOTH clocks advanced by
+        audible_cooldown_seconds from the high-water marks — the
+        market observation time (observed_at) and the dispatch time
+        (updated_at / the dispatcher clock). Otherwise the group's
+        immediate events fold into its silent digest. A negative
+        difference (time regression) is below the cooldown, so it is
+        fail-closed; the marks themselves only move forward. Groups of
+        the same observed_at as an already-admitted group in this pass
+        sound too (one observation batch rings on every device). A
+        PENDING sound unit is a reservation already made: it retries
+        as sound regardless of the window."""
+        cooldown = self.cfg.get("audible_cooldown_seconds",
+                                notify_config.AUDIBLE_COOLDOWN_DEFAULT)
+        if not isinstance(cooldown, int) or isinstance(cooldown, bool) or \
+           cooldown < 1:
+            raise notify_config.ConfigError(
+                "audible_cooldown_seconds must be a positive integer")
+        last_obs_epoch, last_disp_epoch = self._audible_watermarks(
+            events or [], state or {})
+        now_sec = int(self._clock() if now_epoch is None else now_epoch) \
+            if (events is not None or state is not None or
+                now_epoch is not None) else None
+        admitted_obs_in_pass = None
         groups = {}
         order = []
         for event, device_id in due:
@@ -471,14 +579,49 @@ class Dispatcher:
             groups[key].append(event)
         units = []
         for key in order:
-            for msg_kind, events in compose_admission_units(
-                    groups[key], self.cfg):
-                units.append({"kind": msg_kind, "device_id": key[1],
-                              "events": events})
+            obs_ts, device_id = key
+            retrying_audible = [
+                event for event in groups[key]
+                if state and self._is_pending_audible(
+                    state.get((event["event_id"], device_id)), event)]
+            fresh = [
+                event for event in groups[key]
+                if not (state and self._is_pending_audible(
+                    state.get((event["event_id"], device_id)), event))]
+            if retrying_audible:
+                units.append({
+                    "kind": "single" if len(retrying_audible) == 1
+                    else "summary",
+                    "device_id": device_id,
+                    "events": retrying_audible,
+                })
+            if not fresh:
+                continue
+            obs_epoch = notify_ledger.iso_to_epoch(obs_ts)
+            if admitted_obs_in_pass == obs_ts:
+                allow_audible = True
+            else:
+                obs_ok = last_obs_epoch is None or \
+                    (obs_epoch - last_obs_epoch) >= cooldown
+                disp_ok = last_disp_epoch is None or now_sec is None or \
+                    (now_sec - last_disp_epoch) >= cooldown
+                allow_audible = obs_ok and disp_ok
+            for msg_kind, unit_events in compose_admission_units(
+                    fresh, self.cfg, allow_audible=allow_audible):
+                units.append({"kind": msg_kind, "device_id": device_id,
+                              "events": unit_events})
+                if msg_kind not in ("single", "summary"):
+                    continue
+                admitted_obs_in_pass = obs_ts
+                last_obs_epoch = obs_epoch if last_obs_epoch is None \
+                    else max(last_obs_epoch, obs_epoch)
+                if now_sec is not None:
+                    last_disp_epoch = now_sec if last_disp_epoch is None \
+                        else max(last_disp_epoch, now_sec)
         return units
 
     def sweep_pass(self, pairs, state, token_by_device, next_due,
-                   park_beyond_cap=True):
+                   park_beyond_cap=True, events=None):
         """One pass over the worklist: the due pairs are composed into
         observation-group send units (README §0/§6) and every unit is
         sent; returns the number of MESSAGES attempted (a unit is one
@@ -488,7 +631,16 @@ class Dispatcher:
         scheduler resume) a wait beyond backoff_cap_seconds parks the
         unit (next_due None, the records stay PENDING) instead; the
         resident worker passes False — it is its own resume, nothing
-        is parked."""
+        is parked. `events` is the in-scope fact snapshot the audible
+        watermarks read; a direct caller without one gets the last
+        snapshot merged with the pairs' own facts."""
+        if events is None:
+            events = list(self._last_events)
+            known = {event["event_id"] for event in events}
+            for event, _device_id in pairs:
+                if event["event_id"] not in known:
+                    events.append(event)
+                    known.add(event["event_id"])
         now = self._clock()
         due = []
         for event, device_id, _attempts in pairs:
@@ -498,7 +650,8 @@ class Dispatcher:
                 continue
             due.append((event, device_id))
         sent = 0
-        for unit in self._plan_units(due):
+        for unit in self._plan_units(due, events=events, state=state,
+                                     now_epoch=now):
             device_id = unit["device_id"]
             kind, wait = self._attempt_unit(unit,
                                             token_by_device[device_id],
@@ -526,6 +679,7 @@ class Dispatcher:
         sleeping happens between passes, on the (single) retry wait."""
         state = self.delivery.read_state()
         events = self.ledger.events(strict=False)
+        self._last_events = events
         devices = self.registry.devices()
         pairs = self._candidates(events, state, devices)
         self.counts["pairs_to_send"] = len(pairs)
@@ -536,7 +690,8 @@ class Dispatcher:
 
         token_by_device = dict(devices)
         while True:
-            if self.sweep_pass(pairs, state, token_by_device, next_due):
+            if self.sweep_pass(pairs, state, token_by_device, next_due,
+                               events=events):
                 continue
             pending = [due_at for due_at in next_due.values()
                        if due_at is not None]
@@ -694,6 +849,7 @@ class Dispatcher:
         attempted."""
         state = self.delivery.read_state()
         events = self.ledger.events(strict=False)
+        self._last_events = events
         devices = self.registry.devices()
         pairs = self._candidates(events, state, devices,
                                  session_id=self._session_id,
@@ -704,7 +860,7 @@ class Dispatcher:
             if pair not in next_due:
                 next_due[pair] = 0.0
         sent = self.sweep_pass(pairs, state, dict(devices), next_due,
-                               park_beyond_cap=False)
+                               park_beyond_cap=False, events=events)
         self.counts["messages_sent"] = \
             self.counts.get("messages_sent", 0) + sent
         return sent
@@ -736,6 +892,10 @@ def admission_report(cfg, events_path):
     verdict line per fact (file order), then per observation group the
     send summary and the composed message plan (title/body/event_ids —
     the exact composition the dispatcher would send), then the totals.
+    The Global Attention Budget v1 is replayed from the file alone (the
+    observed_at high-water mark; there is no clock): an immediate event
+    folded into its group's digest is reported DIGEST/digest, matching
+    the plan and the silent total.
     No send, no ledger write, no clock: the same file + policy always
     prints the same bytes. A plan whose composed payload would exceed
     the vendor limit is printed as refused (the same
@@ -756,17 +916,36 @@ def admission_report(cfg, events_path):
             order.append(key)
         groups[key].append(event)
 
+    # The Global Attention Budget v1 replay (README §0): the same dual
+    # clock rule the dispatcher applies, derived from the file alone
+    # (the report has no clock and writes nothing) — a group's sound is
+    # admitted only after the observed_at high-water mark advanced by
+    # audible_cooldown_seconds. A folded immediate event is reported
+    # DIGEST/digest, matching the plan's silent unit and the totals.
+    cooldown = cfg.get("audible_cooldown_seconds",
+                       notify_config.AUDIBLE_COOLDOWN_DEFAULT)
+    if not isinstance(cooldown, int) or isinstance(cooldown, bool) or \
+       cooldown < 1:
+        raise notify_config.ConfigError(
+            "audible_cooldown_seconds must be a positive integer")
     plans = []
     forms = {}
+    last_obs_epoch = None
     for key in order:
+        obs_epoch = notify_ledger.iso_to_epoch(key)
+        allow_audible = last_obs_epoch is None or \
+            (obs_epoch - last_obs_epoch) >= cooldown
         group_plans = []
         for msg_kind, unit_events in compose_admission_units(
-                groups[key], cfg):
+                groups[key], cfg, allow_audible=allow_audible):
             plan = {"kind": msg_kind, "count": len(unit_events),
                     "event_ids": [event["event_id"]
                                   for event in unit_events]}
             for event in unit_events:
                 forms[event["event_id"]] = msg_kind
+            if msg_kind in ("single", "summary"):
+                last_obs_epoch = obs_epoch if last_obs_epoch is None \
+                    else max(last_obs_epoch, obs_epoch)
             try:
                 if msg_kind == "single":
                     message = notify_fcm.build_message(unit_events[0], "")
@@ -791,16 +970,19 @@ def admission_report(cfg, events_path):
     for event in events:
         event_type = event["event_type"]
         mode = notify_config.admission_mode(cfg, event_type)
-        if mode == "immediate":
-            verdict = "ADMIT"
-            form = forms.get(event["event_id"], "single")
-        elif mode == "digest":
-            verdict = "DIGEST"
-            form = "digest"
-        else:
+        if mode == "suppress":
             verdict = "SUPPRESS"
             form = "not_in_admission" if event_type not in \
                 notify_fcm.TOP10_EVENT_TYPES else "suppress"
+        elif forms.get(event["event_id"]) == "digest":
+            # An immediate event the attention budget folded into the
+            # group's digest is reported honestly as DIGEST/digest —
+            # the verdict matches the plan and the silent total.
+            verdict = "DIGEST"
+            form = "digest"
+        else:
+            verdict = "ADMIT"
+            form = forms.get(event["event_id"], "single")
         verdicts[verdict] += 1
         lines.append("admission event=%s type=%s observed_at=%s "
                      "verdict=%s form=%s" %

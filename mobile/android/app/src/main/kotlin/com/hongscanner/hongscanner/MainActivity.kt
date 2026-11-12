@@ -213,20 +213,32 @@ class MainActivity : FlutterActivity() {
                 putExtra(TAP_EVENT_IDS_KEY, eventIds)
             }
         }
-        // Stable id per message unit: a single event keys on its own id
-        // (a re-delivery updates the post in place instead of stacking
-        // a second notification); a summary/digest keys on kind + the
-        // representative id, so a roll-up never overwrites the single
-        // alert of an event it covers (nor a sound summary a silent
-        // digest of the same cover list). The same value is the
-        // PendingIntent request code — two units must not share one
-        // PendingIntent, or FLAG_UPDATE_CURRENT would swap their tap
-        // extras.
+        // Stable slot per message unit. Audible units (single, summary)
+        // keep distinct unit ids under tag = null: a single event keys
+        // on its own id (a re-delivery updates the post in place instead
+        // of stacking a second notification) and a summary keys on kind
+        // + the representative id, so a roll-up never overwrites the
+        // single alert of an event it covers. Silent digest units share
+        // one replaceable slot with background FCM posts: Firebase
+        // Messaging's DisplayNotification posts
+        // notify("market_rank_digest", 0, ...) for a message carrying
+        // android.notification.tag = "market_rank_digest", so the
+        // foreground post uses the same (tag, id) and the shade holds
+        // at most one silent summary card, updated in place. The
+        // PendingIntent request code follows the slot, and each digest
+        // update replaces the tap intent's event_id/event_ids via
+        // FLAG_UPDATE_CURRENT.
+        val isDigest = kind == "digest"
+        val notificationTag = if (isDigest) MARKET_DIGEST_CHANNEL_ID else null
         val notificationId =
-            if (batch) "$kind:$eventId".hashCode() else eventId.hashCode()
+            if (isDigest) 0
+            else if (batch) "$kind:$eventId".hashCode()
+            else eventId.hashCode()
+        val requestCode =
+            if (isDigest) MARKET_DIGEST_CHANNEL_ID.hashCode() else notificationId
         val contentIntent = PendingIntent.getActivity(
             this,
-            notificationId,
+            requestCode,
             tapIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -246,9 +258,13 @@ class MainActivity : FlutterActivity() {
                 }
             )
             .setAutoCancel(true)
+            // One silent summary card, updated in place: a replaced
+            // digest does not re-alert (sound is channel-owned anyway,
+            // but heads-up/vibration behavior stays stable pre-O).
+            .setOnlyAlertOnce(isDigest)
             .build()
         try {
-            manager.notify(notificationId, notification)
+            manager.notify(notificationTag, notificationId, notification)
             result.success(true)
         } catch (e: SecurityException) {
             // Permission revoked between the check and the post: refuse,

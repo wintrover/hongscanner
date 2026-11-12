@@ -73,6 +73,27 @@ Python register 프로세스 (notify_register.py)
   배치로 도착하면(앞 멤버가 이미 ACCEPTED) dedup이 우선이다: 늦은
   멤버는 자기 자신의 메시지로 간다 — 관측 그룹 상한이 중복 재전송을
   이기지 않는다(정직한 경계, test_notify가 핀).
+- **Global Attention Budget v1 — 사운드는 60분에 1회다**: 관측 그룹별
+  상한(사운드 1통)은 그룹 안의 중복만 막는다. 그룹 사이의 사운드
+  빈도는 실행 범위(run scope) 안의 이중 시계 예산이 제한한다. 설정
+  `audible_cooldown_seconds`(기본 3600, 1 이상 정수, `0`은
+  ConfigError로 거부 — fail-closed)가 그 창이다.
+  - scope 안에서 `TOP10_ENTERED`/`TOP10_EXITED`를 포함한 첫 관측
+    그룹은 사운드(single 또는 summary, `market_rank_changes`)로
+    어드미션된다.
+  - 이후 그룹은 두 조건이 **모두** 성립할 때만 사운드다: (a) 시장
+    관측 시각(`observed_at`)이 in-scope `ACCEPTED`/`PENDING` 사운드
+    전달 기록 전체의 high-water mark보다 `audible_cooldown_seconds`
+    이상 전진했고, (b) 실제 발송·예약 시각(`updated_at` / 현재
+    dispatcher 시계)도 같은 high-water mark보다
+    `audible_cooldown_seconds` 이상 전진했다.
+  - `ACCEPTED`와 `PENDING` 사운드 기록은 둘 다 예산을 예약·소비한다 —
+    재시도가 60분 상한을 우회할 수 없다. 시간 역행(Δt < 0)은
+    high-water mark를 뒤로 옮기지 않고 무음 `digest`로 fail-closed
+    한다.
+  - 창 안의 `TOP10_ENTERED`/`TOP10_EXITED`는 그룹의 무음 `digest`
+    유닛(`market_rank_digest`)에 접힌다. ledger와 `data.event_ids`에는
+    모든 사건이 남는다 — 왕복 상쇄는 없다.
 
 - 3상태 3보금(전달 상태는 이벤트 팩트에 절대 병합되지 않는다,
   스키마 x-separation-rule): 중요도/신뢰는 팩트의 필드, 검증은 세션
@@ -284,6 +305,16 @@ Python register 프로세스 (notify_register.py)
   previous_rank만 있으면 `<prev>위→후보 제외`, 둘 다 없으면 순위
   문안 없음 — single과 같은 정직성 규칙, 발명 금지) + ` 외 N건`,
   priority **"normal"**·channel `market_rank_digest`.
+- **무음 digest는 알림 shade의 단일 슬롯이다**: digest 메시지는
+  `android.notification.tag = "market_rank_digest"`를 싣고, background
+  에서는 Firebase Messaging의 `DisplayNotification`이
+  `notify("market_rank_digest", 0, ...)`로 표시한다. foreground
+  `MainActivity.kt`도 같은 `(tag = "market_rank_digest", id = 0)`
+  슬롯에 `setOnlyAlertOnce(true)`로 재게시하므로, 두 경로 모두 같은
+  무음 요약 카드를 제자리에서 교체한다. 경계: ledger와 History 탭은
+  모든 사건을 보존하며, 이 카드는 최신 digest 그룹의 단일 shade
+  진입점일 뿐이다. 서버의 사운드 어드미션은 60분으로 제한되지만 실제
+  소리 재생은 Android OS 채널·DND 설정의 몫이다.
 - **data 계약은 형식별로 다르다**: single은 개별 필드(event_id/
   event_type/severity/direction/symbol/previous_rank/rank, §6 첫
   항목)만 실는다. 그룹 메시지(summary·digest)는 **kind / event_ids
@@ -337,6 +368,7 @@ Python register 프로세스 (notify_register.py)
   "retry_min_seconds": 60,           // 라이브 기본 = 벤더 최소 1분
   "backoff_cap_seconds": 900,
   "watch_poll_seconds": 1.0,         // 상주 worker 틱 간격, 0 < x <= 60
+  "audible_cooldown_seconds": 3600,  // 사운드 전역 예산(초), 1 이상 정수
   "service_account_path": "/abs/outside-repo/sa.json",  // 또는 아래
   "token_command": ["gcloud", "auth", "application-default",
                     "print-access-token"],
@@ -354,6 +386,13 @@ Python register 프로세스 (notify_register.py)
   기본값(안B)으로 동작하고 `--admission-report`(§9)가 그 사실을
   출력 첫 줄에 명시한다(`admission policy source=default`) — 섹션
   없음이 설정된 정책과 혼동되지 않는다.
+
+- **`audible_cooldown_seconds`**: 사운드 어드미션의 전역 이중 시계
+  예산 창(초). 기본 3600. `1` 이상 정수만 허용하고 `0`·음수·비정수·
+  bool은 ConfigError(exit 2)다 — `0`은 "예산 없음"이 아니라
+  fail-closed 거부다(§0 Global Attention Budget v1). 창의 판정은
+  `observed_at`(시장 관측 시각)과 `updated_at`/현재 dispatcher
+  시계(실제 발송·예약 시각) 두 축을 모두 요구한다.
 
 - **`min_severity`는 제거됐다** — 발송 정책은 §0의 어드미션 게이트로
   옮겨갔다. 설정 파일에 키가 남아 있으면 **무시된다**
@@ -490,16 +529,18 @@ Python register 프로세스 (notify_register.py)
   드릴(drill_fcm의 fakesite·증거·자격 누출 검사 패턴 재사용). REAL
   `notify_dispatcher.py --watch`를 백그라운드 OS 프로세스로 띄워
   생산자 파일(watch_poll_seconds=0.2)을 tail하게 한다. 시나리오:
-  - **W1** 증분 tail: 완결 라인 N틱 내 발송, 반쪽 라인(비-LF) 미소비
-    (SEND·ledger 카운트 불변), LF 도달 후 발송, 5건 1회 write 폭주는
-    **다이제스트 1통**으로 전달(누락 0, 와이어 `SEND digest
-    count=5`), 혼합 배치(진입+이탈+순위변화 2건, 같은 observed_at)는
-    **summary 1통 + digest 1통** — delivery 기록 11행(single 2·
-    summary 2·digest 7, provider_message_id 그룹 크기 1,1,2,2,5,
-    전부 ACCEPTED);
+  - **W1** 증분 tail: 완결 라인 N틱 내 발송(세션 최초 사운드 `single`),
+    반쪽 라인(비-LF) 미소비(SEND·ledger 카운트 불변), LF 도달 후 60분
+    Global Attention Budget 쿨다운 내이므로 무음 `digest` 폴딩 발송,
+    5건 1회 write 폭주는 **다이제스트 1통**으로 전달(누락 0, 와이어
+    `SEND digest count=5`), 쿨다운 내 혼합 배치(진입+이탈+순위변화 2건,
+    같은 observed_at)는 즉시 사건까지 폴딩된 **다이제스트 1통(`SEND
+    digest count=4`)** — delivery 기록 11행(single 1·digest 10,
+    provider_message_id 그룹 크기 1,1,4,5, 전부 ACCEPTED);
   - **W2** SIGKILL 후 재시작: 전체 재스캔 멱등(appended=0 dup=2,
     재전송 0, ledger 불변; 살해 전 두 사건은 summary 1통이었음) +
-    재시작한 worker가 신규 이벤트 tail 지속;
+    재시작한 worker가 `delivery.hcj.jsonl`에서 사운드 예산을 복원해
+    신규 이벤트를 무음 `digest`로 tail 지속;
   - **W3** 429 Retry-After 3s 이연은 비블로킹: 직후 신규 이벤트 즉시
     발송(와이어 ts 간격 <1.5s), 지연된 재시도는 스케줄대로(≥2s,
     PENDING→ACCEPTED attempts 1→2) — single 와이어 형식 유지;

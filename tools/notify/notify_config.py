@@ -36,6 +36,11 @@ COMMAND_PATH_KEYS = {
     "register": {"registry_path", "register_bearer_file"},
 }
 INT_DEFAULTS = {"retry_min_seconds": 60, "backoff_cap_seconds": 900}
+# The Global Attention Budget (README §0/§7): the sound admission window
+# in seconds. Its default IS the policy (60 minutes); a zero would mean
+# "no budget", so the key refuses anything below 1 (fail-closed).
+AUDIBLE_COOLDOWN_DEFAULT = 3600
+POSITIVE_INT_DEFAULTS = {"audible_cooldown_seconds": AUDIBLE_COOLDOWN_DEFAULT}
 FLOAT_DEFAULTS = {"watch_poll_seconds": 1.0}
 WATCH_POLL_MAX = 60
 
@@ -137,10 +142,10 @@ def admission_mode(cfg, event_type):
 def load_config(path, for_command):
     """Load and validate the config JSON for one command. Raises
     ConfigError on any deviation; there are no silent defaults except
-    the documented INT/FLOAT/ADMISSION defaults. Unknown keys (a stale
-    min_severity among them — the key is removed from the contract,
-    README §7) pass through unvalidated: the policy no longer reads
-    them. The admission section is the one validated exception."""
+    the documented INT/POSITIVE_INT/FLOAT/ADMISSION defaults. Unknown
+    keys (a stale min_severity among them — the key is removed from the
+    contract, README §7) pass through unvalidated: the policy no longer
+    reads them. The admission section is the one validated exception."""
     if not isinstance(path, str) or not path:
         raise ConfigError("no config path (--config or $HSNOTIFY_CONFIG)")
     try:
@@ -188,6 +193,13 @@ def load_config(path, for_command):
         if not isinstance(value, int) or isinstance(value, bool) or \
            value < 0:
             raise ConfigError("%s must be a non-negative integer" % key)
+        cfg[key] = value
+
+    for key, default in POSITIVE_INT_DEFAULTS.items():
+        value = cfg.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or \
+           value < 1:
+            raise ConfigError("%s must be a positive integer" % key)
         cfg[key] = value
 
     for key, default in FLOAT_DEFAULTS.items():
