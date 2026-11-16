@@ -514,13 +514,29 @@ class TestEventSchema(Base):
                              b'ENTERED","rule_id":"r","session_id":"s",'
                              b'"transition_seq":1}').hexdigest())
 
-    def test_event_types_vocabulary_is_sixteen_with_top10(self):
-        # contracts/events/event.schema.json grew the three market
-        # TOP10 transition types: the ledger mirror carries all 16.
-        self.assertEqual(len(notify_ledger.EVENT_TYPES), 16)
+    def test_event_types_vocabulary_is_seventeen_with_aggregation(self):
+        # contracts/events/event.schema.json grew the three market TOP10
+        # transition types, then AGGREGATION_STARTED (the opening-MA20
+        # operation): the ledger mirror carries all 17.
+        self.assertEqual(len(notify_ledger.EVENT_TYPES), 17)
         self.assertEqual(
-            {"TOP10_ENTERED", "TOP10_EXITED", "RANK_CHANGED"} -
-            set(notify_ledger.EVENT_TYPES), set())
+            {"TOP10_ENTERED", "TOP10_EXITED", "RANK_CHANGED",
+             "AGGREGATION_STARTED"} - set(notify_ledger.EVENT_TYPES),
+            set())
+
+    def test_aggregation_started_fact_is_accepted(self):
+        # 2026-11-16 defect: the schema carried AGGREGATION_STARTED but
+        # this mirror lagged it, so validate_event refused the facts the
+        # collector actually emits (event_gen: aggregation-started-v1,
+        # INFO, OBSERVING, no symbol/direction/rank fields) and the
+        # resident worker's whole ingest batch was refused — the
+        # WATCH BATCH REFUSED retry loop stalls the pipeline. The
+        # committed vocabulary is the truth; the mirror follows it.
+        event = make_event(event_type="AGGREGATION_STARTED",
+                           rule_id="aggregation-started-v1", seq=1,
+                           severity="INFO", symbol=None, name=None,
+                           previous_rank=None, rank=None, direction=None)
+        notify_ledger.validate_event(event)
 
     def test_top10_optional_fields_are_accepted_and_checked(self):
         event = make_event(name="삼성전자", previous_rank=12, rank=4)

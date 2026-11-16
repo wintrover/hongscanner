@@ -175,9 +175,10 @@ Python register 프로세스 (notify_register.py)
   갈라진 중복은 변형 시도다.
 - `check` 서브커맨드: 전 라인 스키마 검증(엄격, 비-LF 꼬리도 위반).
 - 검증은 event.schema.json의 구조적 거울이다: 닫힌 필드 집합
-  (additionalProperties false), **16종 event_type 열거**(후보 3종 +
+  (additionalProperties false), **17종 event_type 열거**(후보 3종 +
   시장 TOP10 전환 3종 TOP10_ENTERED/TOP10_EXITED/RANK_CHANGED +
-  장애 5종 + replay 2종 + 세션 3종), severity/ data_quality/direction
+  장애 5종 + 집계 1종 AGGREGATION_STARTED + replay 2종 + 세션 3종),
+  severity/ data_quality/direction
   열거, event_id 64-lowercase-hex, observed_at 캐논 타임스탬프,
   symbol 6자리, name 문자열(최소 1자, 없어도 됨), rule_version/
   rank/previous_rank ≥ 1. previous_rank는 직전 확정 관측군의 같은
@@ -480,7 +481,7 @@ Python register 프로세스 (notify_register.py)
 
 - `bash tools/notify/test_notify.sh`: unittest 계약 스위트. 실제
   모듈을 가짜 urllib 전송과 temp ledger로 in-process 구동. RFC 7515
-  A.2 벡터(서명·키 파싱·JWT 형상), 스키마 검증 전표(16종 event_type,
+  A.2 벡터(서명·키 파싱·JWT 형상), 스키마 검증 전표(17종 event_type,
   previous_rank/name, delivery `message_kind` 닫힌 열거·선택성),
   ledger 멱등·거부 규칙(1회성 ingest와 상주 배치 `ingest_lines` 모두),
   dispatcher 상태기계 전체(정상·중복 억제·429/404/403·영구·전송
