@@ -43,7 +43,8 @@
 ##          HSCOLLECTOR_PYTHON  worker interpreter (default
 ##                              <repo>/tools/collector/.venv/bin/python)
 ## Exit:    the collector's exit code (0/4 per its README §8); 2 for
-##          launcher usage errors (nothing started).
+##          launcher usage errors or a failed storage preflight (nothing
+##          started).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -104,6 +105,32 @@ fi
 
 mkdir -p "$LOG_DIR"          # the run dir itself stays the collector's (O_EXCL)
 touch "$LAUNCHER_LOG"
+
+# ------------------------------------------------------ storage preflight
+# docs/RETENTION.md (Storage Preflight): the session needs room for the
+# day's raw input (observed ~4 GiB) plus sealed-copy/verify headroom
+# (16 GiB) BEFORE the collector starts writing — a disk that fills
+# mid-session is an unobserved outage. Fail-closed: avail below the
+# threshold, or a df that cannot answer at all, stops the session with
+# exit 2 before anything starts and alerts via $HS_NOTIFY_CMD when set.
+PREFLIGHT_MIN="${HS_PREFLIGHT_MIN_AVAIL:-21474836480}"
+PREFLIGHT_AVAIL=""
+PREFLIGHT_AVAIL="$(df -B1 --output=avail "$LOG_DIR" 2>/dev/null | tail -n 1 | tr -d ' ')" || true
+if ! printf '%s' "$PREFLIGHT_AVAIL" | grep -Eq '^[0-9]+$' || \
+   [ "$PREFLIGHT_AVAIL" -lt "$PREFLIGHT_MIN" ]; then
+  {
+    echo "STORAGE_PREFLIGHT_FAILED: avail=${PREFLIGHT_AVAIL:-unavailable} required=$PREFLIGHT_MIN"
+  } >> "$LAUNCHER_LOG"
+  echo "run_session: STORAGE_PREFLIGHT_FAILED: avail=${PREFLIGHT_AVAIL:-unavailable} required=$PREFLIGHT_MIN" >&2
+  if [ -n "${HS_NOTIFY_CMD:-}" ]; then
+    # shellcheck disable=SC2086 # the override command may carry arguments
+    $HS_NOTIFY_CMD "홍스캐너 STORAGE_PREFLIGHT_FAILED" \
+      "세션 시작 저장공간 사전검증 실패: avail=${PREFLIGHT_AVAIL:-unavailable}바이트 required=$PREFLIGHT_MIN바이트" \
+      >>"$LAUNCHER_LOG" 2>&1 || true
+  fi
+  exit 2
+fi
+echo "PREFLIGHT_OK avail=$PREFLIGHT_AVAIL" >> "$LAUNCHER_LOG"
 
 # --------------------------------------------------------- worker control
 WORKER_MODE="none"
