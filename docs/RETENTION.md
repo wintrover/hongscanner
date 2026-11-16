@@ -71,11 +71,17 @@ Preflight이며, 구현이 이 문서와 어긋나면 구현이 틀린 것이다
   df 자체가 실패하면 stderr·런처 로그에 `STORAGE_PREFLIGHT_FAILED`를
   기록하고 exit 2 — 무엇도 시작하지 않는다(fail-closed). 통과 시
   `PREFLIGHT_OK avail=<값>` 1행.
-- **FCM 알림은 두 상황만**: `RETENTION_BLOCKED`(retention 스크립트)와
-  `STORAGE_PREFLIGHT_FAILED`(preflight). 정상 상태는 무알림이며 신규
-  알림 인프라·원장 관리를 추가하지 않는다(기존 tools/notify 전송 계층
-  재사용). 발송 시도 사실(exit code·결과 라인)과 기기 도달은 구분해
-  기록한다 — accepted ≠ delivered(tools/notify/README.md §6).
+- **ops 알림은 두 상황만**: `RETENTION_BLOCKED`(retention 스크립트)와
+  `STORAGE_PREFLIGHT_FAILED`(preflight). 정상 상황은 알림 팩트 자체를
+  생산하지 않는다(무알림이 성립한다 — 발송 여부를 판단해 억제하는 것이
+  아니라 아예 만들지 않는다). 발송은 **ops side-channel**(`tools/notify/
+  ops_alert.py`): notify 이벤트 원장·전달 원장 기록 없는 일회성 발송,
+  재시도 없음. 시도와 결과(exit code·기기별 결과 라인)는 호출부 기록
+  (retention-log.jsonl의 NOTIFY 행·런처 로그)에만 남는다 — accepted ≠
+  delivered(tools/notify/README.md §6). 향후 ops 경보에 지속 알림(재시도·
+  전달 기록)이 필요하면 신규 인프라를 만들지 않고
+  **AGGREGATION_STARTED 선례의 이벤트 계약 확장**(contracts/events +
+  dispatcher 어드미션)으로 전환한다.
 - **API 노출 정책(2026-11 2차 교정 ④)**: 아카이브된 런은 API가 노출하지
   않는다. 모바일 History는 최근 20거래일의 원본 창만 본다. archive-aware
   API(아카이브 열람·복원 서비스)는 별도 제품 결정으로 이 문서의 범위 밖이다.
@@ -117,36 +123,51 @@ Preflight이며, 구현이 이 문서와 어긋나면 구현이 틀린 것이다
 - 환경변수 오버라이드(전부 계약 테스트가 stub으로 교체):
   `HS_RUNS_DIR`·`HS_ARCHIVE_DIR`·`HS_STATE_DIR`·`HS_CALENDAR_DIR`·
   `HS_CALENDAR_INDEX`·`HS_GATES_FILE`·`HS_START_SCRIPTS_DIR`·
-  `HS_SYSTEMCTL`(기본 `systemctl --user`)·`HS_ZSTD_LEVEL`(기본 3)·
-  `HS_QUOTA_BYTES`·`HS_RECENT_TRADING_DAYS`·`HS_NOTIFY_CMD`.
-  캘린더 days 계산·마커 검증·로그 기록은 `python3` 단발 명령이다.
+  `HS_SYSTEMCTL`(기본 `systemctl --user`)·`HS_ZSTD_LEVEL`(기본 10, VS-0
+  실측)·`HS_QUOTA_BYTES`·`HS_RECENT_TRADING_DAYS`·`HS_NOTIFY_CMD`·
+  `HSNOTIFY_CONFIG`.
+  캘린더 days 계산·마커 검증·로그 기록은 `python3` 단발 명령이고, 알림
+  발송(ops_alert.py)은 run_session.sh와 같은 해석 순서의 Python 3.13
+  인터프리터로 실행한다(tools/notify/README.md §11).
 - exit 0 = 보고 완료(스킵·연기·실패·RETENTION_BLOCKED 포함 — 정직한
   보고는 운영 중단이 아니다), exit 2 = 사용법 오류.
 
-### HS_NOTIFY_CMD — 1회성 ops 알림 발송
+### ops side-channel — tools/notify/ops_alert.py
 
 `HS_NOTIFY_CMD`가 설정돼 있으면 `<title> <body>` 두 인자로 호출하고 그
-exit code를 NOTIFY 기록에 남긴다. **미설정 시 기본 발송 경로**는 스크립트
-내장의 `python3` 단발 프로그램이다 — tools/notify 라이브러리를 직접
-재사용한다: `notify_config.load_config(..., "dispatch")`(설정 경로는
-`$HSNOTIFY_CONFIG`, 기본 `~/.local/share/hongscanner/notify/
-notify_config.json`) → `TokenSource`(서비스계정 JSON 또는 token_command
-— 토큰 출처는 tools/notify/README.md §8 그대로) → `Registry(lock=False)
-.devices()`의 활성 기기 각각에 `notify_fcm.send_message` 1통
-(notification+data, 명시적 `android.priority`·`market_rank_changes`
-채널, 4096바이트 한도 fail-closed). exit 0 = 전 기기 accepted, 2 =
-사용법·설정 거부, 3 = 자격 실패·미수용 응답. **원장 부수효과 없음**:
-ops 경보는 이벤트 팩트가 아니므로 dispatcher의 어드미션 게이트·전달
-원장을 거치지 않는다(P27/P28의 발송 정책 위반이 아니라 그 밖의 경로다 —
-합성 계약테스트는 이 경로를 실번호출 없이 stub으로만 검증한다).
+exit code를 NOTIFY 기록에 남긴다(계약테스트의 stub 경로). **미설정 시
+기본 발송 경로**는 `tools/notify/ops_alert.py`다 — "작업 특화 CLI"
+(notify_register.py 선례):
+
+```
+<Python 3.13 해석: $HSCOLLECTOR_PYTHON → collector venv → python3.13 → uv>
+tools/notify/ops_alert.py --config $HSNOTIFY_CONFIG(기본
+~/.local/share/hongscanner/notify/notify_config.json) <title> <body>
+```
+
+구현은 tools/notify 라이브러리를 직접 재사용한다:
+`notify_config.load_config(..., "dispatch")` → `TokenSource`(서비스계정
+JSON 또는 token_command — 토큰 출처는 tools/notify/README.md §8 그대로)
+→ `Registry(lock=False).devices()`의 활성 기기 각각에
+`notify_fcm.send_message` 1통(notification+data, 명시적
+`android.priority`·`market_rank_changes` 채널, 4096바이트 한도
+fail-closed). exit 0 = 전 기기 accepted, 2 = 사용법·설정·페이로드 위반,
+3 = 활성 기기 없음·자격 실패·미수용 응답. **원장 부수효과 없음**: ops
+경보는 이벤트 팩트가 아니므로 dispatcher의 어드미션 게이트·전달 원장을
+거치지 않는다(P27/P28의 발송 정책 위반이 아니라 그 밖의 경로다 — 합성
+계약테스트는 이 경로를 실번호출 없이 stub으로만 검증한다). 인터프리터를
+3.13 계약으로 올린 이유: 이전 구현이 시스템 `python3`(3.12)로
+라이브러리를 임포트했는데 tools/notify는 3.13 계약이므로 계약 위반이었다.
 
 ### tools/run_session.sh — Storage Preflight
 
 `--out` 인자 파싱 후 `mkdir -p "$LOG_DIR"`·`touch "$LAUNCHER_LOG"` 직후,
 `start_worker`·collector 기동 **전에** 실행한다. 미달·df 실패 시 stderr +
-런처 로그 `STORAGE_PREFLIGHT_FAILED: avail=<값> required=<값>` +
-`HS_NOTIFY_CMD`(설정돼 있으면) 알림 + exit 2(기존 usage 오류 exit 2와
-같은 코드 — "아무 것도 시작하지 않은" 거부). 통과 시
+런처 로그 `STORAGE_PREFLIGHT_FAILED: avail=<값> required=<값>` + ops
+side-channel 알림(`HS_NOTIFY_CMD` 설정 시 그 명령, 미설정 시 기본
+ops_alert.py — 워커와 동일한 Python 3.13 인터프리터 사용, 이 스크립트의
+PY 해석이 preflight보다 먼저 완료되므로 항상 실행 가능) + exit 2(기존
+usage 오류 exit 2와 같은 코드 — "아무 것도 시작하지 않은" 거부). 통과 시
 `PREFLIGHT_OK avail=<값>` 1행. 기존 인자·순서·동작은 그대로다.
 
 ### systemd 유닛 (서버 배포 전문 — git 밖, 여기 보관이 재현성 계약)
@@ -188,11 +209,12 @@ git 밖 래퍼(`~/.local/bin/hongscanner-*-start.sh`)은 **수정하지 않는�
    hongscanner-retention.service` → exit 0·journal 실행 기록·
    retention-log.jsonl 추가·`runs/` 무변경(현 시점 전 런 보호) 관측
 
-preflight 알림(`STORAGE_PREFLIGHT_FAILED`의 HS_NOTIFY_CMD)은 세션
-서비스 환경에 `HS_NOTIFY_CMD`가 설정돼 있을 때만 발송된다 — 기존
-세션 유닛·래퍼 수정 금지 원칙 때문에 서버에서의 활성화(환경변수 주입)
-는 운영자 결정으로 남는다. retention 스크립트의 `RETENTION_BLOCKED`
-알림은 기본 발송 경로가 있으므로 별도 설정이 필요 없다.
+preflight 알림(`STORAGE_PREFLIGHT_FAILED`)은 별도 설정 없이 기본
+ops_alert.py 경로로 발송된다 — run_session.sh가 워커 인터프리터로 이미
+요구하는 것과 동일한 Python 3.13 해석을 재사용하므로 세션 서비스가
+동작하는 환경이면 알림 경로도 동작한다. 기존 세션 유닛·래퍼 수정·환경
+변수 주입은 필요 없다. retention 스크립트의 `RETENTION_BLOCKED` 알림도
+같은 기본 경로다.
 
 ## 알려진 한계
 
@@ -211,11 +233,19 @@ preflight 알림(`STORAGE_PREFLIGHT_FAILED`의 HS_NOTIFY_CMD)은 세션
   없는 첫 dry-run은 무변경 원칙(디렉터리·파일 생성 금지) 때문에 락 없이
   관측한다.
 
-## VS-0 — 압축 실측표 (자리표시자: VS-0 실측 후 기입)
+## VS-0 — 압축 실측표 (2026-11-16, 운영 노트북 사본 측정)
 
-운영 런 사본(`/tmp`에서 원본 무접촉)으로 tar+zstd 압축률·시간·복원
-sha256을 측정해 `HS_ZSTD_LEVEL` 기본값(현재 가설 3)을 고정한다.
+운영 런 사본(`/tmp`에서 원본 무접근)으로 tar+zstd 압축률·시간·복원
+sha256을 측정했다. 대상: 2026-11-11·11-12 완주(ARCHIVE_ELIGIBLE 조건)
+런 2개, 합계 2,121,328,143바이트. `zstd -t` 양측 통과, 복원 round-trip
+sha256 전 파일 일치(3/3).
 
 | level | bytes_before | bytes_after | ratio | 압축 시간 | zstd -t | 복원 sha256 일치 |
 |---|---|---|---|---|---|---|
-| (VS-0 실측 후 기입) | | | | | | |
+| 3  | 2,121,328,143 | 146,797,631 | 14.45× | 5.2s  | 통과 | 일치 (3/3) |
+| 10 | 2,121,328,143 | 111,364,759 | 19.05× | 42.9s | 통과 | 일치 (3/3) |
+
+**채택: `HS_ZSTD_LEVEL` 기본 10**. 주간 배치(토요일 12:00 timer, 활성
+세션 스킵 방어 포함) 관점에서 37.7초의 추가 압축 시간은 무의미하고
+아카이브 장기 보관 크기가 약 24% 감소한다. 일회성 대량 백로그 압축
+시에는 `HS_ZSTD_LEVEL` 오버라이드로 낮출 수 있다.

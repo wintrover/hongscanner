@@ -47,19 +47,18 @@
 ##
 ## Notify: $HS_NOTIFY_CMD (when set) is called as
 ##   $HS_NOTIFY_CMD "<title>" "<body>"
-## and its exit code is recorded. When unset the built-in default sender
-## runs: a one-shot python3 program that reuses the tools/notify library
-## directly (notify_config.load_config "dispatch" — config path
-## $HSNOTIFY_CONFIG, default ~/.local/share/hongscanner/notify/
-## notify_config.json; OAuth token via TokenSource: service-account JSON or
-## token_command; devices from the registry; one notification+data message
-## per active device via notify_fcm.send_message, explicit android.priority
-## and the market_rank_changes channel). Exit codes: 0 every send accepted,
-## 2 usage/config (incl. payload over the 4096-byte vendor limit), 3
-## credential failure or any non-accepted send. Ops alerts are not event
-## facts: the dispatcher admission gate never sees them, so no delivery
-## ledger record is written (accepted != delivered is recorded as an exit
-## code + stdout result line, nothing more).
+## and its exit code is recorded. When unset the default sender is
+## tools/notify/ops_alert.py (the ops side-channel, docs/RETENTION.md):
+## a one-shot alert that leaves no event or delivery ledger record — the
+## attempt and outcome live in this script's retention-log.jsonl. It is
+## run with the same Python 3.13 interpreter resolution as the session
+## launcher ($HSCOLLECTOR_PYTHON → collector venv → python3.13 → uv;
+## tools/notify is a 3.13 contract, tools/notify/README.md §11) and takes
+## --config from $HSNOTIFY_CONFIG (default
+## ~/.local/share/hongscanner/notify/notify_config.json). Exit codes:
+## 0 every send accepted, 2 usage/config (incl. payload over the
+## 4096-byte vendor limit), 3 no active devices, credential failure or
+## any non-accepted send.
 ##
 ## Usage: tools/runs_retention.sh [--apply]
 ## Env (every path overridable; the contract tests stub them):
@@ -71,10 +70,14 @@
 ##   HS_GATES_FILE           (default <repo>/docs/GATES.md)
 ##   HS_START_SCRIPTS_DIR    (default ~/.local/bin)
 ##   HS_SYSTEMCTL            (default "systemctl --user")
-##   HS_ZSTD_LEVEL           (default 3; VS-0 measurement pending)
+##   HS_ZSTD_LEVEL           (default 10; VS-0: -10 is 19.05x vs -3's
+##                           14.45x on the 11-12 full-run corpus, 42.9s
+##                           vs 5.2s — the weekly batch takes the size)
 ##   HS_QUOTA_BYTES          (default 107374182400 = 100 GiB, runs+archive)
 ##   HS_RECENT_TRADING_DAYS  (default 20)
-##   HS_NOTIFY_CMD           (default: the built-in python3 sender above)
+##   HS_NOTIFY_CMD           (default: tools/notify/ops_alert.py above)
+##   HSNOTIFY_CONFIG         ops_alert --config (default
+##                           ~/.local/share/hongscanner/notify/notify_config.json)
 ## Exit: 0 — report completed, including SKIPPED_ACTIVE_SESSION,
 ##       CALENDAR_UNUSABLE (all protected), deferred/failed archives and
 ##       RETENTION_BLOCKED (an honest report is not an operational stop);
@@ -105,10 +108,11 @@ HS_CALENDAR_INDEX="${HS_CALENDAR_INDEX:-$REPO/calendars/CALENDAR_INDEX.sha256}"
 HS_GATES_FILE="${HS_GATES_FILE:-$REPO/docs/GATES.md}"
 HS_START_SCRIPTS_DIR="${HS_START_SCRIPTS_DIR:-$HOME/.local/bin}"
 HS_SYSTEMCTL="${HS_SYSTEMCTL:-systemctl --user}"
-HS_ZSTD_LEVEL="${HS_ZSTD_LEVEL:-3}"
+HS_ZSTD_LEVEL="${HS_ZSTD_LEVEL:-10}"
 HS_QUOTA_BYTES="${HS_QUOTA_BYTES:-107374182400}"
 HS_RECENT_TRADING_DAYS="${HS_RECENT_TRADING_DAYS:-20}"
 HS_NOTIFY_CMD="${HS_NOTIFY_CMD:-}"
+NOTIFY_CONFIG="${HSNOTIFY_CONFIG:-$HOME/.local/share/hongscanner/notify/notify_config.json}"
 
 for guard_var in HS_RUNS_DIR HS_ARCHIVE_DIR HS_STATE_DIR; do
   case "${!guard_var}" in
@@ -124,64 +128,24 @@ LOG_FILE="$HS_STATE_DIR/retention-log.jsonl"
 TMP_DIR="$HS_STATE_DIR/tmp"
 ACTIVE_MTIME_SECONDS=$(( 26 * 3600 ))
 
-# The built-in one-shot ops-alert sender (HS_NOTIFY_CMD unset): the
-# tools/notify library reused directly — config load, OAuth token, device
-# registry, FCM HTTP v1 send. No single quotes (the program is embedded in
-# a single-quoted bash string).
-OPS_ALERT_PY='
-import json, os, sys
-sys.path.insert(0, sys.argv[1])
-import notify_config, notify_fcm, notify_ledger
-title, body = sys.argv[2], sys.argv[3]
-config_path = (os.environ.get("HSNOTIFY_CONFIG") or
-               os.path.expanduser("~/.local/share/hongscanner/notify/notify_config.json"))
-
-def err(line):
-    print(line, file=sys.stderr, flush=True)
-
-try:
-    cfg = notify_config.load_config(config_path, "dispatch")
-except notify_config.ConfigError as exc:
-    err("ops_alert: config refused: %s" % exc)
-    sys.exit(2)
-
-def message(token):
-    return {"message": {
-        "token": token,
-        "notification": {"title": title, "body": body},
-        "android": {"priority": "high",
-                    "notification": {"channel_id": "market_rank_changes"}},
-        "data": {"kind": "ops_alert", "title": title, "body": body}}}
-
-registry = notify_ledger.Registry(cfg["registry_path"], lock=False)
-try:
-    devices = registry.devices()
-finally:
-    registry.close()
-if not devices:
-    err("ops_alert: no active devices in the registry")
-    sys.exit(3)
-try:
-    tokens = notify_fcm.TokenSource(cfg)
-    code = 0
-    for device_id in sorted(devices):
-        payload = message(devices[device_id])
-        size = len(json.dumps(payload, ensure_ascii=False,
-                              separators=(",", ":")).encode("utf-8"))
-        if size > notify_fcm.PAYLOAD_LIMIT_BYTES:
-            err("ops_alert: payload %d bytes is over the vendor limit" % size)
-            sys.exit(2)
-        outcome = notify_fcm.send_message(cfg["project_id"], tokens.get(), payload)
-        print("ops_alert device=%s result=%s status=%s error=%s" % (
-            device_id, outcome.kind, outcome.http_status, outcome.error_code),
-            flush=True)
-        if outcome.kind != "accepted":
-            code = 3
-    sys.exit(code)
-except notify_fcm.FcmError as exc:
-    err("ops_alert: credential failure: %s" % exc)
-    sys.exit(3)
-'
+# The default ops-alert sender (HS_NOTIFY_CMD unset) is
+# tools/notify/ops_alert.py — the ops side-channel. Its interpreter is
+# resolved exactly like the session launcher's worker interpreter
+# (tools/run_session.sh): $HSCOLLECTOR_PYTHON, the collector venv,
+# python3.13, then `uv python find 3.13` (tools/notify is a Python 3.13
+# contract, tools/notify/README.md §11). A retention pass never depends
+# on the notify path: an unresolvable interpreter is reported, not fatal.
+OPS_ALERT="$REPO/tools/notify/ops_alert.py"
+OPS_ALERT_PY=""
+if [ -n "${HSCOLLECTOR_PYTHON:-}" ]; then
+  OPS_ALERT_PY="$HSCOLLECTOR_PYTHON"
+elif [ -x "$REPO/tools/collector/.venv/bin/python" ]; then
+  OPS_ALERT_PY="$REPO/tools/collector/.venv/bin/python"
+elif command -v python3.13 >/dev/null 2>&1; then
+  OPS_ALERT_PY="python3.13"
+elif command -v uv >/dev/null 2>&1; then
+  OPS_ALERT_PY="$(uv python find 3.13 2>/dev/null)" || OPS_ALERT_PY=""
+fi
 
 send_notify() { # $1 title, $2 body
   if [ -n "$HS_NOTIFY_CMD" ]; then
@@ -189,7 +153,12 @@ send_notify() { # $1 title, $2 body
     $HS_NOTIFY_CMD "$1" "$2"
     return $?
   fi
-  python3 -c "$OPS_ALERT_PY" "$REPO/tools/notify" "$1" "$2"
+  if [ -z "$OPS_ALERT_PY" ] || [ ! -x "$OPS_ALERT_PY" ]; then
+    echo "retention: no Python 3.13 interpreter for ops_alert.py —" \
+         "alert NOT sent (title: $1)" >&2
+    return 3
+  fi
+  "$OPS_ALERT_PY" "$OPS_ALERT" --config "$NOTIFY_CONFIG" "$1" "$2"
 }
 
 log_event() { # $1 action, rest KEY=VALUE — appends one JSON line (apply only)
