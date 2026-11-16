@@ -716,6 +716,7 @@ record's canonical line):
 | `rest-truncated-v1` | REST_TRUNCATED | a gap record whose `what` is `rest_truncated` (second fact of the same record, distinct by event_type) | HIGH / INCOMPLETE |
 | `subscription-truncated-v1` | SUBSCRIPTION_TRUNCATED | a gap record whose `what` is `subscription_truncated` (second fact of the same record, distinct by event_type); the fact's direction is the gap detail's pinned `direction=up\|down` token | HIGH / INCOMPLETE |
 | `market-state-unknown-v1` | MARKET_STATE_UNKNOWN | a 0s ws_raw payload whose FID 215 value is outside the evidenced set {2,4,8,9}; at most one per record | HIGH / UNKNOWN |
+| `aggregation-started-v1` | AGGREGATION_STARTED | the first completed ka10027 up+down pair whose derived candidate generation is non-empty; empty pairs keep waiting, and at most one fact per run is judged | INFO / OBSERVING |
 | `session-close-v1` | SESSION_ENDED | the session_end seal record | INFO / OBSERVING |
 | `session-incomplete-v1` | SESSION_INCOMPLETE | `finish` on a consumed stream that never sealed; binds to the last consumed record | HIGH / INCOMPLETE |
 

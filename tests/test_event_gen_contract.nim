@@ -56,6 +56,7 @@ const
                  "RANK_CHANGED", "FEED_DISCONNECTED",
                  "DATA_GAP_SUSPECTED", "REST_TRUNCATED",
                  "SUBSCRIPTION_TRUNCATED", "MARKET_STATE_UNKNOWN",
+                 "AGGREGATION_STARTED",
                  "REPLAY_MATCH", "REPLAY_MISMATCH",
                  "SESSION_ENDED", "SESSION_INCOMPLETE", "SESSION_APPROVED"]
   severities = @["INFO", "HIGH", "CRITICAL"]
@@ -174,23 +175,23 @@ let events = eventsOfRecords(recs)
 # ------------------------------------------------------- generation & shape
 
 block generationShape:
-  check("generation: the sealed session judges exactly 8 facts",
-        events.len == 8)
+  check("generation: the sealed session judges exactly 9 facts",
+        events.len == 9)
   check("generation: every fact line is canonical HCJ",
         allCanonical(events))
   check("generation: every fact passes the closed-field validation",
         allValid(events))
   check("generation: the event_type sequence is the judgment order",
         fieldSeq(events, "event_type") == @[
-          "CANDIDATE_ENTERED", "CANDIDATE_ENTERED", "DATA_GAP_SUSPECTED",
-          "DATA_GAP_SUSPECTED", "REST_TRUNCATED", "FEED_DISCONNECTED",
-          "MARKET_STATE_UNKNOWN", "SESSION_ENDED"])
+          "CANDIDATE_ENTERED", "CANDIDATE_ENTERED", "AGGREGATION_STARTED",
+          "DATA_GAP_SUSPECTED", "DATA_GAP_SUSPECTED", "REST_TRUNCATED",
+          "FEED_DISCONNECTED", "MARKET_STATE_UNKNOWN", "SESSION_ENDED"])
   check("generation: the rule_id sequence is per rule",
         fieldSeq(events, "rule_id") == @[
           "candidate-transition-v1", "candidate-transition-v1",
-          "gap-suspected-v1", "gap-suspected-v1", "rest-truncated-v1",
-          "feed-disconnected-v1", "market-state-unknown-v1",
-          "session-close-v1"])
+          "aggregation-started-v1", "gap-suspected-v1", "gap-suspected-v1",
+          "rest-truncated-v1", "feed-disconnected-v1",
+          "market-state-unknown-v1", "session-close-v1"])
   check("generation: every fact carries rule_version 1",
         (block:
            var ok = true
@@ -200,8 +201,9 @@ block generationShape:
   check("generation: session_id is the config record's session_date",
         fieldSeq(events, "session_id") ==
         @["2026-11-02", "2026-11-02", "2026-11-02", "2026-11-02",
-          "2026-11-02", "2026-11-02", "2026-11-02", "2026-11-02"])
-  check("generation: all 8 ids are distinct", idsDistinct(events))
+          "2026-11-02", "2026-11-02", "2026-11-02", "2026-11-02",
+          "2026-11-02"])
+  check("generation: all 9 ids are distinct", idsDistinct(events))
   check("generation: no position field is ever emitted",
         (block:
            var ok = true
@@ -228,21 +230,21 @@ block observedAt:
         fieldOf(events[1], "observed_at") ==
         "2026-11-02T00:00:00+09:00")
   check("observed_at: a gap fact observes its own record t",
-        fieldOf(events[2], "observed_at") == "2026-11-02T10:00:00+09:00")
+        fieldOf(events[3], "observed_at") == "2026-11-02T10:00:00+09:00")
   check("observed_at: the truncation facts observe their own record t",
-        fieldOf(events[3], "observed_at") == "2026-11-02T10:15:00+09:00" and
-        fieldOf(events[4], "observed_at") == "2026-11-02T10:15:00+09:00")
+        fieldOf(events[4], "observed_at") == "2026-11-02T10:15:00+09:00" and
+        fieldOf(events[5], "observed_at") == "2026-11-02T10:15:00+09:00")
   check("observed_at: the feed-disconnection fact observes its record t",
-        fieldOf(events[5], "observed_at") == "2026-11-02T10:25:00+09:00")
+        fieldOf(events[6], "observed_at") == "2026-11-02T10:25:00+09:00")
   check("observed_at: the market-state fact observes the ws_raw t",
-        fieldOf(events[6], "observed_at") == "2026-11-02T10:30:00+09:00")
+        fieldOf(events[7], "observed_at") == "2026-11-02T10:30:00+09:00")
   check("observed_at: the session_end fact observes the last recorded t " &
         "(0s FID 20), not a wall clock",
-        fieldOf(events[7], "observed_at") == "2026-11-02T15:30:10+09:00")
+        fieldOf(events[8], "observed_at") == "2026-11-02T15:30:10+09:00")
   check("observed_at: the evidenced 0s record (seq 12) judges exactly no " &
         "fact — its t never appears as an unevidenced observation",
-        events.len == 8 and
-        fieldOf(events[6], "evidence_ref") == contentRef(recs[10]))
+        events.len == 9 and
+        fieldOf(events[7], "evidence_ref") == contentRef(recs[10]))
 
 # ------------------------------------------------------------- the id rule
 
@@ -257,25 +259,25 @@ block eventIdRule:
         fieldOf(events[1], "event_id") ==
         idFor("CANDIDATE_ENTERED", "candidate-transition-v1", "000660", 4))
   check("event_id: the symbol gap fact binds to Q=5",
-        fieldOf(events[2], "event_id") ==
+        fieldOf(events[3], "event_id") ==
         idFor("DATA_GAP_SUSPECTED", "gap-suspected-v1", "005930", 5))
   check("event_id: the connection-wide gap fact binds to Q=7 with the " &
         "wildcard entity",
-        fieldOf(events[3], "event_id") ==
+        fieldOf(events[4], "event_id") ==
         idFor("DATA_GAP_SUSPECTED", "gap-suspected-v1", "*", 7))
   check("event_id: the truncation fact differs from the gap fact of the " &
         "same record only by event_type",
-        fieldOf(events[4], "event_id") ==
-        idFor("REST_TRUNCATED", "rest-truncated-v1", "*", 7) and
-        fieldOf(events[3], "event_id") != fieldOf(events[4], "event_id"))
-  check("event_id: the feed disconnection binds to Q=9",
         fieldOf(events[5], "event_id") ==
+        idFor("REST_TRUNCATED", "rest-truncated-v1", "*", 7) and
+        fieldOf(events[4], "event_id") != fieldOf(events[5], "event_id"))
+  check("event_id: the feed disconnection binds to Q=9",
+        fieldOf(events[6], "event_id") ==
         idFor("FEED_DISCONNECTED", "feed-disconnected-v1", "*", 9))
   check("event_id: the market-state fact binds to Q=11",
-        fieldOf(events[6], "event_id") ==
+        fieldOf(events[7], "event_id") ==
         idFor("MARKET_STATE_UNKNOWN", "market-state-unknown-v1", "*", 11))
   check("event_id: the session close binds to the seal record Q=13",
-        fieldOf(events[7], "event_id") ==
+        fieldOf(events[8], "event_id") ==
         idFor("SESSION_ENDED", "session-close-v1", "*", 13))
   check("event_id: a differing Q yields a different id",
         idFor("SESSION_ENDED", "session-close-v1", "*", 13) !=
@@ -304,12 +306,16 @@ block runIdNamespace:
   let runA = eventsOfRecords(withRunId(recs, "fidelity-2026-11-02-a"))
   let runB = eventsOfRecords(withRunId(recs, "fidelity-2026-11-02-b"))
   check("run_id: every id of run A is the rule over its tuple plus the " &
-        "namespace (candidate UP at Q=4)",
+        "namespace (candidate UP and aggregation-start at Q=4)",
         fieldOf(runA[0], "event_id") ==
           eventIdOf("2026-11-02", "CANDIDATE_ENTERED",
                     "candidate-transition-v1", "005930", 4,
                     "fidelity-2026-11-02-a") and
         fieldOf(runA[2], "event_id") ==
+          eventIdOf("2026-11-02", "AGGREGATION_STARTED",
+                    "aggregation-started-v1", "*", 4,
+                    "fidelity-2026-11-02-a") and
+        fieldOf(runA[3], "event_id") ==
           eventIdOf("2026-11-02", "DATA_GAP_SUSPECTED", "gap-suspected-v1",
                     "005930", 5, "fidelity-2026-11-02-a"))
   check("run_id: runs A and B share no id — the failed run's facts and " &
@@ -363,15 +369,16 @@ block runIdNamespace:
 block evidenceRef:
   check("evidence_ref: candidate facts name the declared vendor scope",
         fieldOf(events[0], "evidence_ref") == "ka10027:stex_tp=1:sort_tp=1" and
-        fieldOf(events[1], "evidence_ref") == "ka10027:stex_tp=1:sort_tp=3")
+        fieldOf(events[1], "evidence_ref") == "ka10027:stex_tp=1:sort_tp=3" and
+        fieldOf(events[2], "evidence_ref") == "ka10027:stex_tp=1:sort_tp=1")
   check("evidence_ref: record-backed facts are content addresses of the " &
         "consumed record's canonical line",
-        fieldOf(events[2], "evidence_ref") == contentRef(recs[4]) and
-        fieldOf(events[3], "evidence_ref") == contentRef(recs[6]) and
+        fieldOf(events[3], "evidence_ref") == contentRef(recs[4]) and
         fieldOf(events[4], "evidence_ref") == contentRef(recs[6]) and
-        fieldOf(events[5], "evidence_ref") == contentRef(recs[8]) and
-        fieldOf(events[6], "evidence_ref") == contentRef(recs[10]) and
-        fieldOf(events[7], "evidence_ref") == contentRef(recs[12]))
+        fieldOf(events[5], "evidence_ref") == contentRef(recs[6]) and
+        fieldOf(events[6], "evidence_ref") == contentRef(recs[8]) and
+        fieldOf(events[7], "evidence_ref") == contentRef(recs[10]) and
+        fieldOf(events[8], "evidence_ref") == contentRef(recs[12]))
 
 # ----------------------------------------------------- determinism & purity
 
@@ -437,7 +444,7 @@ block recovery:
   let incRecs = loadRecords(incompletePath)
   let incEvents = eventsOfRecords(incRecs)
   check("recovery: the unsealed stream ends with SESSION_INCOMPLETE",
-        incEvents.len == 8 and
+        incEvents.len == 9 and
         fieldOf(incEvents[^1], "event_type") == "SESSION_INCOMPLETE")
   check("recovery: the incomplete fact binds to the last consumed record " &
         "(Q=12) and carries its content address",
@@ -538,9 +545,10 @@ block candidateTransitions:
   let (s2, e2) = step(s, restRecord(4, "3", @["000660"]))
   s = s2
   check("candidates: the first completed up+down pair enters both " &
-        "candidates with rank and direction",
+        "candidates with rank and direction, then aggregation starts",
         e2.summary() ==
-        "CANDIDATE_ENTERED/005930/UP/1 CANDIDATE_ENTERED/000660/DOWN/1 ")
+        "CANDIDATE_ENTERED/005930/UP/1 CANDIDATE_ENTERED/000660/DOWN/1 " &
+        "AGGREGATION_STARTED///0 ")
   check("candidates: the derivation binds to the completing record (Q=4)",
         e2[0].eventId == eventIdOf("2026-11-02", "CANDIDATE_ENTERED",
                                    "candidate-transition-v1", "005930", 4))
@@ -638,12 +646,13 @@ block top10Transitions:
   let e1 = feed(restRecord(3, "1", g1up))
   check("top10: an up chain alone still judges nothing", e1.len == 0)
   let e2 = feed(restRecord(4, "3", @[]))
-  check("top10: the first generation judges only candidate facts — the " &
-        "group baseline carries no transition",
-        e2.top10Facts().len == 0 and e2.len == 15 and
+  check("top10: the first generation judges only candidate facts plus the " &
+        "aggregation-start fact — the group baseline carries no transition",
+        e2.top10Facts().len == 0 and e2.len == 16 and
+        e2[^1].eventType == "AGGREGATION_STARTED" and
         (block:
            var ok = true
-           for f in e2:
+           for f in e2[0 ..< ^1]:
              if f.eventType != "CANDIDATE_ENTERED": ok = false
            ok))
   check("top10: the first generation sets the pending stamp and q",
@@ -774,7 +783,7 @@ block top10Transitions:
     if "\"rule_id\":\"top10-transition-v1\"" in l: inc nTop10
   check("top10: an unsealed stream never flushes the final group — only " &
         "the boundary facts exist and the tail is SESSION_INCOMPLETE",
-        nTop10 == 6 and unsealed.len == 32 and
+        nTop10 == 6 and unsealed.len == 33 and
         unsealed[^1].contains("\"SESSION_INCOMPLETE\""))
 
 block top10GroupMerge:
@@ -957,7 +966,7 @@ block incompleteReplay:
   let res = runCore(incRecs)
   check("incomplete: runCore carries the judgment lines including the " &
         "SESSION_INCOMPLETE tail",
-        res.events.len == 8 and
+        res.events.len == 9 and
         res.events[^1].contains("\"SESSION_INCOMPLETE\""))
 
 # ------------------------------------------------------------------- summary

@@ -425,6 +425,7 @@ MV_HISTORY_G4 = [
 
 MV_EXPECTED = {
     "as_of": MV_TEND,
+    "coverage": None,
     "falling_top10": [mv_item(MV_G4_DN09, MV_NAME_MAP),
                       mv_item(MV_G4_DN01, MV_NAME_MAP),
                       mv_item(MV_G4_DN03, MV_NAME_MAP)],
@@ -663,7 +664,7 @@ def om_item(ev, ma20_tag):
     return item
 
 
-def om_expected(ref_stamp, rising, falling):
+def om_expected(ref_stamp, rising, falling, coverage=None):
     history = [
         mv_change("CANDIDATE_EXITED", om_g2_017960x(ref_stamp), None, 5,
                   OM_NAMES),
@@ -674,6 +675,11 @@ def om_expected(ref_stamp, rising, falling):
     ]
     return {
         "as_of": OM_TEND,
+        "coverage": coverage if coverage is not None else {
+            "candidate_count": 12, "computable_count": 8,
+            "rising_count": 5, "falling_count": 3,
+            "rising_complete": False, "falling_complete": False,
+            "status": "PARTIAL"},
         "falling_top10": falling,
         "history": history,
         "latest": {"data_quality": "INCOMPLETE",
@@ -706,13 +712,21 @@ def om_expected_bodies(ref_stamp):
         ref_stamp,
         [om_item(om_g2_011060(ref_stamp), "ABOVE"),
          om_item(om_g2_006660(ref_stamp), "ABOVE")],
-        [om_item(g1["012330"], "BELOW"), om_item(g1["005930"], "BELOW")])
+        [om_item(g1["012330"], "BELOW"), om_item(g1["005930"], "BELOW")],
+        {"candidate_count": 12, "computable_count": 4,
+         "rising_count": 2, "falling_count": 2,
+         "rising_complete": False, "falling_complete": False,
+         "status": "PARTIAL"})
     minus_one = om_expected(
         ref_stamp,
         [om_item(om_g2_011060(ref_stamp), "ABOVE")],
         [om_item(g1["000660"], "BELOW"),
          om_item(om_g2_006660(ref_stamp), "BELOW"),
-         om_item(g1["005930"], "BELOW")])
+         om_item(g1["005930"], "BELOW")],
+        {"candidate_count": 12, "computable_count": 4,
+         "rising_count": 1, "falling_count": 3,
+         "rising_complete": False, "falling_complete": False,
+         "status": "PARTIAL"})
     return zero, plus_one, minus_one
 
 
@@ -929,6 +943,7 @@ TF_HISTORY_G3 = [tf_change(f, TF_NAMES) for f in TF_G3_FLUSH_FACTS]
 
 TF_EXPECTED = {
     "as_of": TF_T3,
+    "coverage": None,
     "falling_top10": [tf_item(TF_G2[4]), tf_item(TF_G2[5])],
     "history": TF_HISTORY_G2,  # the unsealed run: flush facts ineligible
     "latest": {"data_quality": "OBSERVING",
@@ -1962,9 +1977,10 @@ class MarketViewEmptySuite(unittest.TestCase):
     def test_no_directories_projects_absent(self):
         box = Sandbox()
         self.run_with(box)
-        expected = {"as_of": None, "falling_top10": [], "history": [],
-                    "latest": None, "mode": "core", "rising_top10": [],
-                    "run": None, "runs_present": False, "status": None}
+        expected = {"as_of": None, "coverage": None, "falling_top10": [],
+                    "history": [], "latest": None, "mode": "core",
+                    "rising_top10": [], "run": None, "runs_present": False,
+                    "status": None}
         status, body, raw, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
@@ -1983,11 +1999,11 @@ class MarketViewEmptySuite(unittest.TestCase):
         self.run_with(box)
         status, body, _, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"as_of": None, "falling_top10": [],
-                                "history": [], "latest": None,
-                                "mode": "core", "rising_top10": [],
-                                "run": None, "runs_present": True,
-                                "status": None})
+        self.assertEqual(body, {"as_of": None, "coverage": None,
+                                "falling_top10": [], "history": [],
+                                "latest": None, "mode": "core",
+                                "rising_top10": [], "run": None,
+                                "runs_present": True, "status": None})
 
     def test_selected_run_zero_committed_events(self):
         box = Sandbox()
@@ -2002,8 +2018,8 @@ class MarketViewEmptySuite(unittest.TestCase):
         status, body, _, _ = self.server.get_json("/mobile/market-view")
         self.assertEqual(status, 200)
         self.assertEqual(body, {
-            "as_of": None, "falling_top10": [], "history": [],
-            "latest": None, "mode": "core", "rising_top10": [],
+            "as_of": None, "coverage": None, "falling_top10": [],
+            "history": [], "latest": None, "mode": "core", "rising_top10": [],
             "run": {"environment": "demo", "run_id": None,
                     "session": "market-2026-11-09-empty",
                     "session_date": "2026-11-09"},
@@ -2072,6 +2088,11 @@ class MarketViewOpeningSuite(unittest.TestCase):
                               "event_type", "ma20_tag", "name",
                               "observed_at", "rank", "symbol"])
             self.assertIn(item["ma20_tag"], ("ABOVE", "BELOW"))
+        self.assertEqual(body["coverage"], {
+            "candidate_count": 12, "computable_count": 8,
+            "rising_count": 5, "falling_count": 3,
+            "rising_complete": False, "falling_complete": False,
+            "status": "PARTIAL"})
 
     def test_opening_mode_consecutive_requests_identical(self):
         # determinism through the memoized fold: two consecutive

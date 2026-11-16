@@ -79,9 +79,24 @@ class _Top10sBody extends StatelessWidget {
     // cards verbatim — mode switches labels, never the row order or
     // the classification.
     final ma20Mode = marketView.mode == 'opening_ma20';
+    final coverage = marketView.coverage;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        if (ma20Mode && coverage != null) ...[
+          Card(
+            margin: const EdgeInsets.only(bottom: 8),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(
+                '수집 상태: ${coverage.status ?? '?'} · MA20 계산 가능 '
+                '${coverage.computableCount ?? '?'}/관측 대상 '
+                '${coverage.candidateCount ?? '?'}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+          ),
+        ],
         Card(
           margin: const EdgeInsets.only(bottom: 8),
           child: Padding(
@@ -90,8 +105,10 @@ class _Top10sBody extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (ma20Mode) ...[
-                  Text('상승 TOP 10 (MA20 위)',
-                      style: Theme.of(context).textTheme.titleSmall),
+                  Text(
+                    '상승 TOP 10 (MA20 위)'
+                        '${coverage?.risingComplete == false ? ' · PARTIAL ${coverage?.risingCount ?? '?'}종' : ''}',
+                    style: Theme.of(context).textTheme.titleSmall),
                   const SizedBox(height: 6),
                 ],
                 _Top10List(
@@ -111,8 +128,10 @@ class _Top10sBody extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (ma20Mode) ...[
-                  Text('하락 TOP 10 (MA20 아래)',
-                      style: Theme.of(context).textTheme.titleSmall),
+                  Text(
+                    '하락 TOP 10 (MA20 아래)'
+                        '${coverage?.fallingComplete == false ? ' · PARTIAL ${coverage?.fallingCount ?? '?'}종' : ''}',
+                    style: Theme.of(context).textTheme.titleSmall),
                   const SizedBox(height: 6),
                 ],
                 _Top10List(

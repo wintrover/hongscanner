@@ -625,7 +625,7 @@ def opening_market_top10(confirmed, snapshots, ma20):
     are the recorded candidate state verbatim — only the placement and
     the ma20_tag are the mode's."""
     if confirmed is None:
-        return "core", [], []
+        return "core", [], [], None
     index, stamp, state, upserts = confirmed
     if OBSERVED_AT_RE.match(stamp) is None:
         raise DataFault("%s observed_at is not the canonical timestamp "
@@ -637,7 +637,7 @@ def opening_market_top10(confirmed, snapshots, ma20):
                         % EVENTS_JSONL)
     clock = moment.astimezone(KST).strftime("%H:%M:%S")
     if not (OPENING_WINDOW_START <= clock < OPENING_WINDOW_END):
-        return "core", [], []
+        return "core", [], [], None
     snapshot = None
     for offset in (0, 1, -1):
         candidate = index + offset - 1
@@ -668,7 +668,19 @@ def opening_market_top10(confirmed, snapshots, ma20):
             item["ma20_tag"] = "ABOVE" if is_above else "BELOW"
             target.append({field: item[field]
                            for field in MARKET_ITEM_FIELDS})
-    return "opening_ma20", rising, falling
+    rising_complete = len(above) >= MARKET_TOP_N
+    falling_complete = len(below) >= MARKET_TOP_N
+    coverage = {
+        "candidate_count": len(state),
+        "computable_count": len(above) + len(below),
+        "rising_count": len(above),
+        "falling_count": len(below),
+        "rising_complete": rising_complete,
+        "falling_complete": falling_complete,
+        "status": ("COMPLETE" if rising_complete and falling_complete
+                   else "PARTIAL"),
+    }
+    return "opening_ma20", rising, falling, coverage
 
 
 class Projector:
@@ -1094,8 +1106,9 @@ class Projector:
                              read_last_observed_at(events_path),
                              config.get("events_contract")))
         if not eligible:
-            return {"as_of": None, "history": [], "latest": None,
-                    "mode": "core", "run": None, "rising_top10": [],
+            return {"as_of": None, "coverage": None, "history": [],
+                    "latest": None, "mode": "core", "run": None,
+                    "rising_top10": [],
                     "falling_top10": [], "runs_present": bool(names),
                     "status": None}
         # Selection (README §3.7): max session_date, then max last
@@ -1331,8 +1344,8 @@ class Projector:
             # comparison records confirm_group never wrote.
             changes = self._fact_history(facts, last_stamp_pos, sealed,
                                          stock_names)
-        mode, opening_rising, opening_falling = opening_market_top10(
-            confirmed, snapshots, ma20)
+        (mode, opening_rising, opening_falling, coverage) = \
+            opening_market_top10(confirmed, snapshots, ma20)
         if mode == "opening_ma20":
             rising, falling = opening_rising, opening_falling
         else:
@@ -1352,6 +1365,7 @@ class Projector:
         last = events[-1] if events else None
         return {
             "as_of": last["observed_at"] if last else None,
+            "coverage": coverage,
             "history": changes,
             "latest": ({field: last[field] for field in
                         ("data_quality", "event_id", "event_type",

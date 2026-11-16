@@ -137,6 +137,7 @@ import notify_ledger
 # notify_config's admission validation share one truth: a fourth
 # notifiable type changes all of them together or neither.
 NOTIFIABLE_EVENT_TYPES = notify_fcm.TOP10_EVENT_TYPES
+AGGREGATION_STARTED = "AGGREGATION_STARTED"
 
 
 def compose_admission_units(events, cfg, allow_audible=True):
@@ -157,15 +158,24 @@ def compose_admission_units(events, cfg, allow_audible=True):
     immediate = []
     digest = []
     for event in events:
+        if event["event_type"] == AGGREGATION_STARTED:
+            if allow_audible:
+                immediate.append(event)
+            continue
         mode = notify_config.admission_mode(cfg, event["event_type"])
         if mode == "immediate" and allow_audible:
             immediate.append(event)
         elif mode in ("immediate", "digest"):
             digest.append(event)
     units = []
-    if immediate:
-        units.append(("single" if len(immediate) == 1 else "summary",
-                      immediate))
+    for event in immediate:
+        if event["event_type"] == AGGREGATION_STARTED:
+            units.append(("aggregation_started", [event]))
+    immediate_top10 = [event for event in immediate
+                       if event["event_type"] != AGGREGATION_STARTED]
+    if immediate_top10:
+        units.append(("single" if len(immediate_top10) == 1 else "summary",
+                      immediate_top10))
     if digest:
         units.append(("digest", digest))
     return units
@@ -261,8 +271,9 @@ class Dispatcher:
         notifyable = 0
         pairs = []
         for event in in_scope:
-            if notify_config.admission_mode(self.cfg,
-                                            event["event_type"]) == \
+            if event["event_type"] != AGGREGATION_STARTED and \
+                    notify_config.admission_mode(self.cfg,
+                                                 event["event_type"]) == \
                     "suppress":
                 continue
             notifyable += 1
@@ -343,7 +354,10 @@ class Dispatcher:
                     message_kind=msg_kind)
 
         try:
-            if msg_kind == "single":
+            if msg_kind == "aggregation_started":
+                message = notify_fcm.build_aggregation_started_message(
+                    events[0], token)
+            elif msg_kind == "single":
                 message = notify_fcm.build_message(events[0], token)
             elif msg_kind == "summary":
                 message = notify_fcm.build_summary_message(events, token)
@@ -947,7 +961,10 @@ def admission_report(cfg, events_path):
                 last_obs_epoch = obs_epoch if last_obs_epoch is None \
                     else max(last_obs_epoch, obs_epoch)
             try:
-                if msg_kind == "single":
+                if msg_kind == "aggregation_started":
+                    message = notify_fcm.build_aggregation_started_message(
+                        unit_events[0], "")
+                elif msg_kind == "single":
                     message = notify_fcm.build_message(unit_events[0], "")
                 elif msg_kind == "summary":
                     message = notify_fcm.build_summary_message(
@@ -969,7 +986,8 @@ def admission_report(cfg, events_path):
     lines = []
     for event in events:
         event_type = event["event_type"]
-        mode = notify_config.admission_mode(cfg, event_type)
+        mode = ("immediate" if event_type == AGGREGATION_STARTED
+                else notify_config.admission_mode(cfg, event_type))
         if mode == "suppress":
             verdict = "SUPPRESS"
             form = "not_in_admission" if event_type not in \
@@ -994,7 +1012,8 @@ def admission_report(cfg, events_path):
     refused_total = 0
     for key, group_plans in plans:
         sound = sum(1 for plan in group_plans
-                    if plan["kind"] in ("single", "summary")
+                    if plan["kind"] in ("single", "summary",
+                                        "aggregation_started")
                     and "refused" not in plan)
         silent = sum(1 for plan in group_plans
                      if plan["kind"] == "digest"

@@ -245,9 +245,41 @@ class MarketViewStatus {
 /// / RANK_CHANGED), plus the run/as_of context. The client never
 /// reorders or refilters anything here: the server order is the display
 /// order.
+class MarketViewCoverage {
+  const MarketViewCoverage({
+    this.candidateCount,
+    this.computableCount,
+    this.risingCount,
+    this.fallingCount,
+    this.risingComplete,
+    this.fallingComplete,
+    this.status,
+  });
+
+  factory MarketViewCoverage.fromMap(Map<String, Object?> raw) =>
+      MarketViewCoverage(
+        candidateCount: _asInt(raw['candidate_count']),
+        computableCount: _asInt(raw['computable_count']),
+        risingCount: _asInt(raw['rising_count']),
+        fallingCount: _asInt(raw['falling_count']),
+        risingComplete: _asBoolOr(raw['rising_complete'], false),
+        fallingComplete: _asBoolOr(raw['falling_complete'], false),
+        status: _asString(raw['status']),
+      );
+
+  final int? candidateCount;
+  final int? computableCount;
+  final int? risingCount;
+  final int? fallingCount;
+  final bool? risingComplete;
+  final bool? fallingComplete;
+  final String? status;
+}
+
 class MarketViewResponse {
   const MarketViewResponse({
     required this.asOf,
+    this.coverage,
     required this.history,
     required this.latest,
     required this.mode,
@@ -262,8 +294,12 @@ class MarketViewResponse {
     final latest = raw['latest'];
     final run = raw['run'];
     final status = raw['status'];
+    final coverage = raw['coverage'];
     return MarketViewResponse(
       asOf: _asString(raw['as_of']),
+      coverage: coverage is Map<String, Object?>
+          ? MarketViewCoverage.fromMap(coverage)
+          : null,
       history:
           _asMapList(raw['history']).map(MarketViewItem.fromMap).toList(),
       latest: latest is Map<String, Object?>
@@ -283,6 +319,9 @@ class MarketViewResponse {
 
   /// Projection timestamp; null when the server recorded none.
   final String? asOf;
+
+  /// Opening-mode coverage; null in core mode or when no run exists.
+  final MarketViewCoverage? coverage;
 
   /// Retained TOP10 state-change records in server order
   /// (oldest→newest), ≤100.

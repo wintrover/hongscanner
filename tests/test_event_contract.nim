@@ -37,13 +37,13 @@ const
                  "RANK_CHANGED", "FEED_DISCONNECTED",
                  "DATA_GAP_SUSPECTED", "REST_TRUNCATED",
                  "SUBSCRIPTION_TRUNCATED", "MARKET_STATE_UNKNOWN",
-                 "REPLAY_MATCH", "REPLAY_MISMATCH",
+                 "AGGREGATION_STARTED", "REPLAY_MATCH", "REPLAY_MISMATCH",
                  "SESSION_ENDED", "SESSION_INCOMPLETE", "SESSION_APPROVED"]
   dataQualities = @["OBSERVING", "INCOMPLETE", "UNKNOWN"]
   severities = @["INFO", "HIGH", "CRITICAL"]
   directions = @["UP", "DOWN"]
   deliveryStates = @["PENDING", "ACCEPTED", "FAILED"]
-  messageKinds = @["single", "summary", "digest"]
+  messageKinds = @["single", "summary", "digest", "aggregation_started"]
   eventFields = @["data_quality", "direction", "event_id", "event_type",
                   "evidence_ref", "name", "observed_at", "previous_rank",
                   "rank", "rule_id", "rule_version", "session_id",
@@ -205,7 +205,7 @@ proc validateDelivery(v: HcjValue): seq[string] =
   if v.has("message_kind"):
     let x = v.get("message_kind")
     if x.kind != hkStr or not messageKinds.contains(x.strVal):
-      result.add("delivery: message_kind is not single|summary|digest")
+      result.add("delivery: message_kind is not single|summary|digest|aggregation_started")
 
 # ---------------------------------------------------------------- builders
 
@@ -312,8 +312,8 @@ block schemaFiles:
           .get("description").asStr)
 
 block enumCompleteness:
-  check("enum: the contract vocabulary is exactly 16 event types",
-        eventTypes.len == 16)
+  check("enum: the contract vocabulary is exactly 17 event types",
+        eventTypes.len == 17)
   check("enum: event_type is the full contract vocabulary",
         enumOf(eventSchema, "event_type") == eventTypes)
   check("enum: data_quality is OBSERVING|INCOMPLETE|UNKNOWN",
@@ -324,7 +324,7 @@ block enumCompleteness:
         enumOf(eventSchema, "direction") == directions)
   check("enum: delivery state is PENDING|ACCEPTED|FAILED",
         enumOf(deliverySchema, "state") == deliveryStates)
-  check("enum: message_kind is single|summary|digest",
+  check("enum: message_kind is single|summary|digest|aggregation_started",
         enumOf(deliverySchema, "message_kind") == messageKinds)
   check("schema: the input seq is never an emitted fact field",
         not eventSchema.get("properties").has("transition_seq"))
@@ -564,7 +564,7 @@ block deliveryRecord:
   check("delivery: a digest-covered record with message_kind passes",
         validateDelivery(digestDeliveryHcj()).len == 0)
   deliveryRejected("a message_kind outside the enum is rejected",
-             "is not single|summary|digest",
+             "is not single|summary|digest|aggregation_started",
              proc (): HcjValue =
                var v = digestDeliveryHcj()
                setType(v, "message_kind", hStr("bulk"))

@@ -108,6 +108,10 @@ TOP10_TITLE = "홍스캐너 TOP10 변화"
 TOP10_CHANNEL_ID = "market_rank_changes"
 DIGEST_TITLE = "홍스캐너 TOP10 순위 요약"
 DIGEST_CHANNEL_ID = "market_rank_digest"
+AGGREGATION_STARTED_TITLE = "홍스캐너 — 정규장 개장 및 집계 시작"
+AGGREGATION_STARTED_BODY = (
+    "09:00 KST 시장 개장 및 후보 순위 집계 시작. 종목 데이터 수집 중")
+AGGREGATION_STARTED_CHANNEL_ID = "market_rank_changes"
 # The digest's notification tag: every silent digest replaces the one
 # shade slot (`notify(tag="market_rank_digest", id=0, ...)` on the
 # app side, README §6). The audible forms never carry it.
@@ -471,6 +475,33 @@ def _top10_message(event, fcm_token):
             "data": data,
         },
     }
+
+
+def build_aggregation_started_message(event, fcm_token):
+    """One audible, non-TOP10 session-start notice. It never enters the
+    market-ranking admission allowlist; the event's id and recorded time
+    are the only linkage carried in data."""
+    return _enforce_payload_limit({
+        "message": {
+            "token": fcm_token,
+            "notification": {
+                "title": AGGREGATION_STARTED_TITLE,
+                "body": AGGREGATION_STARTED_BODY,
+            },
+            "android": {
+                "priority": "high",
+                "notification": {
+                    "channel_id": AGGREGATION_STARTED_CHANNEL_ID,
+                },
+            },
+            "data": {
+                "kind": "aggregation_started",
+                "event_id": event["event_id"],
+                "count": "1",
+                "observed_at": event["observed_at"],
+            },
+        },
+    })
 
 
 def build_summary_message(events, fcm_token):

@@ -68,6 +68,13 @@
 ##                                                        value outside the
 ##                                                        evidenced table
 ##                                                        (HIGH, UNKNOWN)
+##   aggregation-started-v1     1  AGGREGATION_           the first completed
+##                                                        STARTED            ka10027 up+down pair whose derived
+##                                                        candidate generation is
+##                                                        non-empty (empty pairs
+##                                                        keep waiting; at most
+##                                                        one per run) (INFO,
+##                                                        OBSERVING)
 ##   session-close-v1           1  SESSION_ENDED          the session_end
 ##                                                        record (INFO,
 ##                                                        OBSERVING)
@@ -161,6 +168,9 @@ type
                                ## the group whose tail s.candidates holds
     pendingQ*: int             ## the completing pair's q of the pending
                                ## group's latest generation
+    aggregationStarted*: bool  ## the first complete non-empty ka10027
+                               ## pair was already judged (at most one
+                               ## AGGREGATION_STARTED per run)
 
 const
   ruleCandidateTransition* = "candidate-transition-v1"
@@ -170,6 +180,7 @@ const
   ruleRestTruncated* = "rest-truncated-v1"
   ruleSubscriptionTruncated* = "subscription-truncated-v1"
   ruleMarketStateUnknown* = "market-state-unknown-v1"
+  ruleAggregationStarted* = "aggregation-started-v1"
   ruleSessionClose* = "session-close-v1"
   ruleSessionIncomplete* = "session-incomplete-v1"
   ruleVersionEventGen* = 1
@@ -610,6 +621,12 @@ proc pairRounds(s: var EventGenState; events: var seq[EventFact]) =
                          vendorScopeRef(up.pages[0].scope), q, seen, events)
     candidateTransitions(s, prev.down, cand.down, "DOWN",
                          vendorScopeRef(down.pages[0].scope), q, seen, events)
+    if not s.aggregationStarted and (cand.up.len > 0 or cand.down.len > 0):
+      s.aggregationStarted = true
+      events.add(judged(s, q, "AGGREGATION_STARTED",
+                        ruleAggregationStarted, "", s.fallbackT, "INFO",
+                        "OBSERVING",
+                        vendorScopeRef(up.pages[0].scope)))
     if boundary:
       s.top10Confirmed = some(prev)
     s.candidates = cand

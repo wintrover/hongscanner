@@ -754,9 +754,10 @@ block dailySweep:
         dirs[1].daily.stkCd == "005930" and dirs[1].page == 1 and
         dirs[1].daily.baseDt == "20261029" and
         dirs[1].daily.updStkpcTp == "1")
-  check("the universe is the row union in first-appearance order, deduped",
-        c.dailyUniverse == @["005930", "000660", "18064K", "999999"] and
-        c.dailyPending == "005930" and c.dailyCursor == 1)
+  check("the universe is the row union in alternating up/down order, deduped",
+        c.dailyUniverse == @["005930", "18064K", "000660", "999999"] and
+        c.dailyPending == "005930" and c.dailyCursor == 1 and
+        c.dailyReady)
   check("the daily_req directive line is the sidecar command contract",
         directiveLine(dirs[1]) ==
         "{\"api_id\":\"ka10081\",\"page\":1,\"params\":{" &
@@ -777,8 +778,8 @@ block dailySweep:
         recs[0].raw.get("query").get("base_dt").strVal == "20261029" and
         recs[0].raw.get("query").get("upd_stkpc_tp").strVal == "1")
   check("the sweep advances one symbol at a time",
-        c.dailyPending == "000660" and c.dailyCursor == 2 and
-        dirs.dirKinds() == @["daily_req"] and dirs[0].daily.stkCd == "000660")
+        c.dailyPending == "18064K" and c.dailyCursor == 2 and
+        dirs.dirKinds() == @["daily_req"] and dirs[0].daily.stkCd == "18064K")
 
   # A vendor failure body (the measured return_code 2 parameter error) is
   # the honest gap, never a rest_resp record — the symbol is skipped and
@@ -788,12 +789,12 @@ block dailySweep:
   check("a return_code 2 daily response is the daily_capture_failed gap",
         recs.kinds() == @["gap"] and
         recs[0].raw.get("what").strVal == "daily_capture_failed" and
-        recs[0].raw.get("symbol").strVal == "000660" and
+        recs[0].raw.get("symbol").strVal == "18064K" and
         "return_code 2" in recs[0].raw.get("detail").strVal)
   check("the failed symbol is skipped, not stopped",
-        not c.incomplete and c.dailyPending == "18064K" and
+        not c.incomplete and c.dailyPending == "000660" and
         c.dailyCursor == 3 and
-        dirs.dirKinds() == @["daily_req"] and dirs[0].daily.stkCd == "18064K")
+        dirs.dirKinds() == @["daily_req"] and dirs[0].daily.stkCd == "000660")
 
   # A measured rate-limit shape (HTTP 429 + return_code 5) after the
   # sidecar's one bounded retry skips the symbol the same way — including
@@ -805,7 +806,7 @@ block dailySweep:
   check("a 429 daily response (retry exhausted) is the skip gap",
         recs.kinds() == @["gap"] and
         recs[0].raw.get("what").strVal == "daily_capture_failed" and
-        recs[0].raw.get("symbol").strVal == "18064K" and
+        recs[0].raw.get("symbol").strVal == "000660" and
         "HTTP status 429" in recs[0].raw.get("detail").strVal)
   check("the sweep continues to the last symbol",
         c.dailyPending == "999999" and c.dailyCursor == 4 and
@@ -829,7 +830,7 @@ block dailySweep:
                                restBody(@["777777"])))
   check("a poll round derives and swaps without any daily_req",
         dirs.len == 1 and dirs[0].kind == dkRemove and
-        c.dailyUniverse == @["005930", "000660", "18064K", "999999"] and
+        c.dailyUniverse == @["005930", "18064K", "000660", "999999"] and
         c.dailyPending == "" and not c.incomplete)
 
   # A rest_daily without a request in flight is a protocol violation.
@@ -853,6 +854,45 @@ block dailySweep:
                                                    @["20261029"])))),
                  ("cont_yn", hStr("")), ("next_key", hStr("")),
                  ("page", hInt(2)), ("status", hInt(200))), r))
+
+block emptyInitialPairWaiting:
+  ## A confirmed empty initial pair must not finalize an empty sweep
+  ## universe: the collector remains in the initial-rest state, records
+  ## the waiting gap, and retries. The next complete non-empty pair then
+  ## finalizes the snapshot exactly once, regardless of later polls.
+  var c = newCollector()
+  discard c.step(ev("ready", ts))
+  discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  discard c.step(evWs(1, ackPayload()))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(@[])))
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = c.step(evRest("down", 1, 200, "N", "", restBody(@[])))
+  check("a confirmed empty initial pair does not finalize the universe",
+        c.phase == phInitialRest and not c.dailyReady and
+        c.dailyUniverse.len == 0 and
+        dirs.dirKinds() == @["rest_req"] and dirs[0].direction == dirUp and
+        recs.kinds() == @["rest_resp", "gap"] and
+        recs[1].raw.get("what").strVal == "daily_universe_waiting" and
+        not c.incomplete)
+  discard c.step(evRest("up", 1, 200, "N", "",
+                        restBody(@["005930", "000660"])))
+  (recs, dirs) = c.step(evRest("down", 1, 200, "N", "",
+                               restBody(@["999999"])))
+  check("the next complete non-empty pair finalizes the snapshot once",
+        c.dailyReady and
+        c.dailyUniverse == @["005930", "999999", "000660"] and
+        c.dailyCursor == 1 and c.dailyPending == "005930" and
+        c.awaiting == awCandReg and
+        dirs.dirKinds() == @["reg", "daily_req"] and
+        dirs[1].daily.stkCd == "005930")
+  discard c.step(evWs(1, ackPayload()))
+  discard c.step(ev("timer", ts, ("kind", hStr("poll"))))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(@["005930"])))
+  discard c.step(evRest("down", 1, 200, "N", "", restBody(@["777777"])))
+  check("a later poll never extends the finalized snapshot",
+        c.dailyUniverse == @["005930", "999999", "000660"] and
+        c.dailyReady and not c.incomplete)
 
 block dailySweepTransport:
   ## The sidecar names a failed daily transport with req=daily (README
