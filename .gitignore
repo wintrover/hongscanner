@@ -2,6 +2,8 @@
 nimcache/
 build/
 runs/
+runs-archive/
+runs-retention/
 calendars/*.json
 !calendars/CALENDAR_INDEX.sha256
 fixtures/kiwoom-doc/
