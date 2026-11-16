@@ -56,6 +56,7 @@ LIVE·BACKFILL 출처와 세션 모드를 구분해 기록하고 부분 관측�
 | P11 | PH-1/PH-2 | frozen config, separate session | signals observed / `NO_TRIGGER_OBSERVED` | BLOCKED(G2) — PH-1 (2) 관측 시도는 2026-11-02 INCOMPLETE로 종료(증거 로그) |
 | P12 | 승인(approval) | 별도 조건 6건(하단 'Approval' 절) | 모든 조건 충족이 문서화됨 | 미구현(목표 계약, BLOCKED(G2)) |
 | P13 | attestation·설치 digest | main 정확 sha + 설치 파일 sha256 대조 | main sha·digest 모두 일치 | 누적 19회 설치 성공(`~/.local/share/hongscanner/versions/` 19디렉터리 실측)·4회 attest 게이트 실패(`f4ad05c` 10-30·`97043fd` 11-02·`7eefd0d` 11-02·`06f4208` 11-03 이미지 페이즈 — 인과는 증거 로그; 배포 동작을 바꾸는 main 변경마다 재실시) |
+| P14 | runs 보존(retention) | `bash tools/run_tests.sh`(retention 계약 포함)·서버 dry-run 보고·timer 수동 트리거·다음 거래일 preflight 관측 | retention 계약 스위트 통과 + dry-run이 보호 대상 전부를 "변경 없음"으로 보고 + timer 무인 실행·JSONL 기록 관측 + `PREFLIGHT_OK` 관측 | BLOCKED — 스크립트·계약테스트·문서 구현 완료(로컬); 서버 배포·실측·timer 등록 전([docs/RETENTION.md](RETENTION.md)) |
 
 ### Northflank gates (NF)
 
@@ -486,6 +487,33 @@ PR #35~#41 merge분에 대한 attest·설치·검증 재측정(AGENTS.md §2.2)�
 | **네트워크 재연결 및 인터넷 비노출** | 수동 명령 없이 복구, Funnel 비활성·포트포워딩 없음 | `svc wifi enable` 재전환 즉시 `POST_WIFI_RECONNECT_HTTP=200 SSL=0 time=0.806123s`; `tailscale serve status`에 `(tailnet only)` 명시(Funnel 비활성, 공유기 포트포워딩 없음) |
 
 한계(2026-11-12 야간, Private Home Server VS-1): (1) 이 구성은 HP 홈 서버의 전원 및 가정용 인터넷(`CB_WiFi_2G`) 가용성에 종속된다(완전한 외부 클라우드 이관은 `NF-0` 사용자 게이트 대기). (2) Let's Encrypt 인증서 발급에 따라 `hongscanner-srv.tail10d26b.ts.net` 도메인 이름은 공개 Certificate Transparency(CT) 로그에 기록된다(접근 자체는 Tailnet Grants로 차단되며 공개 DNS에 `100.x.y.z` `A` 레코드는 게시되지 않는다). (3) MagicDNS 이름 해석은 단말의 Tailscale DNS(`100.100.100.100`)를 전제하므로, 안드로이드 `private_dns_mode`는 기본값(`null`/`opportunistic`/`off`)을 유지해야 한다(수동 외부 DoT 호스트 지정 시 `*.ts.net` 조회 불가). (4) Tailscale Personal 무료 플랜은 개인 비상업적 사용 범위에서만 유효하다.
+
+## Runs retention (P14 — runs/ 디스크 보존)
+
+정책·판정표·절차의 정본은 [docs/RETENTION.md](RETENTION.md)다. 요약: 판정표
+v2 우선순위(ACTIVE > FAILED > SERVICE_DEPENDENCY > GATES_REFERENCED >
+RECENT_RAW > UNKNOWN > ARCHIVE_ELIGIBLE)로 각 런을 판정하고, 마커 VALID +
+`COLLECTOR_EXIT=0` + end 라인의 교집합이며 20거래일 밖인 봉인 런만
+tar+zstd 무손실 압축(round-trip sha256 증명 후 원본 정리)한다. 100 GiB 소프트
+쿼터(runs+archive 합산) 초과 시 오래된 검증 아카이브부터 제거, 소진 시
+RETENTION_BLOCKED + FCM 알림. 활성 세션이면 전체 스킵. 세션 시작은 20 GiB
+Storage Preflight(fail-closed exit 2). FCM 알림은 RETENTION_BLOCKED·
+STORAGE_PREFLIGHT_FAILED 두 상황뿐(정상 무알림). 실패·UNKNOWN 런의 증거는
+절대 삭제하지 않는다(AGENTS.md §2.1).
+
+완료 증거(전부 실측으로; 측정값·런 ID·로그 발췌는 RETENTION.md에만 기록):
+
+- **계약 스위트**: `bash tools/run_tests.sh`에 `tests/
+  test_retention_contract.sh`(테스트 표 14행)가 포함돼 exit 0 +
+  `ALL CONTRACT SUITES PASSED`.
+- **서버 dry-run 보고**: 운영 `runs/` 실측 — 보호 대상(ACTIVE·FAILED·
+  GATES 참조·서비스 의존·최근 20거래일·상태불명) 전부 "변경 없음",
+  ARCHIVE_ELIGIBLE 판정과 그 사유 명시, 파일시스템 무변경.
+- **timer 실행 기록**: `hongscanner-retention.timer`(Sat 12:00 KST·
+  Persistent) 등록 + 서비스 수동 트리거 1회 무인 실행(exit 0·journal·
+  retention-log.jsonl 기록·runs 무변경).
+- **preflight 관측**: 다음 거래일 세션 시작 시 런처 로그에
+  `PREFLIGHT_OK avail=<값>` 후 수집 정상 개시.
 
 ## Completion Evidence
 

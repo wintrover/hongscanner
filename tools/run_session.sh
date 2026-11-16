@@ -42,12 +42,21 @@
 ##                              <repo>/tools/collector/collector)
 ##          HSCOLLECTOR_PYTHON  worker interpreter (default
 ##                              <repo>/tools/collector/.venv/bin/python)
+##          HS_NOTIFY_CMD       preflight alert command override (the
+##                              contract tests' stub; may carry
+##                              arguments); unset = the ops side-channel
+##                              default: ops_alert.py on the SAME Python
+##                              3.13 interpreter as the worker
+##          HS_PREFLIGHT_MIN_AVAIL  storage preflight threshold in bytes
+##                              (default 21474836480 = 20 GiB)
 ## Exit:    the collector's exit code (0/4 per its README §8); 2 for
-##          launcher usage errors (nothing started).
+##          launcher usage errors or a failed storage preflight (nothing
+##          started).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 NOTIFY_SCRIPT="$REPO/tools/notify/notify_dispatcher.py"
+OPS_ALERT_SCRIPT="$REPO/tools/notify/ops_alert.py"
 
 usage() {
   printf 'usage: tools/run_session.sh <collector args...>  (--out=DIR required)\n' >&2
@@ -104,6 +113,38 @@ fi
 
 mkdir -p "$LOG_DIR"          # the run dir itself stays the collector's (O_EXCL)
 touch "$LAUNCHER_LOG"
+
+# ------------------------------------------------------ storage preflight
+# docs/RETENTION.md (Storage Preflight): the session needs room for the
+# day's raw input (observed ~4 GiB) plus sealed-copy/verify headroom
+# (16 GiB) BEFORE the collector starts writing — a disk that fills
+# mid-session is an unobserved outage. Fail-closed: avail below the
+# threshold, or a df that cannot answer at all, stops the session with
+# exit 2 before anything starts and alerts through the ops side-channel:
+# $HS_NOTIFY_CMD when set (the contract tests' stub), else the default
+# ops_alert.py below on the SAME Python 3.13 interpreter as the worker.
+PREFLIGHT_MIN="${HS_PREFLIGHT_MIN_AVAIL:-21474836480}"
+PREFLIGHT_AVAIL=""
+PREFLIGHT_AVAIL="$(df -B1 --output=avail "$LOG_DIR" 2>/dev/null | tail -n 1 | tr -d ' ')" || true
+if ! printf '%s' "$PREFLIGHT_AVAIL" | grep -Eq '^[0-9]+$' || \
+   [ "$PREFLIGHT_AVAIL" -lt "$PREFLIGHT_MIN" ]; then
+  {
+    echo "STORAGE_PREFLIGHT_FAILED: avail=${PREFLIGHT_AVAIL:-unavailable} required=$PREFLIGHT_MIN"
+  } >> "$LAUNCHER_LOG"
+  echo "run_session: STORAGE_PREFLIGHT_FAILED: avail=${PREFLIGHT_AVAIL:-unavailable} required=$PREFLIGHT_MIN" >&2
+  ALERT_TITLE="홍스캐너 STORAGE_PREFLIGHT_FAILED"
+  ALERT_BODY="세션 시작 저장공간 사전검증 실패: avail=${PREFLIGHT_AVAIL:-unavailable}바이트 required=$PREFLIGHT_MIN바이트"
+  if [ -n "${HS_NOTIFY_CMD:-}" ]; then
+    # shellcheck disable=SC2086 # the override command may carry arguments
+    $HS_NOTIFY_CMD "$ALERT_TITLE" "$ALERT_BODY" \
+      >>"$LAUNCHER_LOG" 2>&1 || true
+  else
+    "$PY" "$OPS_ALERT_SCRIPT" --config "$NOTIFY_CONFIG" \
+      "$ALERT_TITLE" "$ALERT_BODY" >>"$LAUNCHER_LOG" 2>&1 || true
+  fi
+  exit 2
+fi
+echo "PREFLIGHT_OK avail=$PREFLIGHT_AVAIL" >> "$LAUNCHER_LOG"
 
 # --------------------------------------------------------- worker control
 WORKER_MODE="none"

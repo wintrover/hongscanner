@@ -49,6 +49,7 @@ run bash tests/test_container_contract.sh
 run bash tests/test_cli_contract.sh
 run bash tests/test_build_contract.sh
 run bash tests/test_install_attested.sh
+run bash tests/test_retention_contract.sh
 run python3 tests/test_calendar_source.py
 
 echo "ALL CONTRACT SUITES PASSED"
