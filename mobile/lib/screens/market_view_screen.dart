@@ -106,10 +106,8 @@ class _Top10sBody extends StatelessWidget {
               children: [
                 if (ma20Mode) ...[
                   Text(
-                    '상승 TOP 10 (MA20 위)' +
-                        (coverage?.risingComplete == false
-                            ? ' · PARTIAL ${coverage?.risingCount ?? '?'}종'
-                            : ''),
+                    '상승 TOP 10 (MA20 위)'
+                        '${coverage?.risingComplete == false ? ' · PARTIAL ${coverage?.risingCount ?? '?'}종' : ''}',
                     style: Theme.of(context).textTheme.titleSmall),
                   const SizedBox(height: 6),
                 ],
@@ -131,10 +129,8 @@ class _Top10sBody extends StatelessWidget {
               children: [
                 if (ma20Mode) ...[
                   Text(
-                    '하락 TOP 10 (MA20 아래)' +
-                        (coverage?.fallingComplete == false
-                            ? ' · PARTIAL ${coverage?.fallingCount ?? '?'}종'
-                            : ''),
+                    '하락 TOP 10 (MA20 아래)'
+                        '${coverage?.fallingComplete == false ? ' · PARTIAL ${coverage?.fallingCount ?? '?'}종' : ''}',
                     style: Theme.of(context).textTheme.titleSmall),
                   const SizedBox(height: 6),
                 ],
