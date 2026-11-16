@@ -512,16 +512,17 @@ block pollSwap:
 # -------------------------------------------- collector: poll restart path
 
 block pollRestart:
-  # An initially EMPTY universe acks an empty 0B REG (registered, no
-  # active codes). The next poll derives 149/20: the swap branch finds
-  # no active codes and issues the REG directly — the fourth
-  # composeRegData path, selected like the others.
+  # The initial non-empty universe registers; a later poll with
+  # no active codes (none subscribed) issues the selected REG directly —
+  # the fourth composeRegData path, selected like the others. An empty
+  # initial pair no longer registers at all (it retries), so this state
+  # can only be reached through a fully-removed generation.
   var c = newCollector()
   discard c.step(ev("ready", ts))
   discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
   discard c.step(evWs(1, ackPayload()))
-  discard c.step(evRest("up", 1, 200, "N", "", restBody(@[])))
-  discard c.step(evRest("down", 1, 200, "N", "", restBody(@[])))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(@["005930"])))
+  discard c.step(evRest("down", 1, 200, "N", "", restBody(@["000660"])))
   discard c.step(evWs(1, ackPayload()))
   discard c.step(ev("timer", ts, ("kind", hStr("poll"))))
   let ups = codesOf(149, 100000)
@@ -530,13 +531,13 @@ block pollRestart:
   var recs: seq[RecOut]
   var dirs: seq[Directive]
   (recs, dirs) = c.step(evRest("down", 1, 200, "N", "", restBody(downs)))
-  check("poll restart: with no active codes the selected REG is issued " &
-        "directly (the fourth composeRegData path)",
+  check("poll restart: with active codes the poll removes the outgoing " &
+        "generation — the incoming selected REG follows its ack",
         recs.kinds() == @["rest_resp", "gap", "sub"] and
         recs[1].raw.get("what").strVal == "subscription_truncated" and
-        recs[2].raw.get("action").strVal == "reg" and
-        dirs.dirKinds() == @["reg"] and
-        dirs[0].data[0].codes == ups[0 ..< 100] & downs)
+        recs[2].raw.get("action").strVal == "remove" and
+        dirs.dirKinds() == @["remove"] and
+        dirs[0].data[0].codes == @["000660", "005930"])
 
 # ---------------------------------------------------------- event judgment
 

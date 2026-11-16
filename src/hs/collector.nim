@@ -17,8 +17,11 @@
 ##     vendor_input.upDownCandidates (KRX, one query per direction,
 ##     declared page cap; any chain failure is fail-closed);
 ##   - the once-per-session ka10081 daily sweep (VS-1, REPLAY_CONTRACT
-##     §12.9): right after the initial pair's derivation and selection the
-##     universe (the pair's ka10027 row stk_cd union, rank order, deduped)
+##     §12.9): after the first complete, explicitly non-empty initial
+##     candidate pair is derived and selected, the universe (the pair's
+##     ka10027 row stk_cd union, alternating up/down rank order, deduped)
+##     enters a waiting state; confirmed empty initial pairs never
+##     finalize an empty universe and never start a subscription.
 ##     is swept one daily_req at a time; only an affirmed response becomes
 ##     a rest_resp record (a failed capture is the daily_capture_failed
 ##     gap and the symbol is skipped — fail-closed per symbol, never per
@@ -126,9 +129,11 @@ type
     closeValues*: seq[string]        ## distinct observed 215 values, in order
     quarantine*: int
     quarantineNotes*: seq[string]
-    dailyUniverse*: seq[string]  ## the once-per-session ka10081 sweep universe
-                                 ## (initial pair's ka10027 row stk_cds, first
-                                 ## appearance order, deduped)
+    dailyUniverse*: seq[string]  ## the once-per-session ka10081 sweep universe:
+                                 ## the first complete non-empty initial pair's
+                                 ## ka10027 row stk_cds, up/down symbols interleaved
+                                 ## by their in-chain appearance order, deduped
+    dailyReady*: bool            ## the universe was explicitly finalized once
     dailyCursor*: int            ## index of the next universe symbol to request
     dailyPending*: string        ## stk_cd of the in-flight daily request (""
                                  ## = none)
@@ -597,22 +602,26 @@ proc dailyQueryOf*(cfg: CollectorConfig; stkCd: string): Ka10081Query =
 
 proc dailyUniverseOf(c: Collector; upPages, downPages: seq[RawHttpResp];
                      upTruncated, downTruncated: bool): seq[string] =
-  ## The ka10081 sweep universe: the union of the initial pair's ka10027
-  ## row stk_cds — ALL rows, in vendor appearance order (the rank order),
-  ## deduped at first appearance: the up leg was queried first, then the
-  ## down leg's first-seen codes. Out-of-shape codes (the rows the
-  ## derivation partitioned into upExcluded/downExcluded) are included:
-  ## each is a legitimate query symbol and its capture outcome is judged
-  ## per symbol, fail-closed. Built exactly once, at the initial pair's
-  ## completion.
-  for chain in [
-      PageChain(query: c.cfg.queryOf(dirUp), pages: upPages),
-      PageChain(query: c.cfg.queryOf(dirDown), pages: downPages)]:
-    let trunc = if chain.query.direction == dirUp: upTruncated
-                else: downTruncated
-    for cd in chainSymbols(ka10027Spec, chain, c.cfg.pageCap, trunc):
-      if cd notin result:
-        result.add(cd)
+  ## A complete non-empty initial pair finalizes the ka10081 sweep universe:
+  ## the union of the pair's ka10027 row stk_cds, interleaved by each leg's
+  ## vendor appearance order so both directions start entering the sweep
+  ## immediately (up #1, down #1, up #2, ...), deduped at first appearance.
+  ## Out-of-shape codes (the rows the derivation partitioned into
+  ## upExcluded/downExcluded) are included: each is a legitimate query
+  ## symbol and its capture outcome is judged per symbol, fail-closed.
+  ## Built exactly once, and only for a confirmed non-empty pair.
+  let upChain = PageChain(query: c.cfg.queryOf(dirUp), pages: upPages)
+  let downChain = PageChain(query: c.cfg.queryOf(dirDown), pages: downPages)
+  let upCodes = chainSymbols(ka10027Spec, upChain, c.cfg.pageCap, upTruncated)
+  let downCodes = chainSymbols(ka10027Spec, downChain, c.cfg.pageCap,
+                               downTruncated)
+  var i = 0
+  while i < upCodes.len or i < downCodes.len:
+    if i < upCodes.len and upCodes[i] notin result:
+      result.add(upCodes[i])
+    if i < downCodes.len and downCodes[i] notin result:
+      result.add(downCodes[i])
+    inc i
 
 proc dailyRespRecord(c: Collector; stkCd: string; resp: RawHttpResp): RecOut =
   ## One rest_resp record of the daily sweep (rest_resp.nim ka10081 schema:
@@ -637,12 +646,14 @@ proc dailyRespRecord(c: Collector; stkCd: string; resp: RawHttpResp): RecOut =
     ("status", hInt(resp.status))))
 
 proc dailyStep(c: var Collector): seq[Directive] =
-  ## Issue the next daily_req of the once-per-session sweep, if one remains
-  ## and the session is still in a capturable state: one request in flight
-  ## at a time, each universe symbol exactly once (no re-issue on re-poll —
-  ## a symbol that appears only in a later poll round stays uncaptured and
-  ## is excluded downstream), and nothing new after the close evidence or
-  ## outside the active phases (teardown/drain/end issue nothing).
+  ## Issue the next daily_req of the once-per-session sweep, if and only if
+  ## the universe was explicitly finalized and a symbol remains: one
+  ## request in flight at a time, each universe symbol exactly once (no
+  ## re-issue on re-poll — a symbol that appears only in a later poll
+  ## round stays uncaptured and is excluded downstream), and nothing new
+  ## after the close evidence or outside the active phases
+  ## (teardown/drain/end issue nothing).
+  if not c.dailyReady: return @[]
   if c.dailyPending.len > 0: return @[]
   if c.dailyCursor >= c.dailyUniverse.len: return @[]
   if c.closeSeen: return @[]
@@ -840,17 +851,31 @@ proc chainAdvance(c: var Collector; records: var seq[RecOut];
         " — the session's candidate derivation never completed")
     c.phase = phStreaming
     return
+  if finished.purpose == cpInitial:
+    let universe = dailyUniverseOf(c, upPages, downPages,
+                                   finished.firstTruncated, truncated)
+    if universe.len == 0:
+      records.add(gapRecord("", "daily_universe_waiting",
+        "confirmed empty initial candidate pair: no universe is finalized, " &
+        "daily sweep remains unstarted", t))
+      c.chain = RestChain(purpose: cpInitial, direction: dirUp)
+      c.phase = phInitialRest
+      result.add(Directive(kind: dkRestReq, direction: dirUp, page: 1,
+                           contYn: "N", nextKey: ""))
+      return
   cand = selectCandidates(records, cand, finished.firstTruncated,
                           truncated, t)
   if finished.purpose == cpInitial:
     c.candPending = cand
     c.candidatesKnown = true
     # The once-per-session ka10081 daily sweep (VS-1, REPLAY_CONTRACT §12.9):
-    # the universe is the initial pair's row stk_cd union in rank order —
-    # built here, exactly once; a re-poll round never extends it (a symbol
-    # that appears only later stays uncaptured, excluded downstream).
+    # the universe is the first complete non-empty initial pair's row
+    # stk_cd union — built here, exactly once from that snapshot; a
+    # re-poll round never extends it (a symbol that appears only later
+    # stays uncaptured, excluded downstream).
     c.dailyUniverse = dailyUniverseOf(c, upPages, downPages,
                                       finished.firstTruncated, truncated)
+    c.dailyReady = true
     c.dailyCursor = 0
     c.dailyPending = ""
     let data = composeRegData(cand.up, cand.down)

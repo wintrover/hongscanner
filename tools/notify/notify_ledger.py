@@ -63,7 +63,7 @@ EVENT_OPTIONAL = ("direction", "name", "previous_rank", "rank", "symbol")
 DELIVERY_REQUIRED = ("attempts", "device_id", "event_id", "state",
                      "updated_at")
 DELIVERY_OPTIONAL = ("error_code", "message_kind", "provider_message_id")
-MESSAGE_KINDS = ("single", "summary", "digest")
+MESSAGE_KINDS = ("single", "summary", "digest", "aggregation_started")
 
 ID_RE = re.compile(r"^[0-9a-f]{64}$")
 TS_RE = re.compile(

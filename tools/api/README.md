@@ -673,6 +673,16 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   100건 oldest→newest), top10 순서는 이 §의 폴드 규칙이다 — 창 밖
   core에서는 rank 오름차순, 창 안 개장 MA20 모드에서는 위 MA20 거리
   정렬(G 내림차순 상승·G 오름차순 하락, 동률 symbol 오름차순)이다.
+- **개장 모드 수집 상태**: 응답 최상위 `coverage`는 개장 MA20 모드에서
+  기준 그룹 기준 관측 대상(active candidate state) 심볼 수, MA20 계산
+  가능 심볼 수, 그리고 각 방향 목록이 PARTIAL인지 COMPLETE인지를
+  기록합니다. `status`는 `"PARTIAL"` 또는 `"COMPLETE"`이고, `rising_count`·
+  `falling_count`는 목록 길이가 아니라 계산 가능 종목 수입니다.
+  `rising_complete`·`falling_complete`는 해당 방향 계산 가능 종목 수가
+  최소 10개 이상일 때만 true입니다. 이는 기준 그룹 범위 안의 완전성일
+  뿐 전체 시장 TOP10 완전성이 아니며, 앱은 PARTIAL을 명시적으로 표시
+ 해야 합니다.
+
 - **캐비앗**: (1) 이중 방향 코드는 event_gen이 UP 방향으로 한 번만
   판정하므로(중복 제거) DOWN 목록에서 누락될 수 있다. (2) `history`는
   확정된 TOP10 상태 변화 **최근 100건**이다(레거시는 상태 비교 파생,
