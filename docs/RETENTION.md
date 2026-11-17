@@ -71,14 +71,19 @@ Preflight이며, 구현이 이 문서와 어긋나면 구현이 틀린 것이다
   df 자체가 실패하면 stderr·런처 로그에 `STORAGE_PREFLIGHT_FAILED`를
   기록하고 exit 2 — 무엇도 시작하지 않는다(fail-closed). 통과 시
   `PREFLIGHT_OK avail=<값>` 1행.
-- **ops 알림은 두 상황만**: `RETENTION_BLOCKED`(retention 스크립트)와
-  `STORAGE_PREFLIGHT_FAILED`(preflight). 정상 상황은 알림 팩트 자체를
-  생산하지 않는다(무알림이 성립한다 — 발송 여부를 판단해 억제하는 것이
-  아니라 아예 만들지 않는다). 발송은 **ops side-channel**(`tools/notify/
-  ops_alert.py`): notify 이벤트 원장·전달 원장 기록 없는 일회성 발송,
-  재시도 없음. 시도와 결과(exit code·기기별 결과 라인)는 호출부 기록
-  (retention-log.jsonl의 NOTIFY 행·런처 로그)에만 남는다 — accepted ≠
-  delivered(tools/notify/README.md §6). 향후 ops 경보에 지속 알림(재시도·
+- **retention의 ops 알림은 두 상황만**: `RETENTION_BLOCKED`(retention
+  스크립트)와 `STORAGE_PREFLIGHT_FAILED`(preflight). 정상 상황은
+  알림 팩트 자체를 생산하지 않는다(무알림이 성립한다 — 발송 여부를
+  판단해 억제하는 것이 아니라 아예 만들지 않는다). 발송은 **ops
+  side-channel**(`tools/notify/ops_alert.py`): notify 이벤트 원장·전달
+  원장 기록 없는 일회성 발송, 재시도 없음. 시도와 결과(exit code·기기별
+  결과 라인)는 호출부 기록에만 남는다 — ops side-channel의 호출부는
+  셋이다(2026-11 추가): retention 스크립트(retention-log.jsonl의 NOTIFY
+  행), Storage Preflight(런처 로그), API 서비스 `serve.py`(readiness
+  FAILED 전환 시 프로세스당 1회 발송 — tools/api/README.md §8.1). 세
+  번째 호출부의 기록 위치는 **systemd journal/stderr**(OPS_ALERT_*
+  저널 라인)이며 파일 쓰기는 없다. accepted ≠ delivered
+  (tools/notify/README.md §6). 향후 ops 경보에 지속 알림(재시도·
   전달 기록)이 필요하면 신규 인프라를 만들지 않고
   **AGGREGATION_STARTED 선례의 이벤트 계약 확장**(contracts/events +
   dispatcher 어드미션)으로 전환한다.

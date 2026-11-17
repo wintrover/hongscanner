@@ -47,6 +47,16 @@ socket.listen), and the listening socket may exist only after WARMING
 is set, so no client can be accepted before the 503 warming answer
 is in force.
 
+Ops observability (README §8): a prewarm that lands FAILED fires the
+ops side-channel exactly once per process — one tools/notify/
+ops_alert.py attempt (or the HS_OPS_ALERT_CMD command; an empty value
+disables), reported ONLY as stderr journal lines (OPS_ALERT_SKIPPED /
+OPS_ALERT_CALLED / OPS_ALERT_FAILED_ERROR), ledger-free, no retry,
+delivery never guaranteed. /status also exposes the readiness state
+machine, and main() prints one SERVE_PROVENANCE stdout line before the
+SERVE line: the process's own git/blob/sha256 agreement — bounded
+self-reported trust, never an attestation.
+
 Python 3.13, standard library only (http.server). No new dependencies.
 """
 
@@ -56,9 +66,12 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import signal
+import subprocess
 import sys
 import threading
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from functools import cmp_to_key
@@ -106,6 +119,14 @@ VERIFY_OUT = "verify.stdout"
 RUN_JSON_FIELDS = ("session_date", "run_id", "started_at", "code_commit")
 
 CANDIDATE_PREFIX = "CANDIDATE_"
+
+# The FAILED ops side-channel (README §8): exactly one alert attempt
+# per process on the prewarm's FAILED transition, journal-only
+# reporting, no retry.
+OPS_ALERT_TITLE = "Hong Scanner API FAILED"
+OPS_ALERT_BODY_MAX = 300
+OPS_ALERT_CHILD_STDERR_MAX = 200
+OPS_ALERT_TIMEOUT_S = 10
 
 # /mobile/market-view (README §3.7): a market-collection run's identity
 # is the committed config record the collector writes into
@@ -844,6 +865,10 @@ class Projector:
         self._readiness_state = "READY"
         self._readiness_error = None
         self._prewarm_started = False
+        # The FAILED ops alert's exactly-once latch (README §8):
+        # _mark_failed flips it under the readiness lock — one alert
+        # attempt per process, on the single FAILED transition only.
+        self._alert_sent = False
 
     def prewarm_market_projection_async(self):
         """Warm the latest eligible run's §3.7 market fold in the background
@@ -897,13 +922,69 @@ class Projector:
                     self._events_committed_lines(
                         os.path.join(self.runs_root, session, EVENTS_JSONL))
             except Exception as exc:
-                with self._readiness_lock:
-                    self._readiness_state = "FAILED"
-                    self._readiness_error = str(exc)
+                if self._mark_failed(exc):
+                    self._notify_failed(exc)
                 return
             with self._readiness_lock:
                 self._readiness_state = "READY"
         threading.Thread(target=_warm, daemon=True).start()
+
+    def _mark_failed(self, exc):
+        """The FAILED transition under one lock: record the terminal
+        state and its reason, and decide — atomically, exactly once per
+        process — whether this caller owes the ops alert. The winner
+        runs _notify_failed OUTSIDE the lock: the alert subprocess must
+        never hold the readiness lock."""
+        with self._readiness_lock:
+            self._readiness_state = "FAILED"
+            self._readiness_error = str(exc)
+            should_alert = not self._alert_sent
+            self._alert_sent = True
+            return should_alert
+
+    def _notify_failed(self, exc):
+        """The FAILED ops alert side-channel (README §8): one
+        tools/notify/ops_alert.py attempt per process, reported only as
+        stderr journal lines — no ledger, no file writes, no retry; the
+        child accepting is never delivery. HS_OPS_ALERT_CMD replaces
+        the command wholesale (the test seam; its value is split with
+        shlex and run as-is, no argument expansion); an empty or
+        whitespace value disables the alert. Never raises: an alert
+        fault is journaled, never propagated into the warming thread."""
+        mono_ns = time.monotonic_ns()
+        boot_id = _boot_id()
+        configured = os.environ.get("HS_OPS_ALERT_CMD")
+        if configured is not None and not configured.strip():
+            sys.stderr.write("OPS_ALERT_SKIPPED reason=disabled"
+                             " mono_ns=%d boot_id=%s\n"
+                             % (mono_ns, boot_id))
+            return
+        # One line, bounded, no env values or credentials: only the
+        # failure's own reason text, newlines flattened.
+        body = " ".join(str(exc).split())[:OPS_ALERT_BODY_MAX]
+        try:
+            if configured is None:
+                cmd = [sys.executable,
+                       os.path.join(_repo_root(), "tools", "notify",
+                                    "ops_alert.py"),
+                       OPS_ALERT_TITLE, body]
+            else:
+                cmd = shlex.split(configured)
+            done = subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=OPS_ALERT_TIMEOUT_S)
+        except Exception as alert_exc:
+            sys.stderr.write("OPS_ALERT_FAILED_ERROR reason=%s"
+                             " mono_ns=%d boot_id=%s\n"
+                             % (alert_exc.__class__.__name__, mono_ns,
+                                boot_id))
+            return
+        result = "accepted" if done.returncode == 0 else "failed"
+        sys.stderr.write("OPS_ALERT_CALLED result=%s rc=%d mono_ns=%d"
+                         " boot_id=%s\n"
+                         % (result, done.returncode, mono_ns, boot_id))
+        if done.returncode != 0 and done.stderr:
+            child = " ".join(done.stderr.split())[:OPS_ALERT_CHILD_STDERR_MAX]
+            sys.stderr.write("OPS_ALERT_STDERR=%s\n" % child)
 
     # ---- run directories -------------------------------------------------
 
@@ -1055,9 +1136,16 @@ class Projector:
                 "devices": len({rec["device_id"] for
                                 rec in latest_deliveries.values()}),
             }
+        # readiness: the §1/§8 cold-path state machine's current value,
+        # read under its lock — an API-process fact only, never a data
+        # freshness or composite health verdict.
+        with self._readiness_lock:
+            readiness = {"state": self._readiness_state,
+                         "error": self._readiness_error}
         return {"sessions": {"count": len(names), "latest": latest_summary},
                 "events": events_block,
-                "delivery": delivery_block}
+                "delivery": delivery_block,
+                "readiness": readiness}
 
     def candidates(self):
         events, ledger_present = self._ledger_events()
@@ -1805,6 +1893,76 @@ class Handler(BaseHTTPRequestHandler):
         self._method_not_allowed()
 
 
+def _boot_id():
+    """The kernel's boot id (stripped), the per-boot correlation key of
+    the ops journal lines. "unknown" when /proc is unreadable — the
+    journal line still prints, this never raises."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "rb") as f:
+            return f.read().decode("ascii", "replace").strip()
+    except OSError:
+        return "unknown"
+
+
+def _repo_root():
+    """The repository root this serve.py belongs to: three dirnames up
+    from <repo>/tools/api/serve.py."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+
+
+def serve_provenance(repo_root):
+    """Startup provenance for main()'s SERVE_PROVENANCE line (README
+    §8): the git facts of THIS serve.py — HEAD sha, branch, the HEAD
+    blob of tools/api/serve.py, the git blob of the on-disk file, the
+    file's sha256 — plus the self-reported agreement verdict.
+    provenance=OK ONLY when every git command exits 0 with non-empty
+    output, the disk blob equals the HEAD blob, the sha256 is 64
+    lowercase hex, and the branch is main; anything else is UNKNOWN
+    with a compact reason. Bounded self-reported trust, NOT an
+    attestation (AGENTS.md §0.2): the process reporting its own
+    metadata proves agreement, never build origin. Never raises."""
+    info = {"git": None, "branch": None, "blob": None, "disk_blob": None,
+            "sha256": None, "provenance": "UNKNOWN", "reason": None}
+    serve_path = os.path.abspath(__file__)
+
+    def git(*args):
+        return subprocess.run(["git"] + list(args), cwd=repo_root,
+                              capture_output=True, text=True, timeout=5)
+
+    try:
+        done = {"git": git("rev-parse", "HEAD"),
+                "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+                "blob": git("rev-parse", "HEAD:tools/api/serve.py"),
+                "disk_blob": git("hash-object", serve_path)}
+    except Exception:
+        info["reason"] = "git-unavailable"
+        return info
+    if any(proc.returncode != 0 or not proc.stdout.strip()
+           for proc in done.values()):
+        info["reason"] = "git-unavailable"
+        return info
+    for key, proc in done.items():
+        info[key] = proc.stdout.strip()
+    try:
+        with open(serve_path, "rb") as f:
+            info["sha256"] = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        info["reason"] = "serve-unreadable"
+        return info
+    if info["branch"] != "main":
+        info["reason"] = "branch=%s" % info["branch"]
+        return info
+    if info["disk_blob"] != info["blob"]:
+        info["reason"] = "blob-mismatch"
+        return info
+    if re.fullmatch(r"[0-9a-f]{64}", info["sha256"]) is None:
+        info["reason"] = "sha256-shape"
+        return info
+    info["provenance"] = "OK"
+    return info
+
+
 def main(argv=None, server_factory=ThreadingHTTPServer):
     parser = argparse.ArgumentParser(
         prog="serve.py",
@@ -1835,6 +1993,18 @@ def main(argv=None, server_factory=ThreadingHTTPServer):
     if not os.path.isdir(args.runs):
         sys.stderr.write("serve.py: --runs is not an existing directory\n")
         return 2
+
+    # Startup provenance (README §8) precedes the prewarm and the
+    # server: one stdout line, bounded self-reported trust (git/blob/
+    # sha256 agreement of this serve.py), never an attestation.
+    provenance = serve_provenance(_repo_root())
+    print("SERVE_PROVENANCE provenance=%s git=%s branch=%s blob=%s"
+          " disk_blob=%s sha256=%s reason=%s"
+          % (provenance["provenance"], provenance["git"] or "-",
+             provenance["branch"] or "-", provenance["blob"] or "-",
+             provenance["disk_blob"] or "-",
+             provenance["sha256"] or "-",
+             provenance["reason"] or "-"), flush=True)
 
     projector = Projector(args.runs, args.ledger, args.delivery)
     Handler.projector = projector
