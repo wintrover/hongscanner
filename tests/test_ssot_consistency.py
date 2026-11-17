@@ -10,6 +10,13 @@ committed single sources of truth:
   4. contracts/events/event.schema.json <-> tools/api/serve.py
      (the market-view event-type constants and literals)
   5. Dockerfile COPY sources <-> .github/workflows/attest.yml staging step
+  6. contracts/events/event.schema.json <-> tools/notify/notify_fcm.py
+     and tools/notify/notify_dispatcher.py (the delivery policy's
+     hardcoded event-type copies: TOP10_EVENT_TYPES,
+     AGGREGATION_STARTED)
+  7. contracts/events/event.schema.json and delivery.schema.json <->
+     mobile/lib/services/market_alert_channel.dart (the Dart routing
+     copies: marketEventTypes, marketKinds)
 """
 
 import ast
@@ -31,6 +38,14 @@ def load_event_type_enum():
     with open(schema_path, "r", encoding="utf-8") as f:
         schema = json.load(f)
     return schema["properties"]["event_type"]["enum"]
+
+
+def load_message_kind_enum():
+    schema_path = os.path.join(
+        REPO, "contracts", "events", "delivery.schema.json")
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+    return schema["properties"]["message_kind"]["enum"]
 
 
 class SsotConsistencySuite(unittest.TestCase):
@@ -198,6 +213,109 @@ class SsotConsistencySuite(unittest.TestCase):
                 src in attest_text or basename in attest_text,
                 f"Dockerfile COPY source {src!r} missing from attest.yml",
             )
+
+    def _module_assignments(self, path, name):
+        """The value node of the one assignment to `name` in the module
+        at `path` (ast, not import: the module may have import side
+        effects). Fails loudly on zero matches (the extraction went
+        blind) or on several (ambiguous copy)."""
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=path)
+        values = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == name
+                    for target in node.targets)]
+        self.assertEqual(
+            len(values), 1,
+            "%s must assign %s exactly once (found %d): the "
+            "extraction went blind or is ambiguous"
+            % (os.path.basename(path), name, len(values)))
+        return values[0]
+
+    def _dart_set_literals(self, name):
+        """The string literals of the one `name = { ... }` set literal
+        in market_alert_channel.dart. [^}] crosses the literal's
+        newlines without DOTALL and cannot overshoot the closing
+        brace."""
+        dart_path = os.path.join(
+            REPO, "mobile", "lib", "services", "market_alert_channel.dart")
+        with open(dart_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        matches = re.findall(r"\b%s\s*=\s*\{([^}]*)\}" % name, text)
+        self.assertEqual(
+            len(matches), 1,
+            "market_alert_channel.dart must define %s as exactly one "
+            "set literal (found %d): the extraction went blind or is "
+            "ambiguous" % (name, len(matches)))
+        literals = set(re.findall(r"[\"']([^\"']+)[\"']", matches[0]))
+        self.assertTrue(
+            literals,
+            "no string literals in %s: the extraction went blind" % name)
+        return literals
+
+    def test_event_schema_covers_notify_fcm_top10_types(self):
+        # The delivery policy's TOP10 allowlist (also the truth behind
+        # notify_dispatcher.NOTIFIABLE_EVENT_TYPES and
+        # notify_config.ADMISSION_UNIVERSE, which reference it): a
+        # subset of the contract vocabulary, not a mirror of it.
+        fcm_path = os.path.join(REPO, "tools", "notify", "notify_fcm.py")
+        node = self._module_assignments(fcm_path, "TOP10_EVENT_TYPES")
+        if isinstance(node, ast.Call) and len(node.args) == 1:
+            node = node.args[0]
+        self.assertIsInstance(
+            node, (ast.Tuple, ast.Set),
+            "TOP10_EVENT_TYPES is not a set/tuple literal: the "
+            "extraction went blind")
+        members = [
+            elt.value for elt in node.elts
+            if isinstance(elt, ast.Constant)
+            and isinstance(elt.value, str)]
+        self.assertTrue(
+            members,
+            "no string members in TOP10_EVENT_TYPES: the extraction "
+            "went blind")
+
+        enum = set(load_event_type_enum())
+        unknown = set(members) - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_fcm.TOP10_EVENT_TYPES drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_event_schema_covers_dispatcher_aggregation_started(self):
+        dispatcher_path = os.path.join(
+            REPO, "tools", "notify", "notify_dispatcher.py")
+        node = self._module_assignments(
+            dispatcher_path, "AGGREGATION_STARTED")
+        self.assertIsInstance(
+            node, ast.Constant,
+            "AGGREGATION_STARTED is not a literal: the extraction "
+            "went blind")
+        self.assertIsInstance(node.value, str)
+
+        enum = set(load_event_type_enum())
+        self.assertIn(
+            node.value, enum,
+            "notify_dispatcher.AGGREGATION_STARTED drifted from "
+            "event.schema.json")
+
+    def test_event_schema_covers_dart_market_event_types(self):
+        enum = set(load_event_type_enum())
+        unknown = self._dart_set_literals("marketEventTypes") - enum
+        self.assertEqual(
+            unknown, set(),
+            "market_alert_channel.dart marketEventTypes drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_dart_market_kinds(self):
+        enum = set(load_message_kind_enum())
+        unknown = self._dart_set_literals("marketKinds") - enum
+        self.assertEqual(
+            unknown, set(),
+            "market_alert_channel.dart marketKinds drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
 
 
 if __name__ == "__main__":

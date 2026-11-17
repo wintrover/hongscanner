@@ -498,6 +498,16 @@ PR #35~#41 merge분에 대한 attest·설치·검증 재측정(AGENTS.md §2.2)�
 | VS-D(SSOT) | `tests/test_ssot_consistency.py` — 커밋 SSOT 미러의 기계적 일관성 스위트: event.schema.json ↔ notify_ledger(EVENT_TYPES·severity·data_quality·direction), delivery.schema.json ↔ notify_ledger, Dockerfile COPY ↔ attest.yml 스테이징. `tools/run_tests.sh` 게이트 등록 |
 | P3·P13(15c9a3c) | PR #97 merge `15c9a3c` push: ci 런 [44008447409](https://github.com/wintrover/hongscanner/actions/runs/44008447409) — 런 로그에서 `ALL CONTRACT SUITES PASSED` 실측. attest 런 [44008853736](https://github.com/wintrover/hongscanner/actions/runs/44008853736) → 설치 sha256: hongscanner `13b0bfd3a6368c1647bf55a3f91656449c7dd2417d6a3ce45be180edd13caa43`·collector `db240b50cedf2b564147f2dc3f11ccc35b123b23b148cd9df566e03c79d4905b` |
 
+### Evidence log (2026-11-17, 오후) — VS-D 확장: 배달 정책 하드카피 4종의 패리티 검사(테스트 전용)
+
+| gate | observed |
+|---|---|
+| VS-D 확장(5→9 검사) | `tests/test_ssot_consistency.py`에 4검사 추가: event.schema.json `event_type` enum ↔ `notify_fcm.TOP10_EVENT_TYPES`(부분집합 — 배달 정책 허용목록), ↔ `notify_dispatcher.AGGREGATION_STARTED`(원소 소속), ↔ `mobile/lib/services/market_alert_channel.dart` `marketEventTypes`(부분집합), delivery.schema.json `message_kind` enum ↔ 같은 파일 `marketKinds`(부분집합). Python 카피는 ast 파싱(임포트 부작용 없이 소스만 읽음), Dart 카피는 `이름 = { … }` 집합 리터럴 정규식 추출(`[^}]*`가 줄바꿈을 넘되 닫는 괄호를 넘지 않음). 추출 0건·과잉·비문자 리터럴 모두 fail loudly(기존 anti-blind 패턴) |
+| 변이 검증(스위트 자체) | 네 카피에 고의 드리프트 주입(`RANK_DRIFTED`·`AGGREGATION_DRIFTED`·`TOP10_DRIFTED`·`summary_drifted`) → 신규 4검사만 정확히 실패(FAILED failures=4, exit 1), git 원상복구 후 9/9 통과 — 공허 그린이 아님을 실측 |
+| 로컬 게이트 | `python3 tests/test_ssot_consistency.py` 베이스라인(변경 전) 5/5 통과 → 확장 후 9/9 통과, exit 0. `bash tools/run_tests.sh` **exit 0 + `ALL CONTRACT SUITES PASSED`**(SSOT 스위트 9테스트 포함, 로그 1회 실측) |
+
+한계(2026-11-17 오후, VS-D 확장): (1) 이 스위트는 부분집합 패리티만 검사한다 — 카피가 enum 안에 있는지는 검증하나, 카피가 의도대로 선택됐는지(예: 네 번째 허용 유형 추가 시 전부 함께 바뀌는지)는 검증하지 않는다(계약은 `notify_fcm.py` 주석의 one-truth 설계). (2) 같은 어휘의 추가 하드카피가 `push_service.dart:116`(`'summary'`/`'digest'`)·`MainActivity.kt:193`(같은 두 kind)·`digest_list_screen.dart:125`(`'TOP10_ENTERED'`)에 있으나 이번 감사 범위 밖이라 보호되지 않는 채로 남는다(별도 보고).
+
 ## Runs retention (P14 — runs/ 디스크 보존)
 
 정책·판정표·절차의 정본은 [docs/RETENTION.md](RETENTION.md)다. 요약: 판정표
