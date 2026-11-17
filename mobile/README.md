@@ -118,6 +118,71 @@ flutter run --dart-define=HS_API_BASE=http://10.0.2.2:8080   # Android emulator
     tailnet-only with Funnel disabled), and the Tailscale Personal plan
     is for non-commercial personal use.
 
+## Tailnet ACL (operating path)
+
+On the operating front the phone reaches
+`https://hongscanner-srv.tail10d26b.ts.net` (port 443) through
+`tailscale serve`, which proxies to the loopback API. Authorization is
+per device in the tailnet policy — there is no app-level credential on
+this path. Measured policy (2026-11-17, console, owner tailnet):
+
+```json
+"tagOwners": { "tag:hongscanner-srv": ["autogroup:owner"] },
+"hosts": {
+  "sm-s938n": "100.80.46.69/32",
+  "sm-g977n": "100.101.144.92/32"
+},
+"acls": [],
+"grants": [
+  { "src": ["sm-s938n", "sm-g977n"], "dst": ["tag:hongscanner-srv"], "ip": ["tcp:443"] }
+]
+```
+
+- **Two device aliases** — `sm-s938n` and `sm-g977n` (the operating
+  phone: Samsung SM-G977N, Android 12, tailnet node `s10`,
+  `100.101.144.92`). The grant's `src` must list every phone that needs
+  access. Measured failure: with only `sm-s938n` listed, the phone was
+  absent from the server's netmap — `tailscale whois 100.101.144.92`
+  answered `peer not found` and the app stayed offline. After adding
+  `sm-g977n` to `hosts` and to the grant `src`, the server's `tailscale
+  status` shows `s10` and `tailscale ping` measured 6 ms, direct.
+- **`ip` stays `tcp:443` only** — no `tcp:8080`, no SSH. The API itself
+  binds `127.0.0.1:8080`, so the proxy is the single ingress.
+- **Symptom when the grant is missing**: the device disappears from the
+  server's peer list — `tailscale whois 100.101.144.92` answered `peer
+  not found` — and the app renders "오프라인 / 서버에 연결할 수 없음
+  (network error: 111)". A wrong `HS_API_BASE` produces the same screen
+  for a different reason (see the next block), so tell them apart from
+  the built kernel and the server log, not the screen.
+
+Build (no trailing `/`):
+
+```sh
+flutter clean
+flutter build apk --debug --dart-define=HS_API_BASE=https://hongscanner-srv.tail10d26b.ts.net
+# operating APK sha256 3ff3bcb6372e490dfb5b96eb7eb186236e5c934e0a57a2697c34c6888e73e225
+```
+
+The previously installed APK was built **without** `--dart-define`: its
+kernel kept `defaultValue: 'http://10.0.2.2:8080'` (the emulator alias)
+and contained no `ts.net` string, so the device had no route and showed
+the offline state above. The build and install outputs looked normal —
+check the kernel for the `ts.net` origin before blaming the network.
+
+Measured acceptance (2026-11-17 19:31 KST, tailnet only — `adb reverse
+--list` empty, no SSH tunnel, notebook port 18080 closed): app launch
+19:31:21 → server journal 19:31:26 `GET /mobile/market-view HTTP/1.1
+200` → real recorded data on screen (옵토닉스 rank 1 … 깨끗한나라우
+rank 10). The cold path on the same client code (server restart
+19:17:42, via a temporary USB tunnel transport) was `503` at
+19:17:46/49/54/59 and the first `200` at 19:18:05; the app showed
+"오류 / 데이터 준비 중 (잠시 후 다시 시도)" while warming, then data —
+the 5-retry × 5 s = 25 s warming budget in `lib/state/app_store.dart`.
+Serve's access log records `127.0.0.1` for every tailnet request (the
+proxy connects over loopback), so client identity cannot be
+distinguished server-side — device attribution needs device-side
+evidence.
+
 ## Basic Auth & HTTPS (Northflank / Private Home Server VS-1 fronts)
 
 The API server itself has no authentication (`tools/api/README.md` §5);
@@ -197,7 +262,7 @@ runs on startup and on foreground resume, with a restrained backoff
 (1s, 2s, capped by 3 attempts) that ends in a visible error state —
 never an infinite spinner. A `503 warming` answer (the readiness host
 still starting up) is not a failure: the pass retries on a fixed 5s
-wait, at most 3 times (≤15s), without consuming a regular attempt, and
+wait, at most 5 times (≤25s), without consuming a regular attempt, and
 a server that never warms up ends in the visible "데이터 준비 중 (잠시 후
 다시 시도)" error. This is also the recovery path for missed
 messages: firebase_messaging 17.x removed the `onDeletedMessages` Dart

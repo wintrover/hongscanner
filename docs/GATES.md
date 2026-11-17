@@ -554,6 +554,22 @@ OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once
 | P3(ff61908) | PR #105 merge `ff61908`(문서 전용): ci 런 [44053991008](https://github.com/wintrover/hongscanner/actions/runs/44053991008) success, 런 로그 `ALL CONTRACT SUITES PASSED` 1회 실측. canonical 체크아웃(워크스테이션·서버) ff-only `ff61908`, 서버 `readiness=READY`·`SERVE_PROVENANCE provenance=OK git=2735dae…` 유지(코드 blob 동일 — 재시작 없음) |
 | P3(03704ac) | PR #107 merge `03704ac`: attest 런 [44058358690](https://github.com/wintrover/hongscanner/actions/runs/44058358690) success(`headSha=03704ac…`). `tools/install-attested.sh` → `INSTALL VERIFY OK source_digest=03704ac… runner=github-hosted-only` → `INSTALL OK version=03704ac sha256_hongscanner=cc0046ca… sha256_collector=db240b50…`(collector 바이트는 모바일 전용 변경이라 `2735dae`와 동일). **재시작 전 잠복 함정 재발**: 기존 `smoke-2026-11-17-2735dae`는 새 바이너리에서 `verify` exit 7(`code_commit`·`origin_main_sha`) — 래퍼 게이트가 이 smoke를 요구하므로 그대로 재시작하면 기동 실패. 신규 `runs/smoke-2026-11-17-03704ac`: `replay` → `REPLAY OK bars=22 signals=4 events=1 frames=24` exit 0, `verify` → `VERDICT MATCH provenance=OK`+`COMMIT=ABSENT`+`EVENTS=6a51940f…` exit 0. 래퍼 `SMOKE_RUN` 1줄 교체(백업 `.bak-20261117-03704ac`, 나머지 diff 0). 재시작 실측: 첫 `503` `2,215.5ms`(`Retry-After: 5`) → 첫 `200` `17,825.4ms`(콜드 창 `15,610ms`), `readiness=READY`, `SERVE_PROVENANCE provenance=OK git=03704ac24fe4… branch=main blob=b06dc73…`, `active`·`NRestarts=0`, 웜 `/mobile/market-view` 0.416~0.425s |
 
+### Evidence log (2026-11-17, 야간 2) — 휴대폰 클라이언트 tailnet 운영 경로 수용(SM-G977N): 오프라인 원인 진단·ACL 수리·실데이터 표시
+
+운영 서버 `hongscanner-srv`(LAN `192.168.0.82`, tailnet `https://hongscanner-srv.tail10d26b.ts.net`:443)에서 API는 `127.0.0.1:8080`에 바인딩되고 `tailscale serve --bg --https=443 http://127.0.0.1:8080`이 tailnet 인그레스를 맡는다. 유닛은 `hongscanner-serve.service`(systemd --user), 실행 체크아웃 `git=05c0831`(main), 기동 라인 `SERVE_PROVENANCE provenance=OK`.
+
+| gate | observed |
+|---|---|
+| 기기 | Samsung SM-G977N(Android 12), Tailscale 노드 이름 `s10`, tailnet IP `100.101.144.92`, 패키지 `com.hongscanner.hongscanner`, FCM device id `wuyoni-sm-g977n` |
+| 근본원인(오프라인 APK) | 기존 설치 APK가 `--dart-define` 없이 빌드돼 커널에 `defaultValue: 'http://10.0.2.2:8080'`(에뮬레이터)만 있었고 `ts.net` 문자열이 없었다 — 앱 표시 "오프라인 / 서버에 연결할 수 없음 (network error: 111)". 네트워크가 아니라 빌드 입력 결함이며 빌드·설치 출력에는 흔적이 없다(mobile/README.md 'Local debug APK') |
+| Tailnet ACL | 정책(콘솔, 소유자 tailnet): `tagOwners` `tag:hongscanner-srv=[autogroup:owner]`, `hosts` `sm-s938n=100.80.46.69/32`, `acls: []`, `grants` `src ["sm-s938n"] -> dst ["tag:hongscanner-srv"] ip ["tcp:443"]`. 휴대폰은 netmap에 없었다 — 서버 `tailscale whois 100.101.144.92` = `peer not found`. 테일넷 소유자가 `hosts`에 `sm-g977n=100.101.144.92/32`를 추가하고 grant `src`를 `["sm-s938n","sm-g977n"]`로 확장(포트는 여전히 `tcp:443`만). 수리 후 서버 `tailscale status`에 `s10` 표시, `tailscale ping` 실측 6ms(direct) |
+| 운영 APK | `flutter build apk --debug --dart-define=HS_API_BASE=https://hongscanner-srv.tail10d26b.ts.net` → sha256 `3ff3bcb6372e490dfb5b96eb7eb186236e5c934e0a57a2697c34c6888e73e225` |
+| tailnet 전용 수용 | `adb reverse` 없음·SSH 터널 없음(`adb reverse --list` 빈 출력, 노트북 18080 포트 닫힘 확인). 앱 기동 `19:31:21` → 서버 저널 `19:31:26` `GET /mobile/market-view HTTP/1.1 200` → 실데이터 렌더(옵토닉스 rank 1 … 깨끗한나라우 rank 10) |
+| 콜드 경로(동일 클라이언트 코드) | 서버 재시작 `19:17:42` → `19:17:46`·`19:17:49`·`19:17:54`·`19:17:59` 503 → 첫 200 `19:18:05`. 앱은 워밍 중 "오류 / 데이터 준비 중 (잠시 후 다시 시도)"을 표시한 뒤 데이터 표시. 워밍 계약 5회×5초=25초(`mobile/lib/state/app_store.dart`). 이 시퀀스는 임시 USB 터널 전송 경로에서 관측됐다(아래 한계) |
+| FCM 등록 | 서버 레지스트리에는 `wuyoni-sm-g977n`만 존재하고 `s25-ultra`는 토큰을 등록한 적이 없다 |
+
+한계(2026-11-17, 휴대폰 클라이언트 수용): 이 관측은 정규장 창(09:00–15:30 KST) 밖 19:31 KST의 표시이며 시장 데이터 파이프라인의 E2E가 아니다 — `E2E Accepted` 0건과 PH-1/PH-2 BLOCKED는 그대로다(위 VS-3 절). tailnet 전용 경로는 실데이터 렌더까지 실측했지만, 콜드 503→200 시퀀스는 임시 USB 터널 전송에서 관측된 것이므로 tailnet에서의 동일 시퀀스는 별도 측정이다. `tailscale serve`가 루프백으로 프록시하므로 서버 접근 로그는 모든 tailnet 요청을 `127.0.0.1`로 기록해 클라이언트 식별이 불가하다 — 기기 귀속은 기기측 증거로만 성립한다. ACL 수리는 테일넷 소유자(콘솔) 작업이며 저장소 코드·서버 구성 변경이 아니다. 본 PR은 docs-only(추적 코드 수정 0줄)다.
+
 ## Runs retention (P14 — runs/ 디스크 보존)
 
 정책·판정표·절차의 정본은 [docs/RETENTION.md](RETENTION.md)다. 요약: 판정표
