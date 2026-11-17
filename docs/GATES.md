@@ -510,7 +510,7 @@ PR #35~#41 merge분에 대한 attest·설치·검증 재측정(AGENTS.md §2.2)�
 
 ### Evidence log (2026-11-17, OC-0) — 운영 폐쇄: 준비 상태 계약·FAILED 경보·실행 출처
 
-OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once·provenance·monotonic/`boot_id` 계측)은 아래 행들, **OC-1**(호스트 수용 — DHCP 예약·무로그인 물리 재부팅·두 번째 LAN 기기)은 운영자 드릴로 **미실시**, **OC-2**(실패 관측성 — FAILED 경보·주입 드릴)는 합성 드릴 완료, **OC-3**(실장 E2E)은 `E2E Procedure Ready`·`E2E Accepted 0`(위 VS-3 절)이다.
+OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once·provenance·monotonic/`boot_id` 계측)은 아래 행들, **OC-1**(호스트 수용 — 운영 서버 `hongscanner-srv`의 무로그인 물리 재부팅 드릴)은 2026-11-17 저녁 실행 완료(독립 기기인 휴대폰의 관측은 미실시), **OC-2**(실패 관측성 — FAILED 경보·주입 드릴)는 합성 드릴 완료, **OC-3**(실장 E2E)은 `E2E Procedure Ready`·`E2E Accepted 0`(위 VS-3 절)이다. 아래 OC-0 행 중 `192.168.0.7` 관측은 **비운영 워크스테이션 인스턴스**이며, 운영 서버 배포·부팅 증거는 별도 절(2026-11-17 저녁)에 있다.
 
 | gate | observed |
 |---|---|
@@ -520,10 +520,24 @@ OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once
 | OC-0.3 T0_OBSERVED·시계 | `tools/notify/notify_clock.py` — 결과 라인에 `mono_ns`(`time.monotonic_ns`)와 `boot_id`를 추가. `tools/run_session.sh` 경보 5곳에 `t0_observed=1`+`mono_ns`+`boot_id`+UTC wall을 기록한다. `T0`는 실제 발생이 아니라 최초 관측 시점(`T0_OBSERVED`)이며 스탈 클래스는 문턱 초과 시점이다. 재부팅을 넘는 대조는 `boot_id`로 구분한다 |
 | OC-2 FAILED 주입(합성·루프백) | `runs` 대신 합성 트리(`input.hcj.jsonl` 2행 비JSON)와 가짜 `HS_OPS_ALERT_CMD`로 별도 serve를 `127.0.0.1:0`에 기동: `readiness_state=FAILED`, 동시 8요청 전부 `500` `data_fault`, `alert_count=1`·`OPS_ALERT_CALLED result=accepted rc=0 mono_ns=60100171352497 boot_id=c34a9235-…`. 7초 후 재조회에서도 `FAILED`·`500`·경보 1회 유지 — 자동 `READY` 승격 없음(재시작이 복구 경로). 실서비스·실원장은 건드리지 않았다 |
 | P3·P13(3473a75) | PR #103 merge `3473a75` push: ci 런 [44048301502](https://github.com/wintrover/hongscanner/actions/runs/44048301502) success(런 로그 `ALL CONTRACT SUITES PASSED` 1회 실측), attest 런 [44048301432](https://github.com/wintrover/hongscanner/actions/runs/44048301432) success(`headSha=3473a75…`). 설치: `INSTALL VERIFY OK … source_digest=3473a75bf13a40be30f85ce40d077440ef4cb6f3 runner=github-hosted-only` → `INSTALL OK version=3473a75 sha256_hongscanner=c83fde005ce7ce5a4610615f5d9a977bfe9e5e244f679c82ac60788604591cb4 sha256_collector=db240b50cedf2b564147f2dc3f11ccc35b123b23b148cd9df566e03c79d4905b`, `current→versions/3473a75` |
-| 호스트 재시작 관측(OC-0) | `systemctl --user restart hongscanner-api.service` @ `2026-11-17T08:45:29Z`: 첫 조회 `503`(2.6ms) → `200` @ `08:45:42Z`(191.7ms), 콜드 창 `12,726ms`. 직후 `/status.readiness={state:"READY",error:null}`, 기동 로그 `SERVE_PROVENANCE provenance=OK git=3473a75… branch=main blob=b06dc73… disk_blob=b06dc73… sha256=6463fd42…`, `SERVE 192.168.0.7:8080`, 유닛 `active/running`·`NRestarts=0`·`ExecMainStartTimestamp=17:45:29 KST`. 웜 경로 20회: min 188.0ms·median 191.9ms·**P95 200.5ms**·max 206.7ms(1초 예산 내). 조회는 서버 자기 자신에서 수행 — 물리 Android/두 번째 LAN 기기 관측은 OC-1·E2E Step 4 소관(LIMITS) |
+| 워크스테이션 재시작 관측(비운영, OC-0) | 이 호스트(`192.168.0.7`)는 운영 서버가 아니라 개발·검증 인스턴스다. `systemctl --user restart hongscanner-api.service` @ `2026-11-17T08:45:29Z`: 첫 조회 `503`(2.6ms) → `200` @ `08:45:42Z`(191.7ms), 콜드 창 `12,726ms`. 직후 `/status.readiness={state:"READY",error:null}`, 기동 로그 `SERVE_PROVENANCE provenance=OK git=3473a75… branch=main blob=b06dc73… disk_blob=b06dc73… sha256=6463fd42…`, `SERVE 192.168.0.7:8080`, 유닛 `active/running`·`NRestarts=0`·`ExecMainStartTimestamp=17:45:29 KST`. 웜 경로 20회: min 188.0ms·median 191.9ms·**P95 200.5ms**·max 206.7ms(1초 예산 내). 운영 서버 관측은 아래 절(2026-11-17 저녁)이다 |
 | P3·P13(9728ec5) | PR #102 merge `9728ec5` push: ci 런 [44044558787](https://github.com/wintrover/hongscanner/actions/runs/44044558787) success(런 로그 `ALL CONTRACT SUITES PASSED` 1회 실측), attest 런 [44044558759](https://github.com/wintrover/hongscanner/actions/runs/44044558759) success → 설치 sha256 hongscanner `57852f209826ef203e103ef4183ecc55e045c56b6c8b8074c4cc9d9c1a87e39a`·collector `db240b50cedf2b564147f2dc3f11ccc35b123b23b148cd9df566e03c79d4905b` |
 
 한계(2026-11-17, OC-0): (1) `readiness`는 최신 적격 런의 projection 준비만 표현한다 — collector 진행·데이터 최신성은 별도 권위이며 이 엔드포인트에 합성되지 않는다. (2) FAILED 경보는 프로세스당 1회 호출이고 타임아웃·비정상 종료 시 재시도·대체 채널이 없다. (3) `READY` 이후의 hang은 systemd 시야 밖이다(`WATCHDOG` 미사용, 독립 타이머 없음). (4) API 실행 출처는 attested artifact가 아니라 canonical checkout + blob 대조다.
+
+### Evidence log (2026-11-17 저녁) — 운영 서버 `hongscanner-srv` production 배포·OC-1 무로그인 재부팅
+
+운영 호스트는 워크스테이션(`192.168.0.7`)이 아니라 **HP ProBook 470 G2 `hongscanner-srv`**다: `wlo1` `192.168.0.82/24`(DHCP via `192.168.0.1`, MAC `ac:d1:b8:9b:60:bd`), tailnet `100.125.164.8`, `https://hongscanner-srv.tail10d26b.ts.net` (tailnet only, `tailscale serve` → `127.0.0.1:8080`), 유닛 `hongscanner-serve.service`, `Linger=yes`.
+
+| gate | observed |
+|---|---|
+| 배포 전 장애(콜드 폴드) | 체크아웃 `96fd5a1`, 설치 `current→versions/0.1.0-main-e6fbdda`, `runs/` 7.9G·최신 `input.hcj.jsonl` 3.4G. 단일 스레드 serve가 첫 요청에서 콜드 폴드+세션 스캔을 수행: `/status` 3s·`/mobile/market-view` 8s 클라이언트 타임아웃(내부적으로는 `18:04:24`·`18:04:41`·`18:04:58`에 200 기록 후 BrokenPipe). 증거 보존: `~/.local/share/hongscanner/incidents/20261117-coldfold.log`(18,939 bytes)·`20261117-preflight.txt` |
+| 잠복 기동 결함 | 재시작 래퍼 `~/.local/bin/hongscanner-serve-start.sh`의 `SMOKE_RUN`이 `smoke-2026-11-12-6e3ad32`인데 설치 바이너리는 `e6fbdda` → `verify` **exit 7**(`issue: code_commit`·`origin_main_sha`). 재부팅 시 게이트 실패로 서비스가 영구 기동 실패했을 결함. 새 바이너리로 `smoke-2026-11-17-2735dae` 생성(`REPLAY OK bars=22 signals=4 events=1 frames=24`, `VERDICT MATCH provenance=OK`) 후 래퍼의 `SMOKE_RUN`만 교체(백업 `hongscanner-serve-start.sh.bak-20261117`, 658 bytes, 나머지 diff 0) |
+| 서버 배포(P13) | `git fetch origin main && git merge --ff-only origin/main`: `96fd5a1 → 2735dae`(clean). GH_TOKEN으로 `tools/install-attested.sh` 실행: `INSTALL VERIFY OK source_digest=2735dae1142265ab559950285768a24e695a207c runner=github-hosted-only` → `INSTALL OK version=2735dae sha256_hongscanner=67739a2b8e0e17f43e695c7fc131871da713319e6e4ef3b3ac946a90cb55850c sha256_collector=db240b50cedf2b564147f2dc3f11ccc35b123b23b148cd9df566e03c79d4905b`; `sha256sum -c SHA256` OK. `current→versions/2735dae` |
+| production 재시작 | `systemctl --user restart hongscanner-serve.service` @ `2026-11-17T09:08:19Z`: 래퍼 게이트 `VERDICT MATCH provenance=OK` → 첫 조회 `503`(5.7ms, `Retry-After: 5`) → `200` `09:08:35Z`(458.8ms), 콜드 창 `15,720ms`. `/status.readiness={state:"READY",error:null}`, `SERVE_PROVENANCE provenance=OK git=2735dae… branch=main blob=b06dc73… disk_blob=b06dc73… sha256=6463fd42…`, 유닛 `active/running`·`NRestarts=0` |
+| production 웜 지연 | 루프백 `/mobile/market-view` 20회 2세트: P95 **435.2ms**·**432.2ms**(min 417.4ms·median 420.5ms·max 445.5ms, 1초 예산 내) |
+| OC-1 무로그인 재부팅 | `systemctl reboot --no-block` @ `09:10:06Z`(구 `boot_id=50ff711c…`, `uptime -s=2026-11-12 22:52:40`) → 새 `boot_id=41f1aea3-f5e7-44aa-a080-b898e398a88b`, `boot_time=2026-11-17 18:10:17 KST`. 호스트 유닛 `hongscanner-boot-probe.service`(enabled)가 **로그인 전** `mono_s=19.92`에 시작하며 `who_at_probe=[]`·`Linger=yes`·`api_enabled=enabled` 기록. Tailscale poll 1에서 up(`100.125.164.8`), `tailscale serve` 프록시 유지. 첫 `503` `mono_s=20.12`(4.6ms, `Retry-After: 5`) → 첫 `200` `mono_s=37.94`(449.6ms, polls=35). `readiness=READY`, `SERVE_PROVENANCE provenance=OK git=2735dae…`, `NRestarts=0`, HTTPS `200` 4.1s, 수집기 종료 `mono_s=46.73`에 `who=[]` — SSH 로그인은 `09:11:18Z`(수집기 종료 후) |
+| 경계 | 위 HTTPS 200은 **서버 자신**의 MagicDNS 조회다(인그레스·인증서·프록시 검증). tailnet에 휴대폰 `s25-ultra`가 온라인이나 앱 요청은 관측하지 않았다 — `T4`/`T5`와 휴대폰 실조회는 OC-3 Step 3·4 소관이며 `E2E Accepted`는 여전히 0건이다. LAN `192.168.0.82:8080`은 루프백 전용이라 직접 노출되지 않는다. `.82` DHCP 예약은 SSH/운영 편의용이며, 앱 경로인 tailnet 주소는 LAN DHCP와 무관하다 |
 
 ## Runs retention (P14 — runs/ 디스크 보존)
 
@@ -688,8 +702,10 @@ provenance=OK`도 운영 승인이 아니다. 각 런의 승인에는 아래 조
   (fail-closed).
 
 현재 상태: `E2E Procedure Ready`(위 국소 관측·검증). `E2E Accepted` 실측
-0건 — 정규장 창 내 통제 장애 드릴, 1.5 GiB+ 라이브 원장의 LAN 모바일
-조회, 마감 후 전체 증거 묶음은 전부 미실시다.
+0건 — 정규장 창 내 통제 장애 드릴, 1.5 GiB+ 라이브 원장의 tailnet 모바일
+조회, 마감 후 전체 증거 묶음은 전부 미실시다. 운영 서버의 production 배포와
+무로그인 재부팅은 2026-11-17 저녁에 실측됐으나(위 증거 로그), 이는
+`E2E Accepted`가 아니다.
 
 ### 알림 타임라인 T0..T5
 
@@ -729,8 +745,10 @@ provenance=OK`도 운영 승인이 아니다. 각 런의 승인에는 아래 조
    (RETENTION 20 GiB·fail-closed exit 2), 워커 유닛 enabled, 기기
    레지스트리 활성 토큰, serve 상태 `READY`(readiness 3값 계약:
    `WARMING`(HTTP `503` + `Retry-After: 5`) / `READY` / `FAILED` —
-   LIMITS VS-C 행), serve 호스트의 LAN 주소(예: 워크스테이션
-   `192.168.0.7`) 점유 확인. 미달이면 중단 — 그날은 수용하지 않는다.
+   LIMITS VS-C 행), 운영 서버 `hongscanner-srv`의 tailnet 인그레스
+   (`https://hongscanner-srv.tail10d26b.ts.net`)와 readiness 확인.
+   LAN `192.168.0.82:8080`은 루프백 전용이라 직접 조회 대상이 아니다.
+   미달이면 중단 — 그날은 수용하지 않는다.
 2. **Live 09:00+ 수집**: 개장(09:00 KST) 이후 세션이 유효한 초기 체인페어를
    확보(모의 관측: 개장 전 기동은 초기 페어가 빈 응답 — 2026-11-11 실측),
    관측 그룹 누적·워커 디스패치 틱·전달 원장 기록을 관측한다.
@@ -739,12 +757,14 @@ provenance=OK`도 운영 승인이 아니다. 각 런의 승인에는 아래 조
    `ops_alert.py` 송신, FCM accepted, 기기 수신, OS 게시(dumpsys). 합격
    조건: 서버측 `T0`→`T3`가 VS-A SLO 이내, `T5` 게시 관측. 주입 지점·시각을
    기록해 드릴이 세션 증거를 훼손했는지 구별 가능하게 한다.
-4. **1.5 GiB+ 라이브 원장 LAN 모바일 조회**: 세션의 `input.hcj.jsonl`이
-   1.5 GiB 이상인 상태(예: 2026-11-17 실측 2.0 GiB)에서 물리 Android 기기가
-   동일 LAN(와이파이)에서 serve 호스트로 `/mobile/market-view`·
-   `/events/{id}`를 조회한다. 합격 조건: HTTP 200 + `READY` 상태의 웜 경로
-   지연(VS-C — 콜드 13.250초 경로가 아니다). 서버가 그 창에 재기동됐다면
-   `WARMING`(`503` + `Retry-After: 5`)→`READY` 전환 관측을 포함한다.
+4. **1.5 GiB+ 라이브 원장 tailnet 모바일 조회**: 세션의 `input.hcj.jsonl`이
+   1.5 GiB 이상인 상태(예: 2026-11-17 운영 서버 실측 3.4 GiB)에서 물리
+   Android 기기가 tailnet을 통해 `https://hongscanner-srv.tail10d26b.ts.net`
+   으로 `/mobile/market-view`·`/events/{id}`를 조회한다(운영 APK의
+   `HS_API_BASE`가 MagicDNS HTTPS다). 합격 조건: HTTP 200 + `READY` 상태의
+   웜 경로 지연(VS-C — 콜드 15.7초 경로가 아니다). 서버가 그 창에
+   재기동됐다면 `WARMING`(`503` + `Retry-After: 5`)→`READY` 전환 관측을
+   포함한다.
 5. **마감 후 15:30 증거**: 15:30 KST 마감 후 세션 봉인(`session_end`+커밋
    마커) → 설치 바이너리로 replay/verify `VERDICT MATCH provenance=OK`
    exit 0, CHECKSUMS·run.json `code_commit` 대조, PH-1/PH-2 증거(아래
