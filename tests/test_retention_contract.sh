@@ -468,6 +468,89 @@ else
   echo "ok   preflight failure starts no collector"; PASS=$((PASS + 1))
 fi
 
+# =========================================== scenario 15 (VS-A failure/stall alerts)
+
+echo "--- 15: VS-A collector failure, worker failure, and silent stall alerts"
+VSA="$SANDBOX/vsa"
+mkdir -p "$VSA/bin" "$VSA/out"
+cp "$PF/bin/df" "$PF/bin/systemd-run" "$VSA/bin/"
+cat > "$VSA/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" is-active "*) exit 3 ;;
+  *" is-failed "*)
+    if [ "${SYSTEMCTL_IS_FAILED:-0}" = "1" ]; then exit 0; else exit 1; fi
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$VSA/bin/systemctl"
+printf '{}\n' > "$VSA/notify-config.json"
+make_notify_stub "$VSA/bin" "$VSA/notify.log"
+
+cat > "$VSA/collector-fail" <<'EOF'
+#!/usr/bin/env bash
+echo "collector crashing" >&2
+exit 4
+EOF
+chmod +x "$VSA/collector-fail"
+
+# (a) collector non-zero exit -> exit 4 + COLLECTOR_FAILED + notify
+: > "$VSA/notify.log"
+RC=0
+PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
+  HSNOTIFY_CONFIG="$VSA/notify-config.json" \
+  HSCOLLECTOR_BIN="$VSA/collector-fail" \
+  HSCOLLECTOR_PYTHON=/bin/true \
+  HS_NOTIFY_CMD="$VSA/bin/notify-stub" \
+  HS_WATCHDOG_INTERVAL=0 \
+  bash "$RUN_SESSION" --out="$VSA/out/sess-fail" >/dev/null 2>&1 || RC=$?
+assert_eq "collector fail: session exits 4" 4 "$RC"
+assert_contains "COLLECTOR_FAILED recorded" \
+  "$(cat "$VSA/out/sess-fail.launcher.log")" "COLLECTOR_FAILED exit=4"
+assert_contains "notify observed collector failure" \
+  "$(cat "$VSA/notify.log")" "exit=4"
+
+# (b) worker systemd unit failed -> WORKER_UNIT_FAILED + notify
+: > "$VSA/notify.log"
+RC=0
+PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
+  SYSTEMCTL_IS_FAILED=1 \
+  HSNOTIFY_CONFIG="$VSA/notify-config.json" \
+  HSCOLLECTOR_BIN="$PF/collector-echo" \
+  HSCOLLECTOR_PYTHON=/bin/true \
+  HS_NOTIFY_CMD="$VSA/bin/notify-stub" \
+  HS_WATCHDOG_INTERVAL=0 \
+  bash "$RUN_SESSION" --out="$VSA/out/sess-wfail" >/dev/null 2>&1 || RC=$?
+assert_eq "worker fail: collector exits 0" 0 "$RC"
+assert_contains "WORKER_UNIT_FAILED recorded" \
+  "$(cat "$VSA/out/sess-wfail.launcher.log")" "WORKER_UNIT_FAILED unit=hsnotify-sess-wfail"
+assert_contains "notify observed worker failure" \
+  "$(cat "$VSA/notify.log")" "hsnotify-sess-wfail"
+
+# (c) silent stall -> SESSION_STALL_DETECTED + notify
+cat > "$VSA/collector-hang" <<'EOF'
+#!/usr/bin/env bash
+sleep 3
+exit 0
+EOF
+chmod +x "$VSA/collector-hang"
+: > "$VSA/notify.log"
+RC=0
+PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
+  HSNOTIFY_CONFIG="$VSA/notify-config.json" \
+  HSCOLLECTOR_BIN="$VSA/collector-hang" \
+  HSCOLLECTOR_PYTHON=/bin/true \
+  HS_NOTIFY_CMD="$VSA/bin/notify-stub" \
+  HS_WATCHDOG_INTERVAL=1 \
+  HS_STALL_TIMEOUT_SECONDS=1 \
+  bash "$RUN_SESSION" --out="$VSA/out/sess-stall" >/dev/null 2>&1 || RC=$?
+assert_eq "stall test: collector exits 0" 0 "$RC"
+assert_contains "SESSION_STALL_DETECTED recorded" \
+  "$(cat "$VSA/out/sess-stall.launcher.log")" "SESSION_STALL_DETECTED"
+assert_contains "notify observed stall" \
+  "$(cat "$VSA/notify.log")" "무응답"
+
 # ---------------------------------------------------------------- summary
 echo ""
 echo "$PASS passed, $FAILED failed"

@@ -748,6 +748,65 @@ block scopeExcludedStream:
         "byte-identically",
         readFile(dir / inputFile) == readFile(dirB / inputFile))
 
+# ------------------------------------------------- VS-B cross-direction dedup
+
+block crossDuplicateUpWins:
+  ## When the vendor returns the same stock code in both rising (up) and
+  ## falling (down) rankings, selectTopPerDirection applies deterministic
+  ## rising-first (up-wins) deduplication and records crossDuplicates,
+  ## while composeRegData still enforces no-duplicate fail-closed.
+  let cands = UpDownCandidates(
+    up: @["005930", "000660", "035420"],
+    down: @["000660", "051910", "005930", "005380"])
+  let sel = selectTopPerDirection(cands)
+  check("cross-dup: up keeps all rising codes in order",
+        sel.selected.up == @["005930", "000660", "035420"])
+  check("cross-dup: down excludes codes selected in up",
+        sel.selected.down == @["051910", "005380"])
+  check("cross-dup: crossDuplicates records excluded codes in down order",
+        sel.crossDuplicates == @["000660", "005930"])
+  check("cross-dup: down excludedCount is 0 (not miscounted as truncation)",
+        sel.facts[1].excludedCount == 0)
+  let reg = composeRegData(sel.selected.up, sel.selected.down)
+  check("cross-dup: composeRegData accepts the deduplicated sets",
+        reg.len == 1 and reg[0].codes == @["005930", "000660", "035420",
+                                           "051910", "005380"])
+
+  ## End-to-end collector session with cross-duplicate codes: session
+  ## completes cleanly, records cross_duplicate gap, emits
+  ## DATA_GAP_SUSPECTED, and verifies MATCH.
+  var c = newCollector()
+  var outp = c.cfg.preambleRecords()
+  proc feed(line: string) =
+    var recs: seq[RecOut]
+    discard c.handleEvent(line, recs)
+    for r in recs: outp.add(r)
+  feed(ev("ready", ts))
+  feed(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  feed(evWs(1, ackPayload()))
+  feed(evRest("up", 1, 200, "N", "", restBody(@["005930", "000660"])))
+  feed(evRest("down", 1, 200, "N", "", restBody(@["000660", "051910"])))
+  feed(evWs(1, ackPayload()))
+  feed(evWs(1, tick0B(item = "005930", t20 = "090500")))
+  feed(evWs(1, state0S(value215 = "4")))
+  feed(evWs(1, ackPayload(trnm = "REMOVE", code = 0)))
+  var hasCrossGap = false
+  for r in outp:
+    if r.kind == kGap and r.raw.get("what").strVal == "cross_duplicate" and
+       "up_wins_dedup" in r.raw.get("detail").strVal and
+       "000660" in r.raw.get("detail").strVal:
+      hasCrossGap = true
+  check("cross-dup stream: collector records cross_duplicate gap", hasCrossGap)
+  let dir = sealStream(outp)
+  let res = replayOf(dir)
+  check("cross-dup stream: replay succeeds without crashing", res.status == rsOk)
+  check("cross-dup stream: DATA_GAP_SUSPECTED emitted for cross_duplicate",
+        countType(res, "DATA_GAP_SUSPECTED") >= 1)
+  let runDir = writeRunOf(dir, res)
+  let v = verifyOf(runDir)
+  check("cross-dup stream: verify declares MATCH",
+        v.verdict == vMatch and v.matched)
+
 # ------------------------------------------------------------- determinism
 
 block determinism:

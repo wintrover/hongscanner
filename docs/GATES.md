@@ -582,7 +582,10 @@ sidecar + collector core)가 계약 스위트와 함께 구현·merge됐다. 단
   `kiwoom_response_order_first_100_v1`, 2026-11-03 사용자 승인).
   제외 후보는 "후보 없음"이 아니라 기록된 관측 제외이며, 그 사실은
   subscription_truncated 갭과 SUBSCRIPTION_TRUNCATED 이벤트가
-  담당한다. 양방향 선출 집합의 교차 중복은 여전히 거부다(fail-closed).
+  담당한다. 양방향 선출 집합의 교차 중복은 `selectTopPerDirection`에서
+  결정론적 상승 우선(up-wins)으로 중복 제거하며, 제외된 중복 종목과
+  규칙(`up_wins_dedup`)을 `cross_duplicate` 갭(`DATA_GAP_SUSPECTED`)으로
+  기록한다(`composeRegData` 직접 호출의 중복 거부는 방어선으로 유지).
 
 ## PH-1 / PH-2
 
