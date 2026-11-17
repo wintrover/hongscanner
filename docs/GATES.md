@@ -539,6 +539,19 @@ OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once
 | OC-1 무로그인 재부팅 | `systemctl reboot --no-block` @ `09:10:06Z`(구 `boot_id=50ff711c…`, `uptime -s=2026-11-12 22:52:40`) → 새 `boot_id=41f1aea3-f5e7-44aa-a080-b898e398a88b`, `boot_time=2026-11-17 18:10:17 KST`. 호스트 유닛 `hongscanner-boot-probe.service`(enabled)가 **로그인 전** `mono_s=19.92`에 시작하며 `who_at_probe=[]`·`Linger=yes`·`api_enabled=enabled` 기록. Tailscale poll 1에서 up(`100.125.164.8`), `tailscale serve` 프록시 유지. 첫 `503` `mono_s=20.12`(4.6ms, `Retry-After: 5`) → 첫 `200` `mono_s=37.94`(449.6ms, polls=35). `readiness=READY`, `SERVE_PROVENANCE provenance=OK git=2735dae…`, `NRestarts=0`, HTTPS `200` 4.1s, 수집기 종료 `mono_s=46.73`에 `who=[]` — SSH 로그인은 `09:11:18Z`(수집기 종료 후) |
 | 경계 | 위 HTTPS 200은 **서버 자신**의 MagicDNS 조회다(인그레스·인증서·프록시 검증). tailnet에 휴대폰 `s25-ultra`가 온라인이나 앱 요청은 관측하지 않았다 — `T4`/`T5`와 휴대폰 실조회는 OC-3 Step 3·4 소관이며 `E2E Accepted`는 여전히 0건이다. LAN `192.168.0.82:8080`은 루프백 전용이라 직접 노출되지 않는다. `.82` DHCP 예약은 SSH/운영 편의용이며, 앱 경로인 tailnet 주소는 LAN DHCP와 무관하다 |
 
+### Evidence log (2026-11-17 야간) — 일일 세션 개장 실패 진단·조기 종료 경보
+
+| gate | observed |
+|---|---|
+| 08:50 자동 세션 실패 | `hongscanner-session.service` `08:50:00` start → `09:00:15` `Main process exited, code=exited, status=2/INVALIDARGUMENT` → `Failed to start`. launcher log `COLLECTOR CONTRACT: candidate contains a duplicate code: 016800` → `COLLECTOR_EXIT=2`. 당시 체크아웃 `96fd5a1`, 설치 collector `current→versions/0.1.0-main-e6fbdda`(교차 중복 up-wins 이전 바이너리). 기록된 up 페이지 1(8종목)에 `016800`은 1회뿐이고 down 다리 응답은 원본에 기록되기 전에 종료됐다 — 중복의 방향은 원본만으로 확정할 수 없다(아래 LIMITS) |
+| 침묵의 원인 | 수집기 비정상 종료 경보(`COLLECTOR_FAILED` + `send_ops_alert`)는 `c6ed6ea`(PR #102, merge `9728ec5`)에서 추가됐다. 당시 체크아웃 `96fd5a1`에는 그 경로가 없어 실패가 journald에만 남았다 — 오늘의 침묵은 코드 결함이 아니라 구 체크아웃·구 바이너리의 결과다 |
+| 수동 재시도(운영자) | `runs/session-2026-11-17-retry1.launcher.log`: `09:15:03` start → `15:30:41` end, `COLLECTOR DONE records=279414 events=132764`, `COLLECTOR_EXIT=0`. run dir `input.hcj.jsonl` 3,583,357,633 bytes·`events.hcj.jsonl` 49,289,774 bytes·`input.hcj.jsonl.committed` seq=279414. 09:00~09:15 구간은 원본에 없다(`DATA_GAP_SUSPECTED`로 남음) |
+| 새 바이너리 검증 | 실패 런의 `input.hcj.jsonl`(683 records)을 설치본 `2735dae`로 `hongscanner replay --in /tmp/hs-diag-input.jsonl --out /tmp/hs-diag-out`: `REPLAY INCOMPLETE: session_end missing`만 출력 — `duplicate code` 오류 없음. 계약 스위트 `crossDuplicateUpWins`(seal→replay→`VERDICT MATCH`)가 교차 중복 up-wins를 결정론적으로 고정한다 |
+| 조기 종료 경보(호스트) | `~/.local/bin/hongscanner-session-start.sh`에 EXIT 트랩 추가(백업 `.bak-20261117-alert`, 1,554 bytes): 달력 판독 실패·기존 run dir 충돌·`run_session.sh` 부재처럼 launcher에 도달하지 못하는 실패도 `ops_alert.py` 1회 호출. `exec`가 프로세스를 대체하므로 정상 경로의 `run_session.sh` 경보와 중복되지 않는다. 실측: 강제 `exit 9` → `ops_alert device=wuyoni-sm-g977n result=accepted status=200`, 주말 분기(`trading=no`) `exit 0` → 무경보, `bash -n` OK, 본문 diff 0 |
+| ops 알림 실측(T3) | 운영 서버에서 `ops_alert.py` 1회: `result=accepted status=200 error=None mono_ns=802173983157 boot_id=41f1aea3…`. FCM 수락이며 기기 도달(T4/T5)은 미확인 |
+| 운영 조회 지연 | `/status` 3회 4.037/4.040/4.044s(214MB ledger·578k events 전량 파싱, 운영 조회용), 앱 경로 `/mobile/market-view` 0.412/0.413/0.432s. Android 앱은 `market-view`만 호출한다 |
+| P3(ff61908) | PR #105 merge `ff61908`(문서 전용): ci 런 [44053991008](https://github.com/wintrover/hongscanner/actions/runs/44053991008) success, 런 로그 `ALL CONTRACT SUITES PASSED` 1회 실측. canonical 체크아웃(워크스테이션·서버) ff-only `ff61908`, 서버 `readiness=READY`·`SERVE_PROVENANCE provenance=OK git=2735dae…` 유지(코드 blob 동일 — 재시작 없음) |
+
 ## Runs retention (P14 — runs/ 디스크 보존)
 
 정책·판정표·절차의 정본은 [docs/RETENTION.md](RETENTION.md)다. 요약: 판정표
