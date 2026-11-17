@@ -98,9 +98,12 @@ python3.13 tools/api/serve.py \
   `tailscale serve --bg --https=443 http://127.0.0.1:8080`과 Tailscale
   Grants(`"acls": []`, `sm-s938n -> tag:hongscanner-srv` `tcp:443`,
   Funnel 비활성)에 위임한다(ASSUMPTIONS I10).
-- 기동에 성공하면 stdout에 한 줄 `SERVE <바인드주소>:<port>`를 찍고
-  flush한다 — 주소는 OS가 확인한 실제 바인딩이다. 스크립트는 이 줄로
-  실제 주소와 포트를 읽는다.
+- 기동에 성공하면 stdout에 두 줄을 순서대로 찍고 flush한다. 첫 줄은 §8의
+  `SERVE_PROVENANCE provenance=<OK|UNKNOWN> git=<sha|-> branch=<branch|->
+  blob=<headblob|-> disk_blob=<blob|-> sha256=<hex|-> reason=<compact|->`
+  (--runs 검증 통과 직후, prewarm·서버 생성 이전 1회), 둘째 줄은
+  `SERVE <바인드주소>:<port>`다 — 주소는 OS가 확인한 실제 바인딩이며
+  스크립트는 이 줄로 실제 주소와 포트를 읽는다(기존 의미 불변).
 - 종료는 SIGTERM/SIGINT로 한다: 서버가 조용히 드레인하고 exit 0으로
   끝난다. 기동 실패는 exit 코드로 끝난다: 2 = 사용법·설정 위반
   (존재하지 않는 --runs, 포트 범위 위반, --bind 거부), 4 = 바인드
@@ -126,7 +129,8 @@ python3.13 tools/api/serve.py \
   `READY` 전환 후 정상 서빙, 예외로 끝나면 프로세스 수명 내내
   `FAILED`(종단) — 모든 market-view 요청은 500 `data_fault`
   (message: "market projection prewarm failed: …")로 응답한다.
-  다른 엔드포인트는 readiness 상태와 무관하다.
+  다른 엔드포인트는 readiness 상태와 무관하다. **FAILED 전환은
+  ops 사이드 채널 알림을 프로세스당 정확히 1회 발사한다**(§8.1).
 
 ## 2. JSON 규약
 
@@ -181,6 +185,7 @@ run-범위 원천 — 선택 규칙이 고른 하나의 런 디렉터리의
                               "CANDIDATE_EXITED", "observed_at": "…"},
              "latest_session_id": "2026-10-30",
              "ledger_present": true},
+  "readiness": {"error": null, "state": "READY"},
   "sessions": {"count": 4,
                "latest": {"code_commit": "885b…", "run_id": "…",
                           "run_json_present": true, "session": "run-…",
@@ -192,6 +197,10 @@ run-범위 원천 — 선택 규칙이 고른 하나의 런 디렉터리의
   상태의 합계다(delivery ledger 문서와 같은 last-record-wins 규칙).
   `configured`는 `--delivery` 지정 여부, `present`는 파일 존재다.
 - `events.latest_*`는 ledger 파일 순서의 마지막 이벤트에서 온다.
+- `readiness`는 §1 콜드 패스 상태 기계의 현재값 그대로다(`state`:
+  `WARMING`|`READY`|`FAILED`, `error`: FAILED의 사유, 그 외 null —
+  §8.2의 의미론). **합성 HEALTHY 불리언은 의도적으로 없다**: 이 API는
+  판정하지 않는다(§0).
 - **존재하지만 커밋된 레코드가 0개인 ledger**(단일 작성자가 `O_CREAT`로
   파일을 연 뒤 첫 기록 전 — notify 워커 기동 직후가 정확히 이 상태다)는
   `ledger_present: true`·`count: 0`·빈 `by_type`/`by_severity`·
@@ -800,7 +809,15 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   WARMING→READY→200 전환; prewarm 시작 순서 — main의
   server_factory 주입으로 서버 생성 시점(소켓이 리스닝되는 순간)의
   readiness 상태가 WARMING임을 단언하고 serve_forever 전에 중단,
-  sleep 없음).
+  sleep 없음), §8 운영 관측(_mark_failed 8스레드 동시 전환 — True
+  정확 1회·하위 프로세스 호출 1회·기본 명령 형상(title/body·timeout
+  10·capture/text), FAILED 종단 간 — HS_OPS_ALERT_CMD 가짜 발송
+  스크립트 원장 1행·OPS_ALERT_CALLED 저널 1회·동시 market_view 8회
+  DataFault·동시 HTTP 4회 500·/status FAILED, READY 착지 무발송·
+  /status READY, 빈 값 disabled의 SKIPPED 라인, /status readiness
+  {state,error} 형상·합성 HEALTHY 부재, SERVE_PROVENANCE — git 없는
+  디렉터리 UNKNOWN+사유·실 프로세스의 전 필드 라인·SERVE 줄 이전
+  순서).
 - 인터프리터 해석 순서는 collector·notify 스위트와 같다:
   `$HSCOLLECTOR_PYTHON` → `python3.13` → `uv python find 3.13`.
 - 게이트: `bash tools/run_tests.sh`에 등록된 스위트(`run bash
@@ -830,3 +847,84 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   프로세스 밖 호스트 실행 어댑터인 `systemd --user` +
   `loginctl enable-linger` (`Linger=yes`)가 담당한다).
 - 판정·replay·verify 실행 — 이 프로세스의 역할이 영원히 아니다.
+
+## 8. 운영 관측 (OC-0) — FAILED ops 알림·readiness 노출·기동 provenance
+
+이 절은 운영 관측 3요소의 계약이다. 공통 원칙: 관측은 **읽기 경로에
+부수 효과를 만들지 않는다** — 이 프로세스는 여전히 아무 파일도 쓰지
+않는다(§0), 알림·상태·증명 어느 것도 판정이 아니다.
+
+### 8.1 FAILED ops 사이드 채널
+
+- prewarm이 예외로 끝나 `FAILED`로 전환할 때 **프로세스당 정확히
+  1회** `tools/notify/ops_alert.py` 발송을 시도한다. FAILED는 프로세스
+  수명 내내 종단(§1)이므로 두 번째 전환·재시도·재발송이 없다. 알림
+  호출은 readiness 락 **밖**에서 실행된다(알림 하위 프로세스가 상태
+  조회를 절대 막지 않는다).
+- **원장 부수 효과 없음**: notify 이벤트 원장·전달 원장에 아무 기록도
+  남지 않는다(tools/notify/README.md §8의 ops_alert.py 설계 그대로).
+  시도와 결과는 **저널 라인(stderr → systemd journal)** 로만 남는다:
+  - `OPS_ALERT_SKIPPED reason=disabled mono_ns=<n> boot_id=<id>
+    wall=<ISO8601Z>` — `HS_OPS_ALERT_CMD`가 빈 값·공백 값으로 설정돼
+    발송이 꺼진 경우.
+  - `OPS_ALERT_CALLED result=accepted|failed rc=<n> mono_ns=<n>
+    boot_id=<id> wall=<ISO8601Z>` — 하위 프로세스 실행 완료. rc≠0이면
+    뒤따르는 `OPS_ALERT_STDERR=<200자 이내 단일 행>` 1줄이 하위
+    stderr를 (개행 제거·절단해) 남긴다.
+  - `OPS_ALERT_FAILED_ERROR reason=<compact> mono_ns=<n> boot_id=<id>
+    wall=<ISO8601Z>` — 실행 자체가 실패(10초 타임아웃·OSError·shlex
+    오류 등). 이 경로는 예외를 절대 전파하지 않는다(알림 실패가
+    서버를 죽이지 않는다).
+  - `mono_ns`는 `time.monotonic_ns()`, `boot_id`는
+    `/proc/sys/kernel/random/boot_id`(부재 시 `unknown`), `wall`은
+    UTC ISO 8601(초 해상도)이다 — `mono_ns`/`boot_id`는 같은
+    부팅·같은 프로세스의 관측 라인을 묶는 상관 키이고, 부팅 경계를
+    넘는 시간 추론은 `wall`로만 한다(다른 기기의 monotonic과 비교
+    금지).
+- **재시도 없음·전달 비보장**: 어떤 결과든 시도 1회가 전부고,
+  `result=accepted`(하위 exit 0)는 수용일 뿐 **전달이 아니다**
+  (tools/notify/README.md §6 — accepted ≠ delivered). 발송 보장이
+  필요한 경보는 이 채널의 역할이 아니다(docs/RETENTION.md의
+  AGGREGATION_STARTED 선례 전환 규칙이 그대로 적용된다).
+- **`HS_OPS_ALERT_CMD` 테스트 이음새**: 설정돼 있으면 그 값을
+  `shlex.split`한 명령을 **그대로** 실행한다(인자 확장 없음 — 필요한
+  인자는 운영자가 값 안에 직접 포함한다). 빈 값·공백 값은 발송
+  비활성(위의 SKIPPED 라인). 미설정이면 기본 경로
+  `[<Python 3.13> <repo>/tools/notify/ops_alert.py <title> <body>]`.
+  `title`은 `Hong Scanner API FAILED`, `body`는 예외 문자열을 개행→
+  공백한 단일 행 300자 절단이다(환경값·자격증명은 절대 넣지 않는다).
+- 호출부 기록 정책(docs/RETENTION.md): 이 API 서비스는 ops
+  side-channel의 네 번째 호출부이며 그 기록 위치는 **systemd
+  journal/stderr**(위의 OPS_ALERT_* 라인)다 — 파일 쓰기는 없다.
+
+### 8.2 /status readiness 의미
+
+- §3.1의 `readiness` 블록은 §1의 콜드 패스 상태 기계
+  (`WARMING`/`READY`/`FAILED`와 FAILED 사유)를 그대로 노출할 뿐이다.
+  **API 투영 프로세스 자체의 상태**지 데이터 신선도·수집 건전성이
+  아니다: `READY`가 "최신 데이터"를, `FAILED`가 "데이터 불량"을
+  의미하지 않는다(FAILED는 이 프로세스의 prewarm이 예외로 끝났다는
+  뜻만 있다). 합성 HEALTHY 불리언은 의도적으로 없다 — 소비자는
+  `state`를 그대로 표시한다(§0: 불확실성을 숨기지 않음).
+
+### 8.3 SERVE_PROVENANCE 기동 라인
+
+- main()은 --runs 검증 통과 직후(prewarm·서버 생성 이전) stdout에
+  한 줄을 찍는다(§1의 두 기동 줄 중 첫 줄):
+  `SERVE_PROVENANCE provenance=<OK|UNKNOWN> git=<sha|-> branch=<branch|->
+  blob=<headblob|-> disk_blob=<blob|-> sha256=<hex|-> reason=<compact|->`
+- 원천: `git rev-parse HEAD`·`git rev-parse --abbrev-ref HEAD`·
+  `git rev-parse HEAD:tools/api/serve.py`(HEAD blob)·실제 serve.py의
+  `git hash-object`(disk_blob), 같은 바이트의 sha256. 전부
+  `cwd=<repo>`, 5초 타임아웃, 실패는 UNKNOWN으로 이어진다(절대
+  예외로 기동을 막지 않는다). 값이 없으면 `-`.
+- `provenance=OK`는 **전부 성립할 때만**: 4개 git 명령 전부 exit 0·
+  비빈 출력, `disk_blob == HEAD blob`, sha256가 64 소문자 hex,
+  `branch == main`. 하나라도 아니면 `UNKNOWN` + compact 사유
+  (`branch=<이름>`, `blob-mismatch`, `git-unavailable`,
+  `serve-unreadable`, …).
+- **유계 신뢰(bounded trust)이지 증명(attestation)이 아니다**
+  (AGENTS.md §0.2): 이 줄은 프로세스가 자기 메타데이터의 일치를
+  스스로 보고한 것일 뿐 빌드 출처의 독립적 증명이 아니며, OK가 어떤
+  운영 승인(GATES P12)도 의미하지 않는다. 아카이브된 attest 산출물
+  검증(tools/install-attested.sh)은 이 라인과 무관하게 그대로다.

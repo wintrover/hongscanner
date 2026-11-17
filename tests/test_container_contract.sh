@@ -404,8 +404,10 @@ PORT_LINE="$(docker port "$CNAME" 8080)"
 assert_contains "port is published on 127.0.0.1 only" "$PORT_LINE" "127.0.0.1:"
 HOST_PORT="$(printf '%s' "$PORT_LINE" | awk '{ n = split($NF, a, ":"); print a[n] }')"
 
-# The SERVE line is the only startup evidence the contract accepts
-# (tools/api/README.md §1).
+# The SERVE line is the startup evidence the contract accepts
+# (tools/api/README.md §1); the §8 SERVE_PROVENANCE line precedes it —
+# the grep anchors on '^SERVE ' (space), which the provenance line's
+# 'SERVE_PROVENANCE' prefix never matches.
 SERVE_LINE=""
 for _ in $(seq 1 120); do
   SERVE_LINE="$(docker logs "$CNAME" 2>/dev/null | grep -m1 '^SERVE ' || true)"
@@ -430,7 +432,7 @@ VRC=0
 "$PY" - "$SANDBOX/status.json" <<'PY' || VRC=$?
 import json, sys
 body = json.load(open(sys.argv[1], encoding="utf-8"))
-assert set(body) == {"sessions", "events", "delivery"}, body
+assert set(body) == {"sessions", "events", "delivery", "readiness"}, body
 assert body["sessions"]["count"] == 1, body["sessions"]
 latest = body["sessions"]["latest"]
 assert latest["run_json_present"] is True, latest
@@ -441,6 +443,14 @@ assert events["ledger_present"] is True, events
 assert events["count"] == 2, events
 assert events["by_type"] == {"CANDIDATE_ENTERED": 1, "SESSION_ENDED": 1}, events
 assert body["delivery"]["configured"] is False, body["delivery"]
+# The §8.2 readiness block: this fixture has no eligible market run, so
+# the prewarm lands READY before the SERVE line is even visible — the
+# state is asserted exactly, with the block's two-key shape (no
+# composite HEALTHY verdict).
+readiness = body["readiness"]
+assert set(readiness) == {"state", "error"}, readiness
+assert readiness["state"] == "READY", readiness
+assert readiness["error"] is None, readiness
 PY
 assert_eq "GET /status serves the mounted fixture (run dir + ledger)" \
   0 "$VRC"

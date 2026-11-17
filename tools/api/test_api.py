@@ -23,12 +23,18 @@ to read_committed_lines), and MarketReadinessSuite the cold-path
 readiness contract (the startup prewarm's WARMING 503 + Retry-After
 without ever queuing on the held fold lock, the single-flight rule, the
 FAILED terminal state, the WARMING -> READY -> 200 transition) —
-in-process with a gated fold, like the two unit suites before it."""
+in-process with a gated fold, like the two unit suites before it.
+ProvenanceSuite holds the §8 startup provenance (SERVE_PROVENANCE
+before SERVE, serve_provenance()'s UNKNOWN-with-reason outside git)."""
 
+import contextlib
 import hashlib
+import io
 import json
 import os
+import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -40,6 +46,7 @@ import time
 import unittest
 
 from http.server import ThreadingHTTPServer
+from unittest import mock
 from urllib import request as urlrequest
 from urllib.error import HTTPError
 
@@ -1213,9 +1220,10 @@ def build_market_view_sandbox(swap_groups=0, sealed=False):
 
 
 class ServerProc:
-    """One serve.py subprocess on an ephemeral port. The SERVE line is
-    the only startup evidence the suite accepts, and it must name the
-    address the server was asked to bind."""
+    """One serve.py subprocess on an ephemeral port. The startup
+    evidence the suite accepts is, in order, the SERVE_PROVENANCE line
+    (README §8) and then the SERVE line — and the SERVE line must name
+    the address the server was asked to bind."""
 
     def __init__(self, box, with_delivery=True, bind=None):
         host = bind if bind is not None else "127.0.0.1"
@@ -1227,13 +1235,13 @@ class ServerProc:
             args += ["--bind", bind]
         self.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
-        ready = select.select([self.proc.stdout], [], [], 20)[0]
-        if not ready:
+        self.provenance_line = self._read_startup_line(
+            "SERVE_PROVENANCE")
+        if not self.provenance_line.startswith("SERVE_PROVENANCE "):
             self.proc.kill()
-            out, err = self.proc.communicate(timeout=10)
-            raise AssertionError("serve.py did not print SERVE in 20s: "
-                                 "stdout=%r stderr=%r" % (out, err))
-        line = self.proc.stdout.readline().decode("utf-8").strip()
+            raise AssertionError("unexpected first startup line: %r"
+                                 % self.provenance_line)
+        line = self._read_startup_line("SERVE")
         if not line.startswith("SERVE %s:" % host):
             raise AssertionError("unexpected serve line: %r" % line)
         self.bind = host
@@ -1246,6 +1254,17 @@ class ServerProc:
         # a server still warming after the timeout fails the suite, it
         # never passes on it.
         self.wait_market_view_ready()
+
+    def _read_startup_line(self, what, timeout=20):
+        """One stdout startup line, with a bounded wait: a serve.py that
+        never prints it is killed and reported, never hung on."""
+        if not select.select([self.proc.stdout], [], [], timeout)[0]:
+            self.proc.kill()
+            out, err = self.proc.communicate(timeout=10)
+            raise AssertionError("serve.py did not print %s in %ds: "
+                                 "stdout=%r stderr=%r" % (what, timeout,
+                                                          out, err))
+        return self.proc.stdout.readline().decode("utf-8").strip()
 
     def wait_market_view_ready(self, timeout=30):
         """Poll /mobile/market-view until the 503 warming answers stop.
@@ -3226,7 +3245,15 @@ class MarketReadinessSuite(unittest.TestCase):
     Deterministic in-process control (the MarketFoldSuite discipline):
     the module fold is wrapped with a gate the test opens, and a real
     ThreadingHTTPServer serves the real Handler on an ephemeral
-    loopback port for the HTTP bytes."""
+    loopback port for the HTTP bytes.
+
+    The FAILED ops side-channel (README §8) lives here too: the
+    transition's exactly-once alert (raced _mark_failed, one subprocess
+    call with the default command/timeout), the end-to-end FAILED
+    landing through the HS_OPS_ALERT_CMD fake-script seam (one ledger
+    line, one OPS_ALERT_CALLED journal line, 8 direct DataFaults and 4
+    HTTP 500s), the READY no-alert landing, the disabled seam, and the
+    /status readiness block's exact {state, error} shape."""
 
     def setUp(self):
         self.box = build_market_view_sandbox()
@@ -3399,8 +3426,10 @@ class MarketReadinessSuite(unittest.TestCase):
                         real)
         projector = serve.Projector(self.box.runs, self.box.ledger)
         port = self.start_handler_server(projector)
-        projector.prewarm_market_projection_async()
-        self.wait_state(projector, "FAILED")
+        with self.install_disabled_ops_alert(), \
+                contextlib.redirect_stderr(io.StringIO()):
+            projector.prewarm_market_projection_async()
+            self.wait_state(projector, "FAILED")
         with projector._readiness_lock:
             self.assertEqual(projector._readiness_error,
                              "cold-path fixture failure")
@@ -3483,12 +3512,218 @@ class MarketReadinessSuite(unittest.TestCase):
 
         argv = ["--runs", self.box.runs, "--ledger", self.box.ledger,
                 "--delivery", self.box.delivery, "--port", "0"]
-        with self.assertRaises(Sentinel):
+        captured_out = io.StringIO()
+        with self.assertRaises(Sentinel), \
+                contextlib.redirect_stdout(captured_out):
             serve.main(argv, server_factory=factory)
+        # the provenance line is printed before the server factory even
+        # runs — it precedes the listening socket, like the prewarm
+        self.assertTrue(captured_out.getvalue()
+                        .startswith("SERVE_PROVENANCE provenance="))
         # the listening socket may exist only after WARMING was set:
         # on the pre-fix order (server constructed first) the captured
         # state is the Projector.__init__ default READY
         self.assertEqual(captured["state"], "WARMING")
+
+    # -- (f) the FAILED ops alert: exactly once per process -----------------
+
+    def install_fake_ops_alert(self):
+        """An executable fake alert command (the HS_OPS_ALERT_CMD test
+        seam, README §8): appends one line to a ledger file per
+        invocation — the exactly-once contract is the line count.
+        Returns (script_path, ledger_path)."""
+        root = tempfile.mkdtemp(prefix="hs-ops-alert-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        ledger = os.path.join(root, "alert.lines")
+        script = os.path.join(root, "fake-alert.sh")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nprintf 'alert\\n' >> %s\n"
+                    % shlex.quote(ledger))
+        os.chmod(script, 0o755)
+        return script, ledger
+
+    def install_disabled_ops_alert(self):
+        """The FAILED transition owes the ops side-channel alert (README
+        §8); failure landings that don't test the alert itself disable
+        it (the empty HS_OPS_ALERT_CMD seam) so no real send ever
+        happens — the alert's own contract is the (f)/(g) tests."""
+        return mock.patch.dict(os.environ, {"HS_OPS_ALERT_CMD": ""})
+
+    def test_failed_ops_alert_is_exactly_once_under_concurrency(self):
+        """_mark_failed's exactly-once latch holds under a raced
+        transition: 8 threads run the _warm() failure discipline (mark,
+        then notify only as the winner); exactly one True comes back and
+        the alert subprocess runs exactly once — the default command,
+        title/body arguments, timeout=10 — with FAILED and the reason
+        recorded."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        projector = serve.Projector(box.runs, box.ledger)
+        results = []
+        barrier = threading.Barrier(8)
+        failure = RuntimeError("boom-once")
+
+        def transition():
+            barrier.wait()
+            # the _warm() except discipline verbatim: only the mark
+            # winner owes the alert, and it notifies OUTSIDE the lock
+            won = projector._mark_failed(failure)
+            results.append(won)
+            if won:
+                projector._notify_failed(failure)
+
+        threads = [threading.Thread(target=transition)
+                   for _ in range(8)]
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HS_OPS_ALERT_CMD", None)
+            with mock.patch.object(serve.subprocess, "run", fake_run), \
+                    contextlib.redirect_stderr(captured):
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(10)
+        self.assertFalse(any(t.is_alive() for t in threads),
+                         "transition threads never finished")
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 7)
+        with projector._readiness_lock:
+            self.assertEqual(projector._readiness_state, "FAILED")
+            self.assertEqual(projector._readiness_error, "boom-once")
+            self.assertTrue(projector._alert_sent)
+        self.assertEqual(len(calls), 1)
+        cmd, kwargs = calls[0]
+        self.assertEqual(cmd[0], sys.executable)
+        self.assertTrue(cmd[1].endswith(
+            os.path.join("tools", "notify", "ops_alert.py")))
+        self.assertEqual(cmd[2], "Hong Scanner API FAILED")
+        self.assertEqual(cmd[3], "boom-once")
+        self.assertLessEqual(len(cmd[3]), 300)
+        self.assertNotIn("\n", cmd[3])
+        self.assertEqual(kwargs.get("timeout"), 10)
+        self.assertTrue(kwargs.get("capture_output"))
+        self.assertTrue(kwargs.get("text"))
+        journal = captured.getvalue()
+        self.assertEqual(journal.count("OPS_ALERT_CALLED"), 1)
+        self.assertIn("OPS_ALERT_CALLED result=accepted rc=0", journal)
+        self.assertIn("boot_id=", journal)
+
+    def test_failed_end_to_end_fires_one_ops_alert(self):
+        """End to end over the real transition: a prewarm whose fold
+        raises lands FAILED and fires the ops side-channel exactly once
+        — one fake-script ledger line, one OPS_ALERT_CALLED journal
+        line — while 8 concurrent market_view() calls answer DataFault
+        and 4 concurrent HTTP GETs answer 500 data_fault (none of the
+        fault surface re-alerts), and /status reports the FAILED
+        readiness with the reason."""
+        script, ledger = self.install_fake_ops_alert()
+        real = serve._fold_market_projection_inc
+
+        def failing_fold(path, session_date, prev_state=None):
+            raise RuntimeError("cold-path fixture failure")
+        serve._fold_market_projection_inc = failing_fold
+        self.addCleanup(setattr, serve, "_fold_market_projection_inc",
+                        real)
+        projector = serve.Projector(self.box.runs, self.box.ledger)
+        port = self.start_handler_server(projector)
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ,
+                             {"HS_OPS_ALERT_CMD": script}), \
+                contextlib.redirect_stderr(captured):
+            projector.prewarm_market_projection_async()
+            self.wait_state(projector, "FAILED")
+            # the alert runs after the state flips: wait for its
+            # journal line, not only for the state
+            deadline = time.monotonic() + 20
+            while "OPS_ALERT_CALLED" not in captured.getvalue() and \
+                    time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertIn("OPS_ALERT_CALLED result=accepted",
+                      captured.getvalue())
+        outcomes = self.concurrent_market_views(projector, count=8)
+        self.assertEqual([o[0] for o in outcomes], ["DataFault"] * 8)
+        for _, message in outcomes:
+            self.assertIn("market projection prewarm failed", message)
+            self.assertIn("cold-path fixture failure", message)
+        for status, body, _ in self.concurrent_gets(
+                port, "/mobile/market-view", count=4):
+            self.assertEqual(status, 500)
+            error = json.loads(body.decode("utf-8"))["error"]
+            self.assertEqual(error["code"], "data_fault")
+            self.assertIn("market projection prewarm failed",
+                          error["message"])
+        # exactly one alert: one ledger line, one journal line
+        with open(ledger, encoding="utf-8") as f:
+            self.assertEqual(f.read().splitlines(), ["alert"])
+        self.assertEqual(captured.getvalue().count(
+            "OPS_ALERT_CALLED result=accepted"), 1)
+        status, body, _ = self.get(port, "/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8"))["readiness"],
+                         {"state": "FAILED",
+                          "error": "cold-path fixture failure"})
+
+    def test_ready_landing_sends_no_ops_alert(self):
+        """A successful prewarm never touches the ops side-channel: no
+        ledger line, no journal line, and /status readiness READY with
+        no error."""
+        script, ledger = self.install_fake_ops_alert()
+        projector = serve.Projector(self.box.runs, self.box.ledger)
+        port = self.start_handler_server(projector)
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, {"HS_OPS_ALERT_CMD": script}), \
+                contextlib.redirect_stderr(captured):
+            projector.prewarm_market_projection_async()
+            self.wait_state(projector, "READY")
+        self.assertFalse(os.path.exists(ledger))
+        self.assertNotIn("OPS_ALERT_", captured.getvalue())
+        status, body, _ = self.get(port, "/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8"))["readiness"],
+                         {"state": "READY", "error": None})
+
+    def test_status_readiness_block_is_state_and_error_only(self):
+        """The /status readiness block is exactly {state, error} for
+        both READY and FAILED — no composite HEALTHY boolean, no other
+        keys: the API projects the §1 state machine, it never judges
+        health (§0), and the disabled seam answers OPS_ALERT_SKIPPED."""
+        ready = serve.Projector(self.box.runs, self.box.ledger)
+        ready.prewarm_market_projection_async()
+        self.wait_state(ready, "READY")
+        self.assertEqual(ready.status()["readiness"],
+                         {"state": "READY", "error": None})
+        real = serve._fold_market_projection_inc
+
+        def failing_fold(path, session_date, prev_state=None):
+            raise RuntimeError("cold-path fixture failure")
+        serve._fold_market_projection_inc = failing_fold
+        self.addCleanup(setattr, serve, "_fold_market_projection_inc",
+                        real)
+        failed = serve.Projector(self.box.runs, self.box.ledger)
+        captured = io.StringIO()
+        with self.install_disabled_ops_alert(), \
+                contextlib.redirect_stderr(captured):
+            failed.prewarm_market_projection_async()
+            self.wait_state(failed, "FAILED")
+            deadline = time.monotonic() + 10
+            while "OPS_ALERT_SKIPPED" not in captured.getvalue() and \
+                    time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertIn("OPS_ALERT_SKIPPED reason=disabled",
+                      captured.getvalue())
+        body = failed.status()
+        self.assertEqual(body["readiness"],
+                         {"state": "FAILED",
+                          "error": "cold-path fixture failure"})
+        self.assertEqual(set(body["readiness"]), {"state", "error"})
+        self.assertNotIn("healthy", body)
+        self.assertNotIn("HEALTHY", body)
 
 
 class TornLedgerSuite(unittest.TestCase):
@@ -3635,6 +3870,60 @@ class BindAddressSuite(unittest.TestCase):
                          "application/json; charset=utf-8")
         self.assertTrue(raw.endswith(b"\n"))
         self.assertEqual(body["sessions"]["count"], 0)
+
+
+class ProvenanceSuite(unittest.TestCase):
+    """The startup provenance contract (README §8): serve_provenance()
+    is bounded self-reported trust — the git/blob/sha256 agreement of
+    this serve.py, OK only when every git command succeeds, the disk
+    blob equals the HEAD blob, the sha256 is 64 lowercase hex and the
+    branch is main — and a real serve.py process prints exactly one
+    SERVE_PROVENANCE stdout line BEFORE the SERVE line. The suite never
+    requires provenance=OK: this checkout is a feature-branch worktree
+    by design, and UNKNOWN-with-reason is the honest answer there."""
+
+    def reap_server(self):
+        code, _ = self.server.stop()
+        self.assertEqual(code, 0, "serve.py did not exit 0 on SIGTERM")
+        self.server.assert_gone()
+
+    def test_serve_provenance_unknown_without_git(self):
+        # a directory outside any git work tree: git fails, everything
+        # stays unknown with a compact reason — never an exception
+        root = tempfile.mkdtemp(prefix="hs-provenance-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        info = serve.serve_provenance(root)
+        self.assertEqual(info["provenance"], "UNKNOWN")
+        self.assertTrue(info["reason"])
+        self.assertIsNone(info["git"])
+
+    def test_serve_process_prints_provenance_line_before_serve(self):
+        # the real process's own stdout, read line by line: one
+        # SERVE_PROVENANCE line with every field, then the SERVE line
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        self.server = ServerProc(box)
+        self.addCleanup(self.reap_server)
+        line = self.server.provenance_line
+        self.assertTrue(line.startswith("SERVE_PROVENANCE provenance="))
+        tokens = line.split()
+        self.assertEqual(tokens[0], "SERVE_PROVENANCE")
+        fields = dict(token.split("=", 1) for token in tokens[1:])
+        self.assertEqual(set(fields),
+                         {"provenance", "git", "branch", "blob",
+                          "disk_blob", "sha256", "reason"})
+        self.assertIn(fields["provenance"], ("OK", "UNKNOWN"))
+        self.assertTrue(all(value != "" for value in fields.values()))
+        self.assertTrue(fields["sha256"] == "-" or
+                        re.fullmatch(r"[0-9a-f]{64}", fields["sha256"]))
+        self.assertTrue(fields["git"] == "-" or
+                        re.fullmatch(r"[0-9a-f]{7,64}", fields["git"]))
+        if fields["provenance"] == "OK":
+            self.assertEqual(fields["branch"], "main")
+            self.assertEqual(fields["disk_blob"], fields["blob"])
+            self.assertEqual(fields["reason"], "-")
+        else:
+            self.assertNotEqual(fields["reason"], "-")
 
 
 if __name__ == "__main__":
