@@ -953,11 +953,12 @@ class Projector:
         fault is journaled, never propagated into the warming thread."""
         mono_ns = time.monotonic_ns()
         boot_id = _boot_id()
+        wall = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         configured = os.environ.get("HS_OPS_ALERT_CMD")
         if configured is not None and not configured.strip():
             sys.stderr.write("OPS_ALERT_SKIPPED reason=disabled"
-                             " mono_ns=%d boot_id=%s\n"
-                             % (mono_ns, boot_id))
+                             " mono_ns=%d boot_id=%s wall=%s\n"
+                             % (mono_ns, boot_id, wall))
             return
         # One line, bounded, no env values or credentials: only the
         # failure's own reason text, newlines flattened.

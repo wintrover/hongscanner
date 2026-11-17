@@ -3573,8 +3573,9 @@ class MarketReadinessSuite(unittest.TestCase):
             barrier.wait()
             # the _warm() except discipline verbatim: only the mark
             # winner owes the alert, and it notifies OUTSIDE the lock
-            results.append(projector._mark_failed(failure))
-            if results[-1]:
+            won = projector._mark_failed(failure)
+            results.append(won)
+            if won:
                 projector._notify_failed(failure)
 
         threads = [threading.Thread(target=transition)

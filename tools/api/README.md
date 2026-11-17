@@ -864,19 +864,23 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
 - **원장 부수 효과 없음**: notify 이벤트 원장·전달 원장에 아무 기록도
   남지 않는다(tools/notify/README.md §8의 ops_alert.py 설계 그대로).
   시도와 결과는 **저널 라인(stderr → systemd journal)** 로만 남는다:
-  - `OPS_ALERT_SKIPPED reason=disabled mono_ns=<n> boot_id=<id>` —
-    `HS_OPS_ALERT_CMD`가 빈 값·공백 값으로 설정돼 발송이 꺼진 경우.
+  - `OPS_ALERT_SKIPPED reason=disabled mono_ns=<n> boot_id=<id>
+    wall=<ISO8601Z>` — `HS_OPS_ALERT_CMD`가 빈 값·공백 값으로 설정돼
+    발송이 꺼진 경우.
   - `OPS_ALERT_CALLED result=accepted|failed rc=<n> mono_ns=<n>
-    boot_id=<id>` — 하위 프로세스 실행 완료. rc≠0이면 뒤따르는
-    `OPS_ALERT_STDERR=<200자 이내 단일 행>` 1줄이 하위 stderr를
-    (개행 제거·절단해) 남긴다.
-  - `OPS_ALERT_FAILED_ERROR reason=<compact> mono_ns=<n> boot_id=<id>`
-    — 실행 자체가 실패(10초 타임아웃·OSError·shlex 오류 등). 이
-    경로는 예외를 절대 전파하지 않는다(알림 실패가 서버를 죽이지
-    않는다).
+    boot_id=<id> wall=<ISO8601Z>` — 하위 프로세스 실행 완료. rc≠0이면
+    뒤따르는 `OPS_ALERT_STDERR=<200자 이내 단일 행>` 1줄이 하위
+    stderr를 (개행 제거·절단해) 남긴다.
+  - `OPS_ALERT_FAILED_ERROR reason=<compact> mono_ns=<n> boot_id=<id>
+    wall=<ISO8601Z>` — 실행 자체가 실패(10초 타임아웃·OSError·shlex
+    오류 등). 이 경로는 예외를 절대 전파하지 않는다(알림 실패가
+    서버를 죽이지 않는다).
   - `mono_ns`는 `time.monotonic_ns()`, `boot_id`는
-    `/proc/sys/kernel/random/boot_id`(부재 시 `unknown`)다 — 같은
-    부팅·같은 프로세스의 관측 라인을 묶는 상관 키일 뿐이다.
+    `/proc/sys/kernel/random/boot_id`(부재 시 `unknown`), `wall`은
+    UTC ISO 8601(초 해상도)이다 — `mono_ns`/`boot_id`는 같은
+    부팅·같은 프로세스의 관측 라인을 묶는 상관 키이고, 부팅 경계를
+    넘는 시간 추론은 `wall`로만 한다(다른 기기의 monotonic과 비교
+    금지).
 - **재시도 없음·전달 비보장**: 어떤 결과든 시도 1회가 전부고,
   `result=accepted`(하위 exit 0)는 수용일 뿐 **전달이 아니다**
   (tools/notify/README.md §6 — accepted ≠ delivered). 발송 보장이
@@ -890,7 +894,7 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   `title`은 `Hong Scanner API FAILED`, `body`는 예외 문자열을 개행→
   공백한 단일 행 300자 절단이다(환경값·자격증명은 절대 넣지 않는다).
 - 호출부 기록 정책(docs/RETENTION.md): 이 API 서비스는 ops
-  side-channel의 세 번째 호출부이며 그 기록 위치는 **systemd
+  side-channel의 네 번째 호출부이며 그 기록 위치는 **systemd
   journal/stderr**(위의 OPS_ALERT_* 라인)다 — 파일 쓰기는 없다.
 
 ### 8.2 /status readiness 의미

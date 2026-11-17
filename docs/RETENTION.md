@@ -78,11 +78,14 @@ Preflight이며, 구현이 이 문서와 어긋나면 구현이 틀린 것이다
   side-channel**(`tools/notify/ops_alert.py`): notify 이벤트 원장·전달
   원장 기록 없는 일회성 발송, 재시도 없음. 시도와 결과(exit code·기기별
   결과 라인)는 호출부 기록에만 남는다 — ops side-channel의 호출부는
-  셋이다(2026-11 추가): retention 스크립트(retention-log.jsonl의 NOTIFY
-  행), Storage Preflight(런처 로그), API 서비스 `serve.py`(readiness
-  FAILED 전환 시 프로세스당 1회 발송 — tools/api/README.md §8.1). 세
-  번째 호출부의 기록 위치는 **systemd journal/stderr**(OPS_ALERT_*
-  저널 라인)이며 파일 쓰기는 없다. accepted ≠ delivered
+  넷이다(2026-11 추가): retention 스크립트(`RETENTION_BLOCKED` —
+  retention-log.jsonl의 NOTIFY 행), Storage Preflight
+  (`STORAGE_PREFLIGHT_FAILED` — 런처 로그), 세션 런처의 세션 장애 경보
+  (`WORKER_UNIT_FAILED`·`SESSION_STALL_DETECTED`·`COLLECTOR_FAILED` —
+  런처 로그의 `OPS_ALERT` 라인), API 서비스 `serve.py`(readiness FAILED
+  전환 시 프로세스당 1회 발송 — tools/api/README.md §8.1). 네 번째
+  호출부의 기록 위치는 **systemd journal/stderr**(OPS_ALERT_* 저널
+  라인)이며 파일 쓰기는 없다. accepted ≠ delivered
   (tools/notify/README.md §6). 향후 ops 경보에 지속 알림(재시도·
   전달 기록)이 필요하면 신규 인프라를 만들지 않고
   **AGGREGATION_STARTED 선례의 이벤트 계약 확장**(contracts/events +
