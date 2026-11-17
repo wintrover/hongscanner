@@ -218,6 +218,8 @@ type
     selected*: UpDownCandidates
     facts*: array[2, DirectionSelection]
     crossDuplicates*: seq[string]
+    intraUpDuplicates*: seq[string]   ## repeated codes within the up list
+    intraDownDuplicates*: seq[string] ## repeated codes within the down list
 
 proc serr(seqNo: int; f: VendorFailure; msg: string): ref SubInputError =
   let e = newException(SubInputError, msg)
@@ -494,19 +496,36 @@ proc firstN(xs: seq[string]; n: int): seq[string] =
   ## only ranking.
   if xs.len <= n: xs else: xs[0 ..< n]
 
+proc dedupFirstWins(xs: seq[string]; dupes: var seq[string]): seq[string] =
+  ## Deterministic first-appearance deduplication within one direction
+  ## list: the vendor's order is the only ranking, so the first
+  ## occurrence keeps its position and later repeats are dropped. Each
+  ## repeated code is recorded once, in first-repeat order.
+  var seen: seq[string] = @[]
+  for c in xs:
+    if inArr(c, seen):
+      if not inArr(c, dupes): dupes.add(c)
+    else:
+      seen.add(c)
+  seen
+
 proc selectTopPerDirection*(cands: UpDownCandidates): SelectionResult =
   ## The one selection function between candidate derivation
   ## (vendor_input.upDownCandidates) and REG composition
   ## (composeRegData): keep each direction's first maxPerDirection
   ## codes in vendor response order, with deterministic rising-first
-  ## (up-wins) cross-direction deduplication. Any code present in the
-  ## selected up set is excluded from down and recorded in
-  ## crossDuplicates so the collector logs a cross_duplicate gap instead
-  ## of crashing the session. Pure and deterministic — same candidates,
-  ## same selection.
-  result.selected.up = firstN(cands.up, maxPerDirection)
+  ## (up-wins) cross-direction deduplication. Repeated codes within one
+  ## direction are deduplicated first-appearance-wins and recorded in
+  ## intraUpDuplicates/intraDownDuplicates (the collector logs a
+  ## duplicate_code gap); any code present in the selected up set is
+  ## excluded from down and recorded in crossDuplicates (a
+  ## cross_duplicate gap) — neither crashes the session. Pure and
+  ## deterministic — same candidates, same selection.
+  let upUnique = dedupFirstWins(cands.up, result.intraUpDuplicates)
+  result.selected.up = firstN(upUnique, maxPerDirection)
+  let downUnique = dedupFirstWins(cands.down, result.intraDownDuplicates)
   var downFiltered: seq[string] = @[]
-  for code in cands.down:
+  for code in downUnique:
     if inArr(code, result.selected.up):
       result.crossDuplicates.add(code)
     else:
@@ -515,7 +534,7 @@ proc selectTopPerDirection*(cands: UpDownCandidates): SelectionResult =
   result.facts[0] = DirectionSelection(
     direction: "up", candidateCount: cands.up.len,
     selectedCount: result.selected.up.len,
-    excludedCount: cands.up.len - result.selected.up.len,
+    excludedCount: upUnique.len - result.selected.up.len,
     scopeExcludedCount: cands.upExcluded.len)
   result.facts[1] = DirectionSelection(
     direction: "down", candidateCount: cands.down.len,
