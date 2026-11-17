@@ -135,6 +135,7 @@ import socket
 import sys
 import time
 
+import notify_clock
 import notify_config
 import notify_fcm
 import notify_ledger
@@ -519,9 +520,14 @@ class Dispatcher:
         return "permanent", None
 
     def _log(self, line):
-        # The resident mode timestamps every stdout line (README §1);
-        # the one-shot output is byte-identical to the old contract.
+        # The resident mode timestamps every stdout line with an ISO
+        # prefix (README §1); the one-shot mode prints lines bare. The
+        # dispatch attempt/result lines additionally carry a same-boot
+        # monotonic stamp (README §1 "Time instrumentation") appended
+        # here in _log so every emitter gets it uniformly.
         prefix = notify_ledger.now_iso() + " " if self._resident else ""
+        if line.startswith(("dispatch attempt_start", "dispatch result=")):
+            line += " " + notify_clock.stamp()
         print(prefix + line, flush=True)
 
     # ---------------------------------------------------- audible budget
