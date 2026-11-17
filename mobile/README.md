@@ -195,7 +195,11 @@ A single fetch of `/mobile/market-view` (plus the on-demand
 `/events/{event_id}` drill-down when a row or notification is selected)
 runs on startup and on foreground resume, with a restrained backoff
 (1s, 2s, capped by 3 attempts) that ends in a visible error state —
-never an infinite spinner. This is also the recovery path for missed
+never an infinite spinner. A `503 warming` answer (the readiness host
+still starting up) is not a failure: the pass retries on a fixed 5s
+wait, at most 3 times (≤15s), without consuming a regular attempt, and
+a server that never warms up ends in the visible "데이터 준비 중 (잠시 후
+다시 시도)" error. This is also the recovery path for missed
 messages: firebase_messaging 17.x removed the `onDeletedMessages` Dart
 callback upstream, so FCM queue-discard recovery is guaranteed by the
 resume resync instead of a callback (documented delta, not a hidden
@@ -386,8 +390,8 @@ APK artifacts are gitignored (`/build/`) and never committed.
   with the banner fallback on refusal or missing text, dedup, no
   routing hijack, cold-start pending-tap consumption, warm-tap delivery
   — the method channel mocked through TestDefaultBinaryMessengerBinding),
-  and resync (single-fetch backoff, recovery, lifecycle resume,
-  pull-to-refresh).
+  and resync (single-fetch backoff, 503 warming auto-retry, recovery,
+  lifecycle resume, pull-to-refresh).
 - `flutter analyze` — clean. NOTE: in this repo's non-ASCII checkout path
   `flutter analyze` crashes (LSP tool bug, exit 255); run it from an
   ASCII-path copy (`rsync -a --exclude .git mobile/ /tmp/hs-mobile-ascii/`).

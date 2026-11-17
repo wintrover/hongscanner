@@ -10,16 +10,20 @@ each one exits cleanly (SIGTERM -> exit 0, no residue). A malformed
 response byte, a leaked path/secret, or a surviving process fails the
 suite. Fail-closed: no assertion reports a pass on absence of evidence.
 
-The §3.7 market view is covered by five suites: MarketViewSuite holds
+The §3.7 market view is covered by six suites: MarketViewSuite holds
 the core fold and the legacy change-history contract, MarketViewFactSuite
 the events_contract "top10-v1" dual path (the fact translation, its
 eligibility rule, the discriminator branches), MarketViewOpeningSuite
 the VS-2 opening MA20 mode (the recorded window predicate, the
 chain-pair correspondence offsets, the integer cross-product order, the
 honest exclusions and the DataFault shapes), MarketFoldSuite the
-pure fold_market_projection unit and its memoization, and
-MarketEventsLinesSuite the events.hcj.jsonl committed-lines cache
-(incremental reads identical to read_committed_lines)."""
+pure fold_market_projection unit and its memoization, MarketEventsLinesSuite
+the events.hcj.jsonl committed-lines cache (incremental reads identical
+to read_committed_lines), and MarketReadinessSuite the cold-path
+readiness contract (the startup prewarm's WARMING 503 + Retry-After
+without ever queuing on the held fold lock, the single-flight rule, the
+FAILED terminal state, the WARMING -> READY -> 200 transition) —
+in-process with a gated fold, like the two unit suites before it."""
 
 import hashlib
 import json
@@ -31,8 +35,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
+from http.server import ThreadingHTTPServer
 from urllib import request as urlrequest
 from urllib.error import HTTPError
 
@@ -1232,6 +1239,28 @@ class ServerProc:
         self.bind = host
         self.port = int(line.split(":")[1])
         self.base = "http://%s:%d" % (host, self.port)
+        # The cold-path readiness contract (README §1/§4): a freshly
+        # started serve.py answers 503 warming (Retry-After) until the
+        # startup prewarm lands. Every request a test makes must observe
+        # settled data, so the constructor waits the warming window out;
+        # a server still warming after the timeout fails the suite, it
+        # never passes on it.
+        self.wait_market_view_ready()
+
+    def wait_market_view_ready(self, timeout=30):
+        """Poll /mobile/market-view until the 503 warming answers stop.
+        Any settled status (200, 500, ...) ends the wait; only the 503s
+        of the warming window are retried."""
+        deadline = time.monotonic() + timeout
+        while True:
+            status, _, _ = self.get("/mobile/market-view")
+            if status != 503:
+                return status
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    "serve.py still warming (503 Retry-After) after %ds"
+                    % timeout)
+            time.sleep(0.02)
 
     def get(self, path, method="GET"):
         req = urlrequest.Request(self.base + path, method=method)
@@ -3170,6 +3199,255 @@ class MarketEventsLinesSuite(unittest.TestCase):
         self.assertGreater(os.path.getsize(path), prefix_end)
         self.assertEqual(self.assert_matches_read_committed_lines(path),
                          [EV1, EV2])
+
+
+class QuietHandler(serve.Handler):
+    """The real Handler with request logging silenced — the in-process
+    readiness server's access log would otherwise interleave with the
+    suite's own output. The wire behavior under test is inherited
+    unchanged."""
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class MarketReadinessSuite(unittest.TestCase):
+    """The cold-path readiness contract (README §1/§4): the startup
+    prewarm moves the projector WARMING -> READY (success) or FAILED
+    (any Exception, terminal for the process). While WARMING every
+    /mobile/market-view request answers 503 {"error":{"code":"warming"}}
+    with Retry-After: 5 — the check happens before _fold_lock is ever
+    touched, so concurrent requests never queue behind the warming scan
+    (the scan holds _fold_lock for its whole duration). FAILED answers
+    500 data_fault on every request. The prewarm is single-flight:
+    however often prewarm_market_projection_async() is called, one
+    warming thread.
+
+    Deterministic in-process control (the MarketFoldSuite discipline):
+    the module fold is wrapped with a gate the test opens, and a real
+    ThreadingHTTPServer serves the real Handler on an ephemeral
+    loopback port for the HTTP bytes."""
+
+    def setUp(self):
+        self.box = build_market_view_sandbox()
+        self.addCleanup(self.box.cleanup)
+
+    # -- in-process harness -------------------------------------------------
+
+    def install_gated_fold(self):
+        """Wrap the module fold: entries are counted and every call
+        blocks until the test opens the gate — the warming thread sits
+        inside _market_projection holding _fold_lock for the whole
+        blocked window."""
+        gate = threading.Event()
+        entered = threading.Event()
+        calls = []
+        real = serve._fold_market_projection_inc
+
+        def gated(path, session_date, prev_state=None):
+            calls.append(path)
+            entered.set()
+            gate.wait()
+            return real(path, session_date, prev_state)
+        serve._fold_market_projection_inc = gated
+        self.addCleanup(setattr, serve, "_fold_market_projection_inc",
+                        real)
+        self.addCleanup(gate.set)  # never leave a thread blocked
+        return gate, entered, calls
+
+    def start_handler_server(self, projector):
+        """The real Handler on an ephemeral loopback port, served in a
+        daemon thread; reaped by cleanup."""
+        server = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+        server.daemon_threads = True
+        saved_projector = serve.Handler.projector
+        serve.Handler.projector = projector
+        threading.Thread(target=server.serve_forever,
+                         kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+
+        def _stop():
+            server.shutdown()
+            server.server_close()
+            serve.Handler.projector = saved_projector
+        self.addCleanup(_stop)
+        return server.server_address[1]
+
+    def get(self, port, path):
+        req = urlrequest.Request("http://127.0.0.1:%d%s" % (port, path))
+        try:
+            with urlrequest.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.read(), dict(resp.headers)
+        except HTTPError as err:
+            return err.code, err.read(), dict(err.headers)
+
+    def wait_state(self, projector, state, timeout=20):
+        deadline = time.monotonic() + timeout
+        while True:
+            with projector._readiness_lock:
+                current = projector._readiness_state
+            if current == state:
+                return current
+            if time.monotonic() > deadline:
+                self.fail("readiness never reached %r (now %r, error %r)"
+                          % (state, current,
+                             projector._readiness_error))
+            time.sleep(0.01)
+
+    def concurrent_market_views(self, projector, count=8):
+        """count concurrent market_view() calls; fails if any thread is
+        still alive after 10s (a call that queued on the held fold lock
+        would never finish) and returns each call's outcome."""
+        outcomes = []
+
+        def call():
+            try:
+                projector.market_view()
+                outcomes.append(("returned", None))
+            except Exception as exc:
+                outcomes.append((type(exc).__name__, str(exc)))
+        threads = [threading.Thread(target=call) for _ in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertFalse(any(t.is_alive() for t in threads),
+                         "market_view() queued behind the warming scan")
+        return outcomes
+
+    def concurrent_gets(self, port, path, count=4):
+        """count concurrent HTTP GETs; fails if any thread is still
+        alive after 10s and returns each (status, body, Retry-After)."""
+        outcomes = []
+
+        def call():
+            status, body, headers = self.get(port, path)
+            outcomes.append((status, body, headers.get("Retry-After")))
+        threads = [threading.Thread(target=call) for _ in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertFalse(any(t.is_alive() for t in threads),
+                         "HTTP GET queued behind the warming scan")
+        return outcomes
+
+    # -- (a) WARMING: 503 + Retry-After, never queued ----------------------
+
+    def test_warming_serves_503_retry_after_without_blocking(self):
+        gate, entered, calls = self.install_gated_fold()
+        projector = serve.Projector(self.box.runs, self.box.ledger)
+        port = self.start_handler_server(projector)
+        projector.prewarm_market_projection_async()
+        self.wait_state(projector, "WARMING")
+        self.assertTrue(entered.wait(10))
+        self.assertEqual(len(calls), 1)  # the warming scan is inside
+        # the gate stays closed for the whole assertion: _fold_lock is
+        # HELD by the warming thread, so any market_view() that touched
+        # it would never return — 8 concurrent direct calls must all
+        # raise ServiceWarming promptly instead
+        outcomes = self.concurrent_market_views(projector)
+        self.assertEqual([o[0] for o in outcomes],
+                         ["ServiceWarming"] * 8)
+        self.assertEqual({o[1] for o in outcomes},
+                         {"market projection is warming"})
+        self.assertEqual(len(calls), 1)  # nothing else entered the fold
+        # the same window over the wire, also concurrent: 503,
+        # Retry-After: 5 and the warming body — never a hung connection
+        for status, body, retry_after in \
+                self.concurrent_gets(port, "/mobile/market-view"):
+            self.assertEqual(status, 503)
+            self.assertEqual(retry_after, "5")
+            self.assertEqual(json.loads(body.decode("utf-8")),
+                             {"error": {"code": "warming",
+                                        "message":
+                                        "market projection is warming"}})
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(body.endswith(b"\n"))
+
+    # -- (b) single-flight ---------------------------------------------------
+
+    def test_prewarm_is_single_flight(self):
+        gate, entered, calls = self.install_gated_fold()
+        projector = serve.Projector(self.box.runs, self.box.ledger)
+        for _ in range(3):
+            projector.prewarm_market_projection_async()
+        self.wait_state(projector, "WARMING")
+        self.assertTrue(entered.wait(10))
+        self.assertEqual(len(calls), 1)  # one warming thread, not three
+        gate.set()
+        self.wait_state(projector, "READY")
+        # the two extra calls started no second scan
+        self.assertEqual(len(calls), 1)
+        # a call after READY never rewarms: the state stays put and no
+        # fold is entered
+        projector.prewarm_market_projection_async()
+        with projector._readiness_lock:
+            self.assertEqual(projector._readiness_state, "READY")
+            self.assertIsNone(projector._readiness_error)
+        self.assertEqual(len(calls), 1)
+
+    # -- (c) prewarm failure: FAILED, 500 data_fault, terminal --------------
+
+    def test_prewarm_failure_stays_failed(self):
+        real = serve._fold_market_projection_inc
+
+        def failing_fold(path, session_date, prev_state=None):
+            raise RuntimeError("cold-path fixture failure")
+        serve._fold_market_projection_inc = failing_fold
+        self.addCleanup(setattr, serve, "_fold_market_projection_inc",
+                        real)
+        projector = serve.Projector(self.box.runs, self.box.ledger)
+        port = self.start_handler_server(projector)
+        projector.prewarm_market_projection_async()
+        self.wait_state(projector, "FAILED")
+        with projector._readiness_lock:
+            self.assertEqual(projector._readiness_error,
+                             "cold-path fixture failure")
+        # every direct call answers the prewarm failure as a DataFault —
+        # never READY serving, never WARMING again
+        for _ in range(2):
+            with self.assertRaises(serve.DataFault) as ctx:
+                projector.market_view()
+            self.assertIn("market projection prewarm failed",
+                          str(ctx.exception))
+            self.assertIn("cold-path fixture failure", str(ctx.exception))
+        # and the same over the wire: 500 data_fault
+        status, body, _ = self.get(port, "/mobile/market-view")
+        self.assertEqual(status, 500)
+        error = json.loads(body.decode("utf-8"))["error"]
+        self.assertEqual(error["code"], "data_fault")
+        self.assertIn("market projection prewarm failed",
+                      error["message"])
+        # a further prewarm call never rewarms or resets the failure:
+        # FAILED is terminal for the process
+        projector.prewarm_market_projection_async()
+        with projector._readiness_lock:
+            self.assertEqual(projector._readiness_state, "FAILED")
+        with self.assertRaises(serve.DataFault):
+            projector.market_view()
+
+    # -- (d) the landing: WARMING -> READY -> 200 OK -------------------------
+
+    def test_warming_to_ready_serves_200_ok(self):
+        gate, entered, calls = self.install_gated_fold()
+        projector = serve.Projector(self.box.runs, self.box.ledger)
+        port = self.start_handler_server(projector)
+        projector.prewarm_market_projection_async()
+        self.wait_state(projector, "WARMING")
+        self.assertTrue(entered.wait(10))
+        status, body, headers = self.get(port, "/mobile/market-view")
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("Retry-After"), "5")
+        # the scan lands: READY, and the same request serves the full
+        # recorded projection — no restart, no second ask
+        gate.set()
+        self.wait_state(projector, "READY")
+        status, body, headers = self.get(port, "/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8")), MV_EXPECTED)
+        self.assertIsNone(headers.get("Retry-After"))
+        self.assertEqual(projector.market_view(), MV_EXPECTED)
 
 
 class TornLedgerSuite(unittest.TestCase):

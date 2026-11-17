@@ -112,6 +112,16 @@ python3.13 tools/api/serve.py \
   size, mtime_ns) 키로 프로세스 내 메모이제이션된다(§3.7의 게시
   조건·한계 참조). 이벤트 폴드와 응답 본체는 여전히 매 요청
   재계산이다.
+- **콜드 패스 준비(readiness)**: 기동 직후 서버는 백그라운드에서
+  최신 적격 런의 §3.7 시장 폴드를 미리 데운다(prewarm, 프로세스당
+  1회 — single-flight). 이 창 동안 `/mobile/market-view`만
+  **503 `warming` + `Retry-After: 5`**로 응답한다: 폴드 락을
+  기다리게 하지 않고 즉시 거절하며(동시 요청도 각각 즉시 503),
+  본문은 `{"error":{"code":"warming",...}}`다. prewarm 성공은
+  `READY` 전환 후 정상 서빙, 예외로 끝나면 프로세스 수명 내내
+  `FAILED`(종단) — 모든 market-view 요청은 500 `data_fault`
+  (message: "market projection prewarm failed: …")로 응답한다.
+  다른 엔드포인트는 readiness 상태와 무관하다.
 
 ## 2. JSON 규약
 
@@ -705,6 +715,8 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
 | 미지 경로·미지 이벤트 id·미지 세션·경로 순회 시도 | 404 `not_found` (요청 값 재출력 없음) |
 | GET 이외의 메서드 (POST/PUT/DELETE/PATCH/HEAD/OPTIONS) | 405 `method_not_allowed`, `Allow: GET` |
 | 기록 파일 불량(커밋된 라인이 불량 JSON·불량 체크섬 줄 등) | 500 `data_fault` — 조용한 스킵 없음 |
+| 콜드 패스 prewarm 진행 중 (`/mobile/market-view`만, §1) | 503 `warming` + `Retry-After: 5` — prewarm 완료 후 재시도 |
+| prewarm 실패(폴드가 예외로 끝남, §1) | 500 `data_fault` ("market projection prewarm failed: …") — 프로세스 수명 동안 종단 |
 | http.server 내부 오류(불량 요청 줄 등) | JSON 본문 (HTML 없음) |
 
 ## 5. 보안 경계
@@ -775,7 +787,12 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   전환; 기준 그룹 = 마지막 확정 관찰 그룹; 스냅샷 검증 오프셋
   0/+1/−1과 전부 실패 시 DataFault; 상승 G 내림차순·하락 G 오름차순·
   동률은 symbol 코드포인트 순·십자곱 동일 비; 가격 불명·일봉 부족
-  제외; 계약 위반 행·query의 DataFault; 연속 2회 요청 동일 바이트).
+  제외; 계약 위반 행·query의 DataFault; 연속 2회 요청 동일 바이트),
+  §1 콜드 패스 readiness(인프로세스 게이트 폴드 — WARMING의
+  503 warming·Retry-After 5, 폴드 락 홀드 중에도 동시 직접·HTTP
+  요청이 즉시 응답, prewarm single-flight 3회 호출 1회 스캔, 폴드
+  예외의 FAILED 종단 500 data_fault·추가 prewarm 호출 무효,
+  WARMING→READY→200 전환).
 - 인터프리터 해석 순서는 collector·notify 스위트와 같다:
   `$HSCOLLECTOR_PYTHON` → `python3.13` → `uv python find 3.13`.
 - 게이트: `bash tools/run_tests.sh`에 등록된 스위트(`run bash

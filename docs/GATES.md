@@ -638,6 +638,92 @@ provenance=OK`도 운영 승인이 아니다. 각 런의 승인에는 아래 조
 세션(`LATE_START`, `BACKFILL` 포함)의 승인 범위는 실제 관측·복원 검증
 범위로 한정된다(P22).
 
+## VS-3 실장 E2E 수용 절차 (E2E Procedure Ready vs E2E Accepted)
+
+알림 종단(장애 → 탐지 → ops 사이드채널 → FCM → 기기 수신 → OS 게시)의
+수용 상태를 둘로 분리한다. 이 절은 그 경계, 측정 규칙, 운영 체크리스트를
+목표 계약으로 고정한다. `E2E Accepted`는 P12 승인 조건을 대체하지 않는다 —
+별개의 종단 증거다.
+
+### 상태 정의
+
+- **`E2E Procedure Ready`** — 절차가 문서화됐고(본 절) 구성요소 각각에
+  시장 창 밖 관측·검증이 있다: VS-A 서버측 경보 SLO·15초 워치독 폴
+  (2026-11-17 증거, PR #97 `15c9a3c`), ops 사이드채널
+  `tools/notify/ops_alert.py`(기기당 1회 FCM HTTP v1·원장 기록 없음 —
+  시도·결과는 호출자 로그가 기록), FCM 실기기 표시·탭 라우팅 관측
+  (2026-11-11·11-12 증거), serve 증분 폴드·pre-warm 실측(2026-11-17),
+  다수 빌드 교차 결정론 smoke. 전부 시장 창 밖·모의·합성 관측의 조합이다.
+- **`E2E Accepted`** — 아래 5단계 체크리스트를 실측 KRX 정규장
+  09:00–15:30 KST 창에서, 물리 Android 기기 증거와 함께 전부 통과·기록했을
+  때뿐이다. `E2E Procedure Ready`는 `E2E Accepted`의 성립 근거가 아니다.
+  시장 창 밖 관측·모의·합성·부분 통과를 Accepted로 승격하지 않는다
+  (fail-closed).
+
+현재 상태: `E2E Procedure Ready`(위 국소 관측·검증). `E2E Accepted` 실측
+0건 — 정규장 창 내 통제 장애 드릴, 1.5 GiB+ 라이브 원장의 LAN 모바일
+조회, 마감 후 전체 증거 묶음은 전부 미실시다.
+
+### 알림 타임라인 T0..T5
+
+| 시점 | 정의 | 관측 주체·증거 |
+|---|---|---|
+| `T0` | 장애·스탈 발생(워커 유닛 실패·세션 무진행 `HS_STALL_TIMEOUT_SECONDS` 초과·수거체 비정상 종료) | 서버 — 런처 로그·journal |
+| `T1` | 탐지: 15초 워치독 폴(`HS_WATCHDOG_INTERVAL`)이 `WORKER_UNIT_FAILED`(1폴 이내) 또는 `SESSION_STALL_DETECTED`(스탈 문턱 경과 후) 관측 | 서버 — `tools/run_session.sh` |
+| `T2` | ops 사이드채널 송신: `ops_alert.py` 기동(기기당 1회 FCM HTTP v1, 세션당 1회 fail-closed) | 서버 — 런처 로그·stdout result 라인 |
+| `T3` | FCM 접수: HTTP 200 `result=accepted` | 서버 — `ops_alert.py` stdout |
+| `T4` | Android 수신: 기기가 메시지를 수신 | 기기 — logcat(FCM 수신) |
+| `T5` | OS 게시: 알림이 게시됨 | 기기 — `dumpsys notification`(NotificationRecord) |
+
+측정 규칙(계약):
+
+- 각 구간은 그 **기기의 단조 시계** 증분으로만 잰다. `T0`~`T3`은 서버
+  `CLOCK_MONOTONIC`, `T4`~`T5`는 기기 단조 시계(Android `elapsedRealtime`
+  계열 — NTP·수동 시각 조정 영향 없음) 기준이다.
+- **clock-skew 주의**: 서버와 기기의 벽시계 절대시각차는 불가지이므로, 서로
+  다른 기기의 벽시계 빼기로 교차 구간(`T3`→`T4`)을 계산하지 않는다. 관측에
+  남는 벽시계 값(dumpsys·logcat)은 문맥 기록일 뿐이며, 전체 T0→T5 지연은
+  각 홉의 단조 증분과 그때 측정·기록한 클록 오프셋으로만 보고한다 — 실측
+  전에는 전체 수치가 UNKNOWN이다(LIMITS).
+- 서버측 `T0`→`T3` 경보 사슬은 VS-A SLO(60초 — 워치독 15초 폴·FCM HTTP v1
+  타임아웃)를 따른다(스탈 클래스는 탐지에 앞서 스탈 문턱이 선행한다).
+  `T4`·`T5`는 물리 기기·OS 소관의 best-effort 관측이다(P12 — FCM 200은
+  접수이지 기기 도착이 아니다).
+
+### 5단계 운영 수용 체크리스트
+
+하나의 KRX 거래일 세션에서 순서대로 수행한다. 각 단계의 증거(로그·응답
+원문·dump)는 런 디렉터리 또는 관측 기록으로 보존하고, 한 단계라도 실패하면
+그날의 `E2E Accepted`는 성립하지 않는다 — 부분 통과를 전체 성공으로
+승급하지 않는다.
+
+1. **Preflight(사전 점검 — 개장 전)**: 증명 설치 바이너리(current·
+   `INSTALL VERIFY OK`), 캘린더 INDEX 무결성, 스토리지 프리플라이트
+   (RETENTION 20 GiB·fail-closed exit 2), 워커 유닛 enabled, 기기
+   레지스트리 활성 토큰, serve 상태 `READY`(readiness 3값 계약:
+   `WARMING`(HTTP `503` + `Retry-After: 5`) / `READY` / `FAILED` —
+   LIMITS VS-C 행), serve 호스트의 LAN 주소(예: 워크스테이션
+   `192.168.0.7`) 점유 확인. 미달이면 중단 — 그날은 수용하지 않는다.
+2. **Live 09:00+ 수집**: 개장(09:00 KST) 이후 세션이 유효한 초기 체인페어를
+   확보(모의 관측: 개장 전 기동은 초기 페어가 빈 응답 — 2026-11-11 실측),
+   관측 그룹 누적·워커 디스패치 틱·전달 원장 기록을 관측한다.
+3. **통제 장애·스탈 드릴(정규장 창 내 1회)**: 워커 유닛 정지 또는 세션
+   스탈을 통제적으로 유입하고 `T0`..`T5` 전 체인을 관측한다 — 워치독 탐지,
+   `ops_alert.py` 송신, FCM accepted, 기기 수신, OS 게시(dumpsys). 합격
+   조건: 서버측 `T0`→`T3`가 VS-A SLO 이내, `T5` 게시 관측. 주입 지점·시각을
+   기록해 드릴이 세션 증거를 훼손했는지 구별 가능하게 한다.
+4. **1.5 GiB+ 라이브 원장 LAN 모바일 조회**: 세션의 `input.hcj.jsonl`이
+   1.5 GiB 이상인 상태(예: 2026-11-17 실측 2.0 GiB)에서 물리 Android 기기가
+   동일 LAN(와이파이)에서 serve 호스트로 `/mobile/market-view`·
+   `/events/{id}`를 조회한다. 합격 조건: HTTP 200 + `READY` 상태의 웜 경로
+   지연(VS-C — 콜드 13.250초 경로가 아니다). 서버가 그 창에 재기동됐다면
+   `WARMING`(`503` + `Retry-After: 5`)→`READY` 전환 관측을 포함한다.
+5. **마감 후 15:30 증거**: 15:30 KST 마감 후 세션 봉인(`session_end`+커밋
+   마커) → 설치 바이너리로 replay/verify `VERDICT MATCH provenance=OK`
+   exit 0, CHECKSUMS·run.json `code_commit` 대조, PH-1/PH-2 증거(아래
+   PH-1/PH-2 절 규칙 그대로 — PH-1 교정에 쓴 세션은 검출 증거로 함께 쓸 수
+   없고 PH-2는 동결 설정의 별개 거래일이다).
+
 ## Attestation과 workflow trust 한계 (목표 계약 — 미구현)
 
 현재 `provenance=OK`는 자체 보고 메타데이터의 일치다. 강화의 목표 계약:
