@@ -19,7 +19,10 @@ chain-pair correspondence offsets, the integer cross-product order, the
 honest exclusions and the DataFault shapes), MarketFoldSuite the
 pure fold_market_projection unit and its memoization, MarketEventsLinesSuite
 the events.hcj.jsonl committed-lines cache (incremental reads identical
-to read_committed_lines), and MarketReadinessSuite the cold-path
+to read_committed_lines), LedgerTailSuite the notify ledger's aggregate
+cursor and tail-first event lookup (/status and /events/{event_id}
+incremental reads, identical to a from-scratch projection), and
+MarketReadinessSuite the cold-path
 readiness contract (the startup prewarm's WARMING 503 + Retry-After
 without ever queuing on the held fold lock, the single-flight rule, the
 FAILED terminal state, the WARMING -> READY -> 200 transition) —
@@ -1449,6 +1452,21 @@ class ApiContractSuite(unittest.TestCase):
         self.assertIsNone(events["latest_event"])
         # run directories are independent of the ledger state
         self.assertEqual(body["sessions"]["count"], 4)
+
+    def test_corrupt_ledger_faults_status_and_event_detail(self):
+        # A committed non-JSON line is corruption, not a skip: both the
+        # incremental /status projection and the tail-first event lookup
+        # answer 500 data_fault, number the line from one, and never
+        # leak the absolute path.
+        with open(self.box.ledger, "ab") as f:
+            f.write(b"{not json}\n")
+        for path in ("/status", "/events/" + EV1["event_id"]):
+            with self.subTest(path=path):
+                status, body, _, _ = self.server.get_json(path)
+                self.assertEqual(status, 500)
+                self.assertEqual(body["error"]["code"], "data_fault")
+                self.assertIn("line 5", body["error"]["message"])
+                self.assertNotIn(self.box.root, body["error"]["message"])
 
     def test_candidates_empty_ledger_has_no_latest_session(self):
         self.truncate_event_ledger()
@@ -3218,6 +3236,270 @@ class MarketEventsLinesSuite(unittest.TestCase):
         self.assertGreater(os.path.getsize(path), prefix_end)
         self.assertEqual(self.assert_matches_read_committed_lines(path),
                          [EV1, EV2])
+
+
+class LedgerTailSuite(unittest.TestCase):
+    """Unit contract of the notify-ledger aggregate cursor and the
+    tail-first event lookup (README §3.1/§3.4): /status reads only the
+    bytes committed since the last call and stays constant-memory, yet
+    its projection must be byte-identical to a from-scratch read for
+    every growth shape — committed appends, a torn tail completed later,
+    a truncate below the cached offset, an inode replacement, an absent
+    file, and empty/torn-only files. A malformed committed line faults
+    with its file-wide line number and never replaces the cached prefix.
+    event() scans the validated prefix backward, so a corrupt ledger
+    still faults before any match is served."""
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.projector = serve.Projector(self.box.runs, self.box.ledger)
+
+    def write_ledger(self, *objects, torn=b""):
+        self.box.write(self.box.ledger, jsonl(*objects) + torn)
+        return self.box.ledger
+
+    def full_status(self):
+        """Status from a projector that has never cached anything: the
+        incremental projection's reference result."""
+        return serve.Projector(self.box.runs, self.box.ledger).status()
+
+    def assert_status_matches_full_read(self):
+        expected = self.full_status()
+        actual = self.projector.status()
+        self.assertEqual(actual, expected)
+        self.assertEqual(canonical(actual), canonical(expected))
+        return actual
+
+    # -- incremental /status ----------------------------------------------
+
+    def test_status_append_matches_full_read(self):
+        self.write_ledger(EV1, EV2)
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 2)
+        first = self.projector._ledger_tail_entry
+        self.assertEqual(first.offset, len(jsonl(EV1, EV2)))
+        self.assertEqual(first.line_no, 2)
+        with open(self.box.ledger, "ab") as f:
+            f.write(jsonl(EV3, EV4))
+        body = self.assert_status_matches_full_read()
+        events = body["events"]
+        self.assertEqual(events["count"], 4)
+        self.assertEqual(events["by_type"],
+                         {"CANDIDATE_ENTERED": 2,
+                          "CANDIDATE_EXITED": 1,
+                          "SESSION_ENDED": 1})
+        self.assertEqual(events["by_severity"], {"HIGH": 1, "INFO": 3})
+        self.assertEqual(events["latest_session_id"], "2026-10-30")
+        self.assertEqual(events["latest_event"],
+                         {k: EV4[k] for k in ("event_id", "event_type",
+                                              "observed_at")})
+        # the unchanged file is served by the same state object (O(1))
+        entry = self.projector._ledger_tail_entry
+        self.assertGreater(entry.offset, first.offset)
+        self.projector.status()
+        self.assertIs(self.projector._ledger_tail_entry, entry)
+
+    def test_grown_file_resumes_from_cached_offset(self):
+        self.write_ledger(EV1)
+        self.projector.status()
+        first_end = self.projector._ledger_tail_entry.offset
+        calls = []
+        real = serve._read_ledger_tail_inc
+
+        def counting(path, prev_state=None):
+            calls.append(prev_state.offset if prev_state is not None else 0)
+            return real(path, prev_state)
+        with mock.patch.object(serve, "_read_ledger_tail_inc", counting):
+            with open(self.box.ledger, "ab") as f:
+                f.write(canonical(EV2) + b"\n")
+            self.projector.status()
+        self.assertEqual(calls, [first_end])
+
+    def test_empty_and_torn_only_ledger_project_zero(self):
+        self.write_ledger()
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"],
+                         {"ledger_present": True, "count": 0,
+                          "by_type": {}, "by_severity": {},
+                          "latest_session_id": None, "latest_event": None})
+        entry = self.projector._ledger_tail_entry
+        self.assertEqual((entry.offset, entry.line_no), (0, 0))
+        self.box.write(self.box.ledger, canonical(EV1)[:17])
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 0)
+        entry = self.projector._ledger_tail_entry
+        self.assertEqual((entry.offset, entry.line_no), (0, 0))
+
+    def test_absent_ledger_projects_absent_and_resets_slot(self):
+        body = self.assert_status_matches_full_read()
+        self.assertFalse(body["events"]["ledger_present"])
+        self.assertIsNone(body["events"]["count"])
+        self.assertIsNone(self.projector._ledger_tail_entry)
+        self.write_ledger(EV1)
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 1)
+        os.remove(self.box.ledger)
+        body = self.assert_status_matches_full_read()
+        self.assertFalse(body["events"]["ledger_present"])
+        self.assertIsNone(self.projector._ledger_tail_entry)
+
+    def test_torn_tail_is_not_consumed_and_resumes(self):
+        rec1 = canonical(EV1) + b"\n"
+        rec2 = canonical(EV2) + b"\n"
+        path = self.write_ledger(EV1, torn=rec2[:20])
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 1)
+        entry = self.projector._ledger_tail_entry
+        self.assertEqual((entry.offset, entry.line_no), (len(rec1), 1))
+        with open(path, "ab") as f:
+            f.write(rec2[20:])
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 2)
+        self.assertEqual(body["events"]["latest_event"]["event_id"],
+                         EV2["event_id"])
+        entry = self.projector._ledger_tail_entry
+        self.assertEqual((entry.offset, entry.line_no),
+                         (len(rec1) + len(rec2), 2))
+
+    def test_truncate_and_inode_replacement_reset_from_zero(self):
+        self.write_ledger(EV1, EV2, EV3)
+        self.assert_status_matches_full_read()
+        with open(self.box.ledger, "wb") as f:
+            f.write(canonical(EV4) + b"\n")
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 1)
+        self.assertEqual(body["events"]["latest_event"]["event_id"],
+                         EV4["event_id"])
+        self.assertEqual(self.projector._ledger_tail_entry.line_no, 1)
+        old_inode = os.stat(self.box.ledger).st_ino
+        tmp = self.box.ledger + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(jsonl(EV1, EV2, EV4))
+        os.replace(tmp, self.box.ledger)
+        self.assertNotEqual(os.stat(self.box.ledger).st_ino, old_inode)
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 3)
+        self.assertEqual(body["events"]["by_type"],
+                         {"CANDIDATE_ENTERED": 1, "CANDIDATE_EXITED": 1,
+                          "SESSION_ENDED": 1})
+        self.assertEqual(body["events"]["latest_event"]["event_id"],
+                         EV4["event_id"])
+
+    def test_corrupt_committed_line_faults_and_keeps_last_good_prefix(self):
+        self.write_ledger(EV1)
+        self.assert_status_matches_full_read()
+        before = self.projector._ledger_tail_entry
+        for bad in (b"\n", b"{not json}\n", b"[1,2]\n",
+                    b'{"event_id": 1}\n'):
+            with self.subTest(bad=bad):
+                with open(self.box.ledger, "ab") as f:
+                    f.write(bad)
+                with self.assertRaises(serve.DataFault) as err:
+                    self.projector.status()
+                self.assertIn("line 2", str(err.exception))
+                self.assertIs(self.projector._ledger_tail_entry, before)
+                with self.assertRaises(serve.DataFault):
+                    self.projector.event(EV1["event_id"])
+                with self.assertRaises(serve.DataFault):
+                    self.projector.status()
+                with open(self.box.ledger, "wb") as f:
+                    f.write(canonical(EV1) + b"\n")
+        body = self.assert_status_matches_full_read()
+        self.assertEqual(body["events"]["count"], 1)
+
+    # -- tail-first /events/{event_id} -------------------------------------
+
+    def test_event_finds_recent_and_old_facts(self):
+        self.write_ledger(EV1, EV2, EV3, EV4)
+        self.assertEqual(self.projector.event(EV4["event_id"]),
+                         {"event": EV4, "delivery": []})
+        self.assertEqual(self.projector.event(EV1["event_id"]),
+                         {"event": EV1, "delivery": []})
+        self.assertIsNone(self.projector.event("0" * 64))
+
+    def test_event_empty_and_absent_ledger_is_none(self):
+        self.assertIsNone(self.projector.event(EV1["event_id"]))
+        self.write_ledger()
+        self.assertIsNone(self.projector.event(EV1["event_id"]))
+
+    def test_event_tail_scan_handles_block_edges_and_utf8(self):
+        korean = event_fact(b"utf8", "CANDIDATE_ENTERED", "2026-10-30",
+                            "2026-10-30T12:00:00+09:00",
+                            "candidate-entered", name="삼성전자")
+        self.write_ledger(EV1, korean, EV2, EV3, EV4)
+        with mock.patch.object(serve, "LEDGER_SCAN_BLOCK", 17):
+            self.assertEqual(self.projector.event(EV1["event_id"])["event"],
+                             EV1)
+            self.assertEqual(
+                self.projector.event(korean["event_id"])["event"], korean)
+            self.assertEqual(self.projector.event(EV4["event_id"])["event"],
+                             EV4)
+            self.assertIsNone(self.projector.event("f" * 64))
+
+    # -- client disconnects ------------------------------------------------
+
+    def test_send_json_absorbs_broken_pipe_and_reset(self):
+        class BrokenWFile:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def write(self, data):
+                raise self.exc
+
+        for exc in (BrokenPipeError("gone"),
+                    ConnectionResetError("gone")):
+            with self.subTest(exc=exc.__class__.__name__):
+                handler = serve.Handler.__new__(serve.Handler)
+                handler.wfile = BrokenWFile(exc)
+                handler.close_connection = False
+                handler.send_response = lambda code: None
+                handler.send_header = lambda key, value: None
+                handler.end_headers = lambda: None
+                captured = io.StringIO()
+                with contextlib.redirect_stderr(captured):
+                    handler._send_json(200, {"ok": True})
+                self.assertTrue(handler.close_connection)
+                lines = captured.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertIn("CLIENT_DISCONNECTED", lines[0])
+
+    def test_send_json_other_write_faults_propagate(self):
+        class FailingWFile:
+            def write(self, data):
+                raise ValueError("not a disconnect")
+
+        handler = serve.Handler.__new__(serve.Handler)
+        handler.wfile = FailingWFile()
+        handler.close_connection = False
+        handler.send_response = lambda code: None
+        handler.send_header = lambda key, value: None
+        handler.end_headers = lambda: None
+        with self.assertRaises(ValueError):
+            handler._send_json(200, {"ok": True})
+
+    def test_server_handle_error_absorbs_disconnects(self):
+        server = serve.ServeHTTPServer.__new__(serve.ServeHTTPServer)
+        calls = []
+
+        def fake(parent, request, client_address):
+            calls.append(client_address)
+        captured = io.StringIO()
+        with mock.patch.object(serve.ThreadingHTTPServer, "handle_error",
+                               fake), contextlib.redirect_stderr(captured):
+            with mock.patch.object(
+                    sys, "exc_info",
+                    return_value=(BrokenPipeError, BrokenPipeError(),
+                                  None)):
+                serve.ServeHTTPServer.handle_error(
+                    server, None, ("127.0.0.1", 9))
+            with mock.patch.object(
+                    sys, "exc_info",
+                    return_value=(ValueError, ValueError(), None)):
+                serve.ServeHTTPServer.handle_error(
+                    server, None, ("127.0.0.1", 9))
+        self.assertEqual(calls, [("127.0.0.1", 9)])
+        self.assertEqual(captured.getvalue().count("\n"), 1)
 
 
 class QuietHandler(serve.Handler):

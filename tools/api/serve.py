@@ -199,6 +199,12 @@ MARKET_EVENTS_CONTRACT = "top10-v1"
 MARKET_FACT_TYPES = ("RANK_CHANGED", "TOP10_ENTERED", "TOP10_EXITED")
 TOP10_PREFIX = "TOP10_"
 
+# /events/{event_id} (README §3.4): after the committed-lines cursor
+# validates the whole ledger, the one-event lookup scans backward in
+# fixed byte blocks instead of materializing every event. 256 KiB keeps
+# a block at a few hundred ledger lines while bounding the read size.
+LEDGER_SCAN_BLOCK = 256 * 1024
+
 
 class DataFault(Exception):
     """A recorded file is unreadable or violates its recorded shape.
@@ -386,6 +392,111 @@ def _read_committed_lines_inc(path, prev_state=None):
         state.offset = committed_offset
         state.line_no = i
         return events, True, state
+
+
+class _LedgerTailState:
+    """Incremental aggregate state for the notify ledger: the byte offset
+    of the last committed LF, the number of committed lines before it
+    (DataFault line numbers), and the projection counters the endpoints
+    need — never the events themselves (constant memory over a ledger
+    that grows every day)."""
+    __slots__ = ("path", "st_dev", "st_ino", "offset", "line_no",
+                 "count", "by_type", "by_severity", "last",
+                 "last_session_id")
+
+    def __init__(self, path, st_dev=0, st_ino=0):
+        self.path = path
+        self.st_dev = st_dev
+        self.st_ino = st_ino
+        self.offset = 0
+        self.line_no = 0
+        self.count = 0
+        self.by_type = Counter()
+        self.by_severity = Counter()
+        self.last = None
+        self.last_session_id = None
+
+
+def _read_ledger_tail_inc(path, prev_state=None):
+    """Incremental version of _ledger_events()' full-ledger scan: the
+    notify ledger grows all day, so /status and the tail-first event
+    lookup consume only bytes committed since the last call.
+
+    Resumes from prev_state.offset when (path, st_dev, st_ino) match and
+    st_size >= prev_state.offset: st_size == offset returns prev_state
+    unchanged in O(1), a grown file reads only the bytes after offset. A
+    smaller size (a truncate), an inode replacement, a path change or a
+    missing file resets cleanly from byte 0. The reading discipline is
+    read_committed_lines exactly: a torn trailing line (no LF) is never
+    consumed and leaves offset at the last committed LF; a malformed
+    committed line — empty, non-JSON, non-object, or missing a string
+    event_id/event_type/session_id/severity — raises DataFault with the
+    file-wide line number. prev_state is never mutated: the returned
+    state is a new object built on a clone of the last good prefix, and
+    a DataFault leaves the caller's slot untouched (fail-closed, never
+    cached). Returns (state, file_present); state is None when the file
+    is absent."""
+    try:
+        st = os.stat(path)
+        f = open(path, "rb")
+    except FileNotFoundError:
+        return None, False
+    except OSError as exc:
+        raise DataFault("%s unreadable: %s"
+                        % (os.path.basename(path), _reason(exc)))
+    name = os.path.basename(path)
+    with f:
+        if prev_state is not None \
+                and prev_state.path == path \
+                and prev_state.st_dev == st.st_dev \
+                and prev_state.st_ino == st.st_ino \
+                and st.st_size >= prev_state.offset:
+            if st.st_size == prev_state.offset:
+                return prev_state, True
+            state = _LedgerTailState(path, st.st_dev, st.st_ino)
+            state.offset = prev_state.offset
+            state.line_no = prev_state.line_no
+            state.count = prev_state.count
+            state.by_type = Counter(prev_state.by_type)
+            state.by_severity = Counter(prev_state.by_severity)
+            state.last = (dict(prev_state.last)
+                          if prev_state.last is not None else None)
+            state.last_session_id = prev_state.last_session_id
+            f.seek(state.offset)
+        else:
+            state = _LedgerTailState(path, st.st_dev, st.st_ino)
+        i = state.line_no
+        committed_offset = state.offset
+        while True:
+            raw = f.readline()
+            if not raw or not raw.endswith(b"\n"):
+                break  # EOF, or a torn tail: not committed yet
+            i += 1
+            committed_offset = f.tell()
+            raw = raw[:-1]
+            if not raw:
+                raise DataFault("%s line %d is empty" % (name, i))
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise DataFault("%s line %d is not valid UTF-8 JSON: %s"
+                                % (name, i, exc))
+            if not isinstance(obj, dict):
+                raise DataFault("%s line %d is not a JSON object" % (name, i))
+            for field in ("event_id", "event_type", "session_id",
+                          "severity"):
+                if not isinstance(obj.get(field), str):
+                    raise DataFault("%s line %d has no %s" % (name, i, field))
+            state.count += 1
+            state.by_type[obj["event_type"]] += 1
+            state.by_severity[obj["severity"]] += 1
+            state.last = {k: obj[k] for k in ("event_id", "event_type",
+                                              "observed_at")
+                          if k in obj}
+            state.last_session_id = obj["session_id"]
+        state.offset = committed_offset
+        state.line_no = i
+        return state, True
 
 
 def read_head_config(path):
@@ -854,6 +965,14 @@ class Projector:
         # by its own lock.
         self._events_lock = threading.Lock()
         self._events_entry = None
+        # The notify ledger's aggregate cursor (README §3.1/§3.4): one
+        # slot, the last published incremental read (path, st_dev,
+        # st_ino, offset, line_no, counters, latest event) — never the
+        # events themselves, so /status stays constant-memory while the
+        # ledger grows. The same single-entry discipline as the slots
+        # above, guarded by its own lock; a fault is never published.
+        self._ledger_tail_lock = threading.Lock()
+        self._ledger_tail_entry = None
         # The cold-path readiness contract (README §1/§4): WARMING from
         # the first prewarm_market_projection_async() call until the
         # background scan lands — READY on success, FAILED with the
@@ -1058,6 +1177,22 @@ class Projector:
                                         % (i, field))
         return events, present
 
+    def _ledger_tail(self):
+        """The memoized aggregate cursor of the notify ledger (/status
+        and the event tail scan): one slot holding the last published
+        incremental read — path, identity, offset, line count, the
+        by-type/by-severity counters and the latest event's fields.
+        Constant memory regardless of ledger size. The lock serializes
+        concurrent ThreadingHTTPServer requests around read-and-publish;
+        a DataFault is never published — the slot keeps the last good
+        prefix, so the fault repeats until the file is fixed. Returns
+        (state, present) with _read_ledger_tail_inc's semantics."""
+        with self._ledger_tail_lock:
+            state, present = _read_ledger_tail_inc(
+                self.ledger_path, self._ledger_tail_entry)
+            self._ledger_tail_entry = state
+            return state, present
+
     def _delivery_latest(self):
         """Latest delivery record per (event_id, device_id), the same
         last-record-wins rule the delivery ledger documents. Returns
@@ -1094,24 +1229,21 @@ class Projector:
             latest_summary = self._run_summary(
                 names[-1], self._run_json(os.path.join(self.runs_root,
                                                        names[-1])))
-        events, ledger_present = self._ledger_events()
+        tail, ledger_present = self._ledger_tail()
         if ledger_present:
             # A present-but-empty ledger (its single writer opened the
             # file with O_CREAT before the first committed record) is an
             # honest zero-count projection, never an IndexError (§3).
-            last = events[-1] if events else None
+            # The incremental cursor serves the same bytes the old full
+            # scan did, without materializing the event list.
             events_block = {
                 "ledger_present": True,
-                "count": len(events),
-                "by_type": dict(sorted(Counter(
-                    ev["event_type"] for ev in events).items())),
-                "by_severity": dict(sorted(Counter(
-                    ev["severity"] for ev in events).items())),
-                "latest_session_id": last["session_id"] if last else None,
-                "latest_event": ({k: last[k]
-                                  for k in ("event_id", "event_type",
-                                            "observed_at")
-                                  if k in last} if last else None),
+                "count": tail.count,
+                "by_type": dict(sorted(tail.by_type.items())),
+                "by_severity": dict(sorted(tail.by_severity.items())),
+                "latest_session_id": tail.last_session_id,
+                "latest_event": (dict(tail.last)
+                                 if tail.last is not None else None),
             }
         else:
             events_block = {"ledger_present": False, "count": None,
@@ -1185,17 +1317,87 @@ class Projector:
         return {"ledger_present": True, "count": len(events),
                 "events": events, "delivery": delivery}
 
+    def _event_from_tail(self, event_id, state):
+        """Backward block scan of the validated ledger prefix
+        [0, state.offset) for one event fact.
+
+        The caller has just advanced the committed-lines cursor to EOF,
+        which validated every committed line from byte 0 — so corruption
+        anywhere in the ledger has already faulted and this scan never
+        skips it. Blocks are read from the end and reassembled across
+        block boundaries before UTF-8 decoding, so a multi-byte character
+        split by a block edge is never misread. A concurrent append past
+        state.offset is not part of this answer.
+
+        event_id is a content hash: repeated ledger lines carrying it are
+        the same fact. The first match met while scanning backward (the
+        newest occurrence) is returned."""
+        name = os.path.basename(self.ledger_path)
+        try:
+            f = open(self.ledger_path, "rb")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise DataFault("%s unreadable: %s" % (name, _reason(exc)))
+        with f:
+            pos = state.offset
+            carry = b""
+            while pos > 0:
+                start = max(0, pos - LEDGER_SCAN_BLOCK)
+                try:
+                    f.seek(start)
+                    chunk = f.read(pos - start)
+                except OSError as exc:
+                    raise DataFault("%s unreadable: %s"
+                                    % (name, _reason(exc)))
+                if len(chunk) != pos - start:
+                    # The file shrank or was replaced after the cursor
+                    # validated it: never serve a guessed prefix.
+                    raise DataFault("%s changed while reading" % name)
+                buf = chunk + carry
+                pieces = buf.split(b"\n")
+                if start > 0:
+                    carry = pieces[0]
+                    complete = pieces[1:]
+                else:
+                    carry = b""
+                    complete = pieces
+                for raw in reversed(complete):
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise DataFault("%s tail line is not valid UTF-8 "
+                                        "JSON: %s" % (name, exc))
+                    if not isinstance(obj, dict):
+                        raise DataFault("%s tail line is not a JSON object"
+                                        % name)
+                    if obj.get("event_id") == event_id:
+                        return obj
+                pos = start
+        return None
+
     def event(self, event_id):
         """The one event fact and its delivery records, or None when the
-        id is not in the ledger (the handler answers 404)."""
-        events, ledger_present = self._ledger_events()
-        latest_deliveries, _, present = self._delivery_latest()
-        for ev in events:
-            if ev["event_id"] == event_id:
-                delivery = self._delivery_for(latest_deliveries, event_id) \
-                    if ledger_present and present else []
-                return {"event": ev, "delivery": delivery}
-        return None
+        id is not in the ledger (the handler answers 404).
+
+        The committed-lines cursor advances to EOF first, validating
+        every new committed ledger byte exactly like read_committed_lines
+        — a corrupt committed line still answers 500, never a skipped
+        tail. The lookup then scans the validated prefix backward and
+        returns the first (newest) match, since event_id is a content
+        hash and duplicate lines are the same fact."""
+        state, ledger_present = self._ledger_tail()
+        latest_deliveries, _, delivery_present = self._delivery_latest()
+        if not ledger_present:
+            return None
+        ev = self._event_from_tail(event_id, state)
+        if ev is None:
+            return None
+        delivery = self._delivery_for(latest_deliveries, event_id) \
+            if delivery_present else []
+        return {"event": ev, "delivery": delivery}
 
     # ---- mobile market view (README §3.7) ---------------------------------
 
@@ -1798,7 +2000,17 @@ class Handler(BaseHTTPRequestHandler):
             for key, value in items:
                 self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            # The client hung up mid-response (the mobile client's 5s
+            # timeout is the common case): one journal line, no
+            # traceback, and the connection is done. Other write faults
+            # stay loud.
+            sys.stderr.write("CLIENT_DISCONNECTED %s\n"
+                             % exc.__class__.__name__)
+            self.close_connection = True
+            return
         self.close_connection = True
 
     def _not_found(self):
@@ -1894,6 +2106,22 @@ class Handler(BaseHTTPRequestHandler):
         self._method_not_allowed()
 
 
+class ServeHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with one refinement: a client that hangs up
+    mid-response (BrokenPipeError/ConnectionResetError, including the
+    flush path outside _send_json) is journaled as one stderr line
+    instead of a traceback. Every other handler fault goes to
+    http.server's default traceback path — failures stay loud."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            sys.stderr.write("CLIENT_DISCONNECTED %s\n"
+                             % exc.__class__.__name__)
+            return
+        super().handle_error(request, client_address)
+
+
 def _boot_id():
     """The kernel's boot id (stripped), the per-boot correlation key of
     the ops journal lines. "unknown" when /proc is unreadable — the
@@ -1964,7 +2192,7 @@ def serve_provenance(repo_root):
     return info
 
 
-def main(argv=None, server_factory=ThreadingHTTPServer):
+def main(argv=None, server_factory=ServeHTTPServer):
     parser = argparse.ArgumentParser(
         prog="serve.py",
         description="Hong Scanner read-only API — serves recorded facts "
