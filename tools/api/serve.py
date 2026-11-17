@@ -40,7 +40,12 @@ Cold-path readiness (README §1/§4): /mobile/market-view answers
 until the background prewarm of the latest eligible run lands (READY
 — normal serving); a prewarm that faults is FAILED for the process
 lifetime and every market-view request answers 500 data_fault. Other
-endpoints are unaffected by the readiness state.
+endpoints are unaffected by the readiness state. main() starts the
+prewarm BEFORE constructing the server: the ThreadingHTTPServer
+constructor binds and listens (socketserver server_activate ->
+socket.listen), and the listening socket may exist only after WARMING
+is set, so no client can be accepted before the 503 warming answer
+is in force.
 
 Python 3.13, standard library only (http.server). No new dependencies.
 """
@@ -842,8 +847,11 @@ class Projector:
 
     def prewarm_market_projection_async(self):
         """Warm the latest eligible run's §3.7 market fold in the background
-        on server startup so the first /mobile/market-view request hits the
-        warm incremental path instead of paying the cold-start scan.
+        so the first /mobile/market-view request hits the warm incremental
+        path instead of paying the cold-start scan. main() calls this
+        BEFORE constructing the server (the ThreadingHTTPServer
+        constructor binds and listens): the call's synchronous part
+        sets WARMING before any listening socket can accept a client.
 
         Cold-path readiness: single-flight — the first call wins and later
         calls return without starting a second thread (one prewarm per
@@ -1797,7 +1805,7 @@ class Handler(BaseHTTPRequestHandler):
         self._method_not_allowed()
 
 
-def main(argv=None):
+def main(argv=None, server_factory=ThreadingHTTPServer):
     parser = argparse.ArgumentParser(
         prog="serve.py",
         description="Hong Scanner read-only API — serves recorded facts "
@@ -1830,8 +1838,18 @@ def main(argv=None):
 
     projector = Projector(args.runs, args.ledger, args.delivery)
     Handler.projector = projector
+    # Startup ordering invariant: the prewarm runs BEFORE the server
+    # is constructed. The ThreadingHTTPServer constructor binds and
+    # listens (socketserver's server_activate calls socket.listen),
+    # so a socket constructed while the projector is still READY
+    # could accept a fast client before WARMING is set — its
+    # /mobile/market-view would pay the synchronous cold fold instead
+    # of the contract's 503 warming. The prewarm's scan runs in a
+    # daemon thread: if the bind below fails, main() still exits 4
+    # promptly and the warming thread dies with the process.
+    projector.prewarm_market_projection_async()
     try:
-        server = ThreadingHTTPServer((bind, args.port), Handler)
+        server = server_factory((bind, args.port), Handler)
     except OSError as exc:
         sys.stderr.write("serve.py: cannot bind %s:%d: %s\n"
                          % (bind, args.port, _reason(exc)))
@@ -1843,7 +1861,6 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
-    projector.prewarm_market_projection_async()
     print("SERVE %s:%d" % server.server_address, flush=True)
     try:
         server.serve_forever(poll_interval=0.2)

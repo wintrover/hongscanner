@@ -3449,6 +3449,47 @@ class MarketReadinessSuite(unittest.TestCase):
         self.assertIsNone(headers.get("Retry-After"))
         self.assertEqual(projector.market_view(), MV_EXPECTED)
 
+    # -- (e) startup ordering: the prewarm precedes the socket -----------
+
+    def test_prewarm_starts_before_the_listening_socket(self):
+        """main() must start the startup prewarm BEFORE it constructs
+        the server: the ThreadingHTTPServer constructor binds and
+        listens (socketserver server_activate -> socket.listen), so a
+        socket constructed while the projector is still READY accepts
+        a fast client before WARMING is ever set — its
+        /mobile/market-view would then pay the synchronous cold fold
+        instead of the contract's 503 warming.
+
+        Deterministic, no sleeps: main() takes a server_factory (the
+        real ThreadingHTTPServer by default); the test's factory
+        captures Handler.projector's readiness state at construction
+        time — the exact moment the socket would start listening —
+        and raises a sentinel that aborts main() before
+        serve_forever."""
+        gate, entered, calls = self.install_gated_fold()
+        saved_projector = serve.Handler.projector
+        self.addCleanup(setattr, serve.Handler, "projector",
+                        saved_projector)
+
+        class Sentinel(Exception):
+            pass
+
+        captured = {}
+
+        def factory(address, handler_class):
+            with serve.Handler.projector._readiness_lock:
+                captured["state"] = serve.Handler.projector._readiness_state
+            raise Sentinel("stop before serve_forever")
+
+        argv = ["--runs", self.box.runs, "--ledger", self.box.ledger,
+                "--delivery", self.box.delivery, "--port", "0"]
+        with self.assertRaises(Sentinel):
+            serve.main(argv, server_factory=factory)
+        # the listening socket may exist only after WARMING was set:
+        # on the pre-fix order (server constructed first) the captured
+        # state is the Projector.__init__ default READY
+        self.assertEqual(captured["state"], "WARMING")
+
 
 class TornLedgerSuite(unittest.TestCase):
     """A ledger being appended concurrently: committed records are

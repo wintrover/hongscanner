@@ -114,7 +114,12 @@ python3.13 tools/api/serve.py \
   재계산이다.
 - **콜드 패스 준비(readiness)**: 기동 직후 서버는 백그라운드에서
   최신 적격 런의 §3.7 시장 폴드를 미리 데운다(prewarm, 프로세스당
-  1회 — single-flight). 이 창 동안 `/mobile/market-view`만
+  1회 — single-flight). **prewarm은 리스닝 소켓이 생기기 전에
+  시작한다**: `ThreadingHTTPServer` 생성자가 바인드+리스닝까지
+  마치므로(socketserver `server_activate` → `socket.listen`),
+  소켓은 `WARMING`이 설정된 뒤에만 존재할 수 있다 — 클라이언트가
+  503 `warming` 답 변이 구축되기 전에 접속 승인되는 창이 없다.
+  이 창 동안 `/mobile/market-view`만
   **503 `warming` + `Retry-After: 5`**로 응답한다: 폴드 락을
   기다리게 하지 않고 즉시 거절하며(동시 요청도 각각 즉시 503),
   본문은 `{"error":{"code":"warming",...}}`다. prewarm 성공은
@@ -792,7 +797,10 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   503 warming·Retry-After 5, 폴드 락 홀드 중에도 동시 직접·HTTP
   요청이 즉시 응답, prewarm single-flight 3회 호출 1회 스캔, 폴드
   예외의 FAILED 종단 500 data_fault·추가 prewarm 호출 무효,
-  WARMING→READY→200 전환).
+  WARMING→READY→200 전환; prewarm 시작 순서 — main의
+  server_factory 주입으로 서버 생성 시점(소켓이 리스닝되는 순간)의
+  readiness 상태가 WARMING임을 단언하고 serve_forever 전에 중단,
+  sleep 없음).
 - 인터프리터 해석 순서는 collector·notify 스위트와 같다:
   `$HSCOLLECTOR_PYTHON` → `python3.13` → `uv python find 3.13`.
 - 게이트: `bash tools/run_tests.sh`에 등록된 스위트(`run bash
