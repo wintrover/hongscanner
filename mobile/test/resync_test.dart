@@ -56,6 +56,65 @@ void main() {
     expect(store.pushState.phase, PushPhase.unwired);
   });
 
+  test('a 503 warming answer retries after 5s and reaches loaded',
+      () async {
+    final backoffs = <Duration>[];
+    var calls = 0;
+    final healthy = fixtureTransport();
+    final transport = FakeTransport((uri) async {
+      calls += 1;
+      if (calls == 1) {
+        return errorJson(503, 'warming', 'server is starting up');
+      }
+      return healthy.get(uri);
+    });
+    final store = makeStore(transport: transport, backoffs: backoffs);
+    await store.bootstrap();
+
+    expect(store.syncCount, 1);
+    expect(transport.requests.length, 2,
+        reason: 'the warming 503 is retried within the same pass');
+    expect(backoffs, [const Duration(seconds: 5)],
+        reason: 'warming waits a fixed 5s, not the exponential backoff');
+    expect(store.recordedBackoffs, [const Duration(seconds: 5)]);
+    expect(store.marketView.phase, LoadPhase.loaded);
+    expect(store.marketView.value?.risingTop10, hasLength(2));
+    expect(store.marketView.value?.fallingTop10, hasLength(1));
+    expect(store.marketView.value?.run?.sessionDate, '2026-11-02');
+  });
+
+  test('warming retries are capped at three and end in the honest message',
+      () async {
+    final backoffs = <Duration>[];
+    final transport = FakeTransport(
+        (_) async => errorJson(503, 'warming', 'server is starting up'));
+    final store = makeStore(transport: transport, backoffs: backoffs);
+    await store.bootstrap();
+
+    expect(transport.requests.length, 4,
+        reason: 'the first fetch plus at most 3 warming retries (≤15s)');
+    expect(
+        backoffs, List<Duration>.filled(3, const Duration(seconds: 5)));
+    expect(store.marketView.phase, LoadPhase.error);
+    expect(store.marketView.offline, isFalse,
+        reason: 'the server answered — warming is not an offline state');
+    expect(store.marketView.errorMessage, contains('데이터 준비 중'));
+  });
+
+  test('a non-warming 503 keeps the plain exponential backoff', () async {
+    final backoffs = <Duration>[];
+    final transport = FakeTransport(
+        (_) async => errorJson(503, 'unavailable', 'front is down'));
+    final store = makeStore(transport: transport, backoffs: backoffs);
+    await store.bootstrap();
+
+    expect(transport.requests.length, 3);
+    expect(backoffs, [const Duration(seconds: 1), const Duration(seconds: 2)],
+        reason: 'only the documented 503 warming shape gets the fixed retry');
+    expect(store.marketView.phase, LoadPhase.error);
+    expect(store.marketView.errorMessage, contains('서버 오류 (503'));
+  });
+
   test('a second sync pass after recovery reloads the projection',
       () async {
     var down = true;

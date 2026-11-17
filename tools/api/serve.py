@@ -35,6 +35,13 @@ Security boundaries (README §5):
   - artifact names read from a recorded CHECKSUMS.sha256 are untrusted
     input: names outside the safe set are refused, never opened.
 
+Cold-path readiness (README §1/§4): /mobile/market-view answers
+503 {"error":{"code":"warming"}} with Retry-After: 5 from startup
+until the background prewarm of the latest eligible run lands (READY
+— normal serving); a prewarm that faults is FAILED for the process
+lifetime and every market-view request answers 500 data_fault. Other
+endpoints are unaffected by the readiness state.
+
 Python 3.13, standard library only (http.server). No new dependencies.
 """
 
@@ -172,6 +179,12 @@ class DataFault(Exception):
     Fail-closed: the endpoint answers HTTP 500, it never silently skips
     a corrupted record. Messages carry file basenames only — never
     absolute paths."""
+
+
+class ServiceWarming(Exception):
+    """The §3.7 market projection's cold-path prewarm is still running.
+    The market view answers HTTP 503 with Retry-After: 5 — a bounded
+    "try again soon", never a blocking wait, never a partial fold."""
 
 
 def canonical_bytes(obj):
@@ -815,11 +828,36 @@ class Projector:
         # by its own lock.
         self._events_lock = threading.Lock()
         self._events_entry = None
+        # The cold-path readiness contract (README §1/§4): WARMING from
+        # the first prewarm_market_projection_async() call until the
+        # background scan lands — READY on success, FAILED with the
+        # recorded reason on any Exception, terminal for the process
+        # (single-flight: no second prewarm). The default is READY so a
+        # Projector constructed directly (the unit suites, no prewarm)
+        # serves market_view() unchanged.
+        self._readiness_lock = threading.Lock()
+        self._readiness_state = "READY"
+        self._readiness_error = None
+        self._prewarm_started = False
 
     def prewarm_market_projection_async(self):
         """Warm the latest eligible run's §3.7 market fold in the background
         on server startup so the first /mobile/market-view request hits the
-        warm incremental path instead of paying the cold-start scan."""
+        warm incremental path instead of paying the cold-start scan.
+
+        Cold-path readiness: single-flight — the first call wins and later
+        calls return without starting a second thread (one prewarm per
+        process). The call moves the projector to WARMING; the background
+        scan's landing is terminal: READY on success, FAILED with the
+        recorded reason on any Exception — a prewarm failure is surfaced to
+        every market-view request as a DataFault, never swallowed."""
+        with self._readiness_lock:
+            if self._prewarm_started:
+                return
+            self._prewarm_started = True
+            self._readiness_state = "WARMING"
+            self._readiness_error = None
+
         def _warm():
             try:
                 names = self._session_names()
@@ -850,8 +888,13 @@ class Projector:
                         session_date)
                     self._events_committed_lines(
                         os.path.join(self.runs_root, session, EVENTS_JSONL))
-            except Exception:
-                pass  # best-effort prewarm; real requests surface DataFaults
+            except Exception as exc:
+                with self._readiness_lock:
+                    self._readiness_state = "FAILED"
+                    self._readiness_error = str(exc)
+                return
+            with self._readiness_lock:
+                self._readiness_state = "READY"
         threading.Thread(target=_warm, daemon=True).start()
 
     # ---- run directories -------------------------------------------------
@@ -1233,7 +1276,19 @@ class Projector:
         wall clock. The event fold and the response stay per-request
         locals; the cached objects are the derived market fold
         (§3.7, _market_projection) and the journal's committed-lines
-        cache (_events_committed_lines)."""
+        cache (_events_committed_lines).
+
+        Cold-path readiness: while the startup prewarm is WARMING the
+        call raises ServiceWarming (the handler's 503 + Retry-After),
+        and a FAILED prewarm raises DataFault — both before any lock or
+        recorded byte is touched, so a warming server's answers never
+        queue behind the scan's own _fold_lock hold."""
+        with self._readiness_lock:
+            if self._readiness_state == "WARMING":
+                raise ServiceWarming("market projection is warming")
+            if self._readiness_state == "FAILED":
+                raise DataFault("market projection prewarm failed: %s"
+                                % (self._readiness_error or "unknown error"))
         names = self._session_names()
         eligible = []
         for name in names:
@@ -1634,14 +1689,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- responses --
 
-    def _send_json(self, code, obj, extra_headers=()):
+    def _send_json(self, code, obj, extra_headers=None):
         body = canonical_bytes(obj) + b"\n"
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
-        for key, value in extra_headers:
-            self.send_header(key, value)
+        if extra_headers:
+            items = extra_headers.items() \
+                if isinstance(extra_headers, dict) else extra_headers
+            for key, value in items:
+                self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
         self.close_connection = True
@@ -1702,6 +1760,10 @@ class Handler(BaseHTTPRequestHandler):
         except DataFault as exc:
             return self._send_json(500, {"error": {"code": "data_fault",
                                                    "message": str(exc)}})
+        except ServiceWarming as exc:
+            return self._send_json(
+                503, {"error": {"code": "warming", "message": str(exc)}},
+                extra_headers={"Retry-After": "5"})
         self._send_json(200, body)
 
     @staticmethod

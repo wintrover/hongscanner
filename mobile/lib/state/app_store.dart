@@ -119,6 +119,14 @@ class AppStore extends ChangeNotifier {
   static Future<void> _defaultDelay(Duration duration) =>
       Future<void>.delayed(duration);
 
+  /// Fixed wait between warming retries — a starting server, not a
+  /// failing one.
+  static const Duration _warmingRetryDelay = Duration(seconds: 5);
+
+  /// Warming retries per sync pass, capping the total warming wait at
+  /// 15s before the honest error state stands.
+  static const int _maxWarmingRetries = 3;
+
   final ApiClient _api;
   final PushService _push;
   final PushPermissionLedger _ledger;
@@ -139,6 +147,11 @@ class AppStore extends ChangeNotifier {
   /// Whether the 401 re-entry prompt already ran in the current resync —
   /// one prompt, one retry, never a loop.
   bool _authPromptShown = false;
+
+  /// Set when the current pass's projection fetch ended in a 503
+  /// `warming` — the readiness host is still starting up, which retries
+  /// on a fixed short wait instead of the failure backoff.
+  bool _sawWarming = false;
 
   /// Set when reading the stored credentials failed (platform error,
   /// corrupted storage). Fail-closed: treated exactly like "no stored
@@ -482,6 +495,12 @@ class AppStore extends ChangeNotifier {
   /// here: one full refresh of the market-view projection, with bounded
   /// backoff on failure.
   ///
+  /// Warming contract (503 `warming`): a pass that ended in the server's
+  /// start-up state retries on a fixed 5s wait, at most 3 times per sync
+  /// (≤15s), without consuming a regular attempt — a server that never
+  /// warms up ends in the visible "데이터 준비 중" error, and non-warming
+  /// failures keep the plain exponential backoff.
+  ///
   /// 401 contract (Basic Auth): when a pass hit a 401 and the re-entry
   /// callback is wired, the prompt runs once per resync and a submission
   /// triggers exactly one retry pass. Cancelling or a failing prompt ends
@@ -495,8 +514,11 @@ class AppStore extends ChangeNotifier {
     try {
       syncCount += 1;
       _authPromptShown = false;
-      for (var attempt = 1; attempt <= _maxSyncAttempts; attempt++) {
+      var attempt = 0; // non-warming attempts spent
+      var warmingRetries = 0;
+      while (true) {
         _sawUnauthorized = false;
+        _sawWarming = false;
         var ok = await _fetchOnce();
         if (!ok &&
             _sawUnauthorized &&
@@ -513,8 +535,16 @@ class AppStore extends ChangeNotifier {
           }
           if (submitted) ok = await _fetchOnce(); // the single retry
         }
-        if (ok) break;
-        if (attempt == _maxSyncAttempts) break;
+        if (ok || _disposed) break;
+        if (_sawWarming) {
+          if (warmingRetries == _maxWarmingRetries) break;
+          warmingRetries += 1;
+          recordedBackoffs.add(_warmingRetryDelay);
+          await _delay(_warmingRetryDelay);
+          continue;
+        }
+        attempt += 1;
+        if (attempt >= _maxSyncAttempts) break;
         final backoff = _backoffBase * (1 << (attempt - 1));
         recordedBackoffs.add(backoff);
         await _delay(backoff);
@@ -533,6 +563,9 @@ class AppStore extends ChangeNotifier {
       marketView = Section.loaded(await _api.fetchMarketView());
     } on ApiClientException catch (e) {
       if (e.statusCode == 401) _sawUnauthorized = true;
+      if (e.statusCode == 503 && e.serverCode == 'warming') {
+        _sawWarming = true;
+      }
       marketView =
           Section.error(_describe(e), offline: e.isConnectivityProblem);
       notifyListeners();
@@ -551,6 +584,7 @@ class AppStore extends ChangeNotifier {
       return switch (e.serverCode) {
         'not_found' => '기록에 없음 (404 not_found)',
         'data_fault' => '기록 파일 불량 (500 data_fault)',
+        'warming' => '데이터 준비 중 (잠시 후 다시 시도)',
         _ => '서버 오류 (${e.statusCode ?? '?'} ${e.serverCode ?? ''})',
       };
     }
