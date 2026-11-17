@@ -265,6 +265,90 @@ def read_committed_lines(path):
     return objects, True
 
 
+class _EventsLinesState:
+    """Incremental state for the committed-lines cache of one
+    events.hcj.jsonl: the byte offset of the last committed LF, the
+    number of committed lines before it (DataFault line numbers) and
+    the parsed objects themselves."""
+    __slots__ = ("path", "st_dev", "st_ino", "offset", "line_no", "events")
+
+    def __init__(self, path, st_dev=0, st_ino=0):
+        self.path = path
+        self.st_dev = st_dev
+        self.st_ino = st_ino
+        self.offset = 0
+        self.line_no = 0
+        self.events = []
+
+
+def _read_committed_lines_inc(path, prev_state=None):
+    """Incremental read_committed_lines (README §3.7: the market view's
+    events.hcj.jsonl grows all day, so a per-request full rescan is the
+    endpoint's hot path — the journal is read as only its new bytes).
+
+    Resumes from prev_state.offset when (path, st_dev, st_ino) match and
+    st_size >= prev_state.offset: st_size == offset returns the cached
+    objects in O(1), a grown file reads only the bytes after offset. A
+    smaller size (a truncate), an inode replacement, a path change or a
+    missing file resets cleanly from byte 0. The reading discipline is
+    read_committed_lines exactly: a torn trailing line (no LF) is never
+    consumed and leaves offset at the last committed LF; a malformed
+    committed line (empty, non-JSON, non-object) raises DataFault
+    without mutating prev_state — the caller's cache keeps the last
+    good prefix and the fault repeats on every call until the file is
+    fixed (fail-closed, never cached). Returns (objects, file_present,
+    state); state is None when the file is absent. The returned list is
+    the new state's own — callers must treat it as read-only, never
+    mutate it in place (an incremental call clones before appending)."""
+    try:
+        st = os.stat(path)
+        f = open(path, "rb")
+    except FileNotFoundError:
+        return [], False, None
+    except OSError as exc:
+        raise DataFault("%s unreadable: %s"
+                        % (os.path.basename(path), _reason(exc)))
+    name = os.path.basename(path)
+    with f:
+        if prev_state is not None \
+                and prev_state.path == path \
+                and prev_state.st_dev == st.st_dev \
+                and prev_state.st_ino == st.st_ino \
+                and st.st_size >= prev_state.offset:
+            if st.st_size == prev_state.offset:
+                return prev_state.events, True, prev_state
+            state = _EventsLinesState(path, st.st_dev, st.st_ino)
+            state.offset = prev_state.offset
+            state.line_no = prev_state.line_no
+            state.events = list(prev_state.events)
+            f.seek(state.offset)
+        else:
+            state = _EventsLinesState(path, st.st_dev, st.st_ino)
+        events = state.events
+        i = state.line_no
+        committed_offset = state.offset
+        while True:
+            raw = f.readline()
+            if not raw or not raw.endswith(b"\n"):
+                break  # EOF, or a torn tail: not committed yet
+            i += 1
+            committed_offset = f.tell()
+            raw = raw[:-1]
+            if not raw:
+                raise DataFault("%s line %d is empty" % (name, i))
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise DataFault("%s line %d is not valid UTF-8 JSON: %s"
+                                % (name, i, exc))
+            if not isinstance(obj, dict):
+                raise DataFault("%s line %d is not a JSON object" % (name, i))
+            events.append(obj)
+        state.offset = committed_offset
+        state.line_no = i
+        return events, True, state
+
+
 def read_head_config(path):
     """The committed config record near the head of an input.hcj.jsonl —
     the recorded identity of a real collection run. Bounded: only the
@@ -724,6 +808,13 @@ class Projector:
         # slot is guarded by one lock.
         self._fold_lock = threading.Lock()
         self._fold_entry = None
+        # The events.hcj.jsonl committed-lines memoization: one slot,
+        # the last published incremental read (path, st_dev, st_ino,
+        # offset, line_no, events) — the same single-entry discipline
+        # as the fold slot (a different selected run rescans), guarded
+        # by its own lock.
+        self._events_lock = threading.Lock()
+        self._events_entry = None
 
     def prewarm_market_projection_async(self):
         """Warm the latest eligible run's §3.7 market fold in the background
@@ -757,6 +848,8 @@ class Projector:
                     self._market_projection(
                         os.path.join(self.runs_root, session, INPUT_JSONL),
                         session_date)
+                    self._events_committed_lines(
+                        os.path.join(self.runs_root, session, EVENTS_JSONL))
             except Exception:
                 pass  # best-effort prewarm; real requests surface DataFaults
         threading.Thread(target=_warm, daemon=True).start()
@@ -987,6 +1080,23 @@ class Projector:
             self._fold_entry = state
             return state.names, state.snapshots, state.ma20
 
+    def _events_committed_lines(self, path):
+        """The memoized committed-lines read of one events.hcj.jsonl —
+        the market view's event source (README §3.7: the journal grows
+        all day, so the per-request read is incremental, never a full
+        rescan of a 29MB+ file). The slot holds the last incremental
+        read and resumes from its byte offset, O(1) while the file has
+        not grown. A DataFault is never cached — a corrupt journal
+        faults on every request until it is fixed; a vanished file
+        resets the slot cleanly. Returns (events, present) with
+        read_committed_lines' exact semantics; the events list is the
+        slot's own and callers must never mutate it in place."""
+        with self._events_lock:
+            events, present, state = _read_committed_lines_inc(
+                path, self._events_entry)
+            self._events_entry = state
+            return events, present
+
     @staticmethod
     def _market_item(ev, rank, names, pos=None):
         """The whitelisted README §3.7 item: nine fields — seven recorded,
@@ -1121,8 +1231,9 @@ class Projector:
         root is listed once per request and every identity is read
         from recorded bytes (the committed config record), never the
         wall clock. The event fold and the response stay per-request
-        locals; the one cached object is the derived market fold
-        (§3.7, _market_projection)."""
+        locals; the cached objects are the derived market fold
+        (§3.7, _market_projection) and the journal's committed-lines
+        cache (_events_committed_lines)."""
         names = self._session_names()
         eligible = []
         for name in names:
@@ -1170,7 +1281,7 @@ class Projector:
         run_dir = os.path.join(self.runs_root, session)
         stock_names, snapshots, ma20 = self._market_projection(
             os.path.join(run_dir, INPUT_JSONL), session_date)
-        events, _ = read_committed_lines(
+        events, _ = self._events_committed_lines(
             os.path.join(run_dir, EVENTS_JSONL))
         # The seal (README §3.7): the recorder's finish() marker — the
         # same recorded fact the verification endpoint reads (§3.6),

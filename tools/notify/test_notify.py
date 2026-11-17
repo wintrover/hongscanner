@@ -24,6 +24,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -2360,6 +2361,71 @@ class TestRegister(Base):
                       out.getvalue())
 
 
+# ------------------------------------------------------------- sd_notify
+
+
+class TestSdNotify(Base):
+    """The sd_notify(3) supervision contract (README §11): the worker's
+    messages to the service manager ride $NOTIFY_SOCKET as AF_UNIX
+    SOCK_DGRAM datagrams (a leading '@' names the abstract namespace,
+    sent as a NUL byte), and without the variable the helper is a
+    strict no-op — a supervised and an unsupervised worker run exactly
+    the same dispatch code."""
+
+    def use_notify_socket(self, value):
+        """Point $NOTIFY_SOCKET at `value` for this test (None: make
+        sure it is unset), restoring the process environment after."""
+        saved = os.environ.pop("NOTIFY_SOCKET", None)
+        if saved is None:
+            self.addCleanup(os.environ.pop, "NOTIFY_SOCKET", None)
+        else:
+            self.addCleanup(os.environ.__setitem__, "NOTIFY_SOCKET",
+                            saved)
+        if value is not None:
+            os.environ["NOTIFY_SOCKET"] = value
+
+    def test_unset_or_empty_notify_socket_is_a_safe_noop(self):
+        # No manager (one-shot runs, tests, the development-mode
+        # fallback): unset AND empty both return before any datagram is
+        # attempted, and nothing ever raises.
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(os.path.join(self.tmp, "notify.sock"))
+        self.addCleanup(sock.close)
+        self.use_notify_socket(None)
+        notify_dispatcher._sd_notify(b"READY=1")
+        self.use_notify_socket("")
+        notify_dispatcher._sd_notify(b"WATCHDOG=1")
+        sock.settimeout(0.2)
+        with self.assertRaises(socket.timeout):
+            sock.recv(4096)
+
+    def test_notify_socket_delivers_ready_and_watchdog_datagrams(self):
+        # A path-form $NOTIFY_SOCKET: the exact READY=1 / WATCHDOG=1
+        # bytes the Type=notify manager reads, one datagram each.
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        path = os.path.join(self.tmp, "notify.sock")
+        sock.bind(path)
+        self.addCleanup(sock.close)
+        self.use_notify_socket(path)
+        notify_dispatcher._sd_notify(b"READY=1")
+        notify_dispatcher._sd_notify(b"WATCHDOG=1")
+        sock.settimeout(5)
+        self.assertEqual(sock.recv(4096), b"READY=1")
+        self.assertEqual(sock.recv(4096), b"WATCHDOG=1")
+
+    def test_leading_at_maps_to_the_abstract_namespace(self):
+        # systemd may hand out an abstract socket ('@'-prefixed); the
+        # datagram must land on the NUL-prefixed abstract address.
+        name = "\0hs-notify-%s" % os.path.basename(self.tmp)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(name)
+        self.addCleanup(sock.close)
+        self.use_notify_socket("@" + name[1:])
+        notify_dispatcher._sd_notify(b"WATCHDOG=1")
+        sock.settimeout(5)
+        self.assertEqual(sock.recv(4096), b"WATCHDOG=1")
+
+
 # --------------------------------------------------- resident watch
 
 
@@ -3063,6 +3129,56 @@ class TestResidentProcess(Base):
         self.assertIn("watch start", "\n".join(lines2))
         self.assertIn("appended=0", lines2[-1])
         self.assertIn("dup=1", lines2[-1])
+        self.assertEqual(self.ledger_lines(cfg), [line])
+
+    def test_watch_mode_signals_ready_once_and_watchdog_per_tick(self):
+        """The sd_notify wiring under a real $NOTIFY_SOCKET (README
+        §11): the resident process tells the manager READY=1 once —
+        after the single-writer locks are held and before the first
+        tick runs — and WATCHDOG=1 on every tick, which is exactly the
+        datagram stream a Type=notify + WatchdogSec=30 unit's manager
+        reads. Without the variable (the test above) the same code path
+        is a no-op."""
+        path, cfg = self.config()
+        self.write_service_account(cfg)
+        events_path = self._events_path()
+        line = self.event_line(seq=1)
+        self._append_lines(events_path, [line])
+        notify_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        notify_path = os.path.join(self.tmp, "notify.socket")
+        notify_sock.bind(notify_path)
+        self.addCleanup(notify_sock.close)
+        cmd = [sys.executable, "notify_dispatcher.py",
+               "--config", path, "--watch", events_path]
+        notify_dir = os.path.dirname(os.path.abspath(__file__))
+        proc = subprocess.Popen(
+            cmd, cwd=notify_dir, env=dict(os.environ,
+                                          NOTIFY_SOCKET=notify_path),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # READY=1 precedes every tick (sent before the loop body),
+            # WATCHDOG=1 follows each completed tick; collect until both
+            # are observed so a slow first tick cannot flake the read.
+            seen = []
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and \
+                    (b"READY=1" not in seen or b"WATCHDOG=1" not in seen):
+                notify_sock.settimeout(2.0)
+                try:
+                    seen.append(notify_sock.recv(4096))
+                except socket.timeout:
+                    pass
+            self.assertEqual(seen[0], b"READY=1")
+            self.assertIn(b"WATCHDOG=1", seen)
+            _wait_for_line("watch tick", proc.stdout)
+        finally:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise
+        self.assertEqual(proc.returncode, 0)
         self.assertEqual(self.ledger_lines(cfg), [line])
 
 

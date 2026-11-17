@@ -14,11 +14,14 @@
 ##     its parent is the service manager, NOT this launcher, so the
 ##     launcher MUST stop it explicitly (trap EXIT below). No --collect:
 ##     a failed unit keeps its exit status observable until reset-failed.
-##   - Type=exec + Restart=on-failure + RestartSec=2: systemd restarts
-##     a crashed worker (full rescan + event_id dedup = no duplicate
-##     push). A worker that stops cleanly (SIGTERM -> exit 0) is NOT
-##     restarted. StartLimit (10s/5) leaves a failed unit for the
-##     session-end observation in the launcher log.
+##   - Type=notify + WatchdogSec=30 + Restart=on-failure + RestartSec=2:
+##     the worker signals sd_notify(3) READY=1 once its single-writer
+##     locks are held and the watch loop begins, and WATCHDOG=1 on every
+##     tick — so systemd restarts a crashed worker (full rescan +
+##     event_id dedup = no duplicate push) AND a worker whose ticks
+##     hang past the 30s watchdog. A worker that stops cleanly (SIGTERM
+##     -> exit 0) is NOT restarted. StartLimit (10s/5) leaves a failed
+##     unit for the session-end observation in the launcher log.
 ##   - the collector is this launcher's child and runs in the FOREGROUND
 ##     (via wait): when it exits — clean close, honest INCOMPLETE exit 4,
 ##     or a crash — the launcher stops the worker, records both exit
@@ -262,7 +265,8 @@ start_worker() {
   systemctl --user reset-failed "$UNIT" 2>>"$LAUNCHER_LOG" || true
   if command -v systemd-run >/dev/null 2>&1 && \
      systemd-run --user --unit="$UNIT" \
-       --property=Type=exec \
+       --property=Type=notify \
+       --property=WatchdogSec=30 \
        --property=Restart=on-failure \
        --property=RestartSec=2 \
        --property=StandardOutput=append:"$LAUNCHER_LOG" \
@@ -270,7 +274,7 @@ start_worker() {
        "$PY" "$NOTIFY_SCRIPT" --config "$NOTIFY_CONFIG" \
        --watch "$EVENTS_FILE" >>"$LAUNCHER_LOG" 2>&1; then
     WORKER_MODE="systemd"
-    echo "WORKER_START systemd unit=$UNIT (Type=exec, Restart=on-failure)" \
+    echo "WORKER_START systemd unit=$UNIT (Type=notify, WatchdogSec=30, Restart=on-failure)" \
       >>"$LAUNCHER_LOG"
   else
     # Development-mode fallback (README §11): loses the auto-restart.

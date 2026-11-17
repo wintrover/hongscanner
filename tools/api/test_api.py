@@ -10,14 +10,16 @@ each one exits cleanly (SIGTERM -> exit 0, no residue). A malformed
 response byte, a leaked path/secret, or a surviving process fails the
 suite. Fail-closed: no assertion reports a pass on absence of evidence.
 
-The §3.7 market view is covered by four suites: MarketViewSuite holds
+The §3.7 market view is covered by five suites: MarketViewSuite holds
 the core fold and the legacy change-history contract, MarketViewFactSuite
 the events_contract "top10-v1" dual path (the fact translation, its
 eligibility rule, the discriminator branches), MarketViewOpeningSuite
 the VS-2 opening MA20 mode (the recorded window predicate, the
 chain-pair correspondence offsets, the integer cross-product order, the
-honest exclusions and the DataFault shapes), and MarketFoldSuite the
-pure fold_market_projection unit and its memoization."""
+honest exclusions and the DataFault shapes), MarketFoldSuite the
+pure fold_market_projection unit and its memoization, and
+MarketEventsLinesSuite the events.hcj.jsonl committed-lines cache
+(incremental reads identical to read_committed_lines)."""
 
 import hashlib
 import json
@@ -1943,6 +1945,35 @@ class MarketViewSuite(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, MV_EXPECTED)
 
+    def test_market_view_committed_append_served_incrementally(self):
+        # the events.hcj.jsonl committed-lines cache: a committed append
+        # between two requests — same server, no restart — is served by
+        # the incremental read, so the next response reflects the new
+        # last record without any full rescan
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, MV_EXPECTED)
+        appended = event_fact(b"mv-append", "SUBSCRIPTION_TRUNCATED",
+                              "2026-11-09", "2026-11-09T15:31:00+09:00",
+                              "subscription-truncated-v1",
+                              severity="HIGH", data_quality="INCOMPLETE",
+                              direction="UP")
+        with open(os.path.join(self.box.runs, MV_WINNER,
+                               "events.hcj.jsonl"), "ab") as f:
+            f.write(canonical(appended) + b"\n")
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        self.assertEqual(status, 200)
+        # a non-candidate record: never closes a group, so only the
+        # as_of/latest evidence and the quality census change
+        self.assertEqual(body, dict(
+            MV_EXPECTED,
+            as_of=appended["observed_at"],
+            latest={"data_quality": "INCOMPLETE",
+                    "event_id": appended["event_id"],
+                    "event_type": "SUBSCRIPTION_TRUNCATED",
+                    "observed_at": appended["observed_at"]},
+            status={"by_data_quality": {"INCOMPLETE": 2, "OBSERVING": 37}}))
+
     def test_market_view_malformed_committed_line_is_data_fault(self):
         # a committed but malformed last line is corruption, not a skip
         with open(os.path.join(self.box.runs, MV_WINNER,
@@ -2936,6 +2967,209 @@ class MarketFoldSuite(unittest.TestCase):
         self.assertEqual(
             projector._market_projection(path, "2026-11-09")[0],
             {"006660": "LG전자"})
+
+
+class MarketEventsLinesSuite(unittest.TestCase):
+    """Unit contract of the events.hcj.jsonl committed-lines cache: the
+    incremental reader behind _events_committed_lines must return
+    exactly read_committed_lines' result over the same file for every
+    growth shape — committed appends, a torn tail completed later, a
+    truncate below the cached offset, an inode replacement, a vanished
+    and re-created file — resume from the cached byte offset instead of
+    rescanning, and fault on a malformed committed line without
+    mutating the cached prefix. Cache behavior the endpoint bytes
+    cannot observe directly (a rescan is result-identical to a hit);
+    endpoint projection stays black-box in MarketViewSuite."""
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+        self.runs = self.box.runs
+        self.projector = serve.Projector(self.runs, self.box.ledger)
+
+    def write_events(self, *objects, torn=b""):
+        run_dir = self.box.session_dir("market-2026-11-09-n")
+        self.box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+                       jsonl(*objects) + torn)
+        return os.path.join(run_dir, "events.hcj.jsonl")
+
+    def assert_matches_read_committed_lines(self, path):
+        """The cache's result is read_committed_lines' result for the
+        same file, present flag included."""
+        events, present = self.projector._events_committed_lines(path)
+        expected, expected_present = serve.read_committed_lines(path)
+        self.assertEqual(present, expected_present)
+        self.assertEqual(events, expected)
+        return events
+
+    # -- the incremental read ------------------------------------------------
+
+    def test_events_cache_append_resumes_from_offset(self):
+        # the memoized read serves an unchanged file in O(1) and a grown
+        # file as only its new bytes: the reader is entered at the
+        # cached offset, never at 0
+        path = self.write_events(EV1, EV2)
+        calls = []
+        real_read = serve._read_committed_lines_inc
+
+        def counting_read(p, prev_state=None):
+            start_off = prev_state.offset if prev_state is not None else 0
+            events, present, state = real_read(p, prev_state)
+            calls.append((start_off, state.offset if state is not None
+                          else None))
+            return events, present, state
+        serve._read_committed_lines_inc = counting_read
+        self.addCleanup(setattr, serve, "_read_committed_lines_inc",
+                        real_read)
+        first = self.assert_matches_read_committed_lines(path)
+        self.assertEqual(first, [EV1, EV2])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 0)
+        first_end = calls[0][1]
+        # identical file: served from the slot at offset == st_size
+        self.assertEqual(self.projector._events_committed_lines(path),
+                         (first, True))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], (first_end, first_end))
+        # a committed append: the reader resumes from first_end, not 0
+        with open(path, "ab") as f:
+            f.write(canonical(EV3) + b"\n")
+        second = self.assert_matches_read_committed_lines(path)
+        self.assertEqual(second, [EV1, EV2, EV3])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[2][0], first_end)
+        self.assertGreater(calls[2][1], first_end)
+
+    def test_events_cache_torn_tail_completes_to_same_result(self):
+        # a torn tail is never consumed (offset stays at the last
+        # committed LF); completing it consumes exactly that line
+        rec1 = canonical(EV1) + b"\n"
+        rec2 = canonical(EV2) + b"\n"
+        path = self.write_events(EV1, torn=rec2[:15])
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV1])
+        entry = self.projector._events_entry
+        self.assertEqual(entry.offset, len(rec1))
+        self.assertEqual(entry.line_no, 1)
+        with open(path, "ab") as f:
+            f.write(rec2[15:])
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV1, EV2])
+        entry = self.projector._events_entry
+        self.assertEqual(entry.offset, len(rec1) + len(rec2))
+        self.assertEqual(entry.line_no, 2)
+
+    def test_events_cache_truncate_resets_from_zero(self):
+        # a rewrite shorter than the cached offset is not a
+        # negative-range resume: the slot resets cleanly and rescans
+        path = self.write_events(EV1, EV2)
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV1, EV2])
+        with open(path, "wb") as f:
+            f.write(canonical(EV1) + b"\n")
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV1])
+        with open(path, "ab") as f:
+            f.write(canonical(EV3) + b"\n")
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV1, EV3])
+
+    def test_events_cache_inode_replacement_rescans(self):
+        # an atomic rename swaps the inode: a rescan even though the new
+        # file is at least as long as the cached offset — the (dev, ino)
+        # identity, not the size alone, invalidates
+        path = self.write_events(EV1, EV2)
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV1, EV2])
+        old_offset = self.projector._events_entry.offset
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(jsonl(EV3, EV4, EV2))
+        os.replace(tmp, path)
+        self.assertGreaterEqual(os.path.getsize(path), old_offset)
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV3, EV4, EV2])
+
+    def test_events_cache_absent_file_resets_slot(self):
+        # a vanished journal reads ([], False) and publishes nothing: a
+        # later re-created file must be scanned, never served stale
+        path = self.write_events(EV1)
+        self.assertEqual(self.projector._events_committed_lines(path),
+                         ([EV1], True))
+        os.remove(path)
+        self.assertEqual(self.projector._events_committed_lines(path),
+                         ([], False))
+        self.assertIsNone(self.projector._events_entry)
+        self.write_events(EV3)
+        self.assertEqual(self.projector._events_committed_lines(path),
+                         ([EV3], True))
+
+    def test_events_cache_empty_and_torn_only_files(self):
+        # the single writer's O_CREAT states: zero bytes and a
+        # not-yet-committed single line both project ([], True)
+        run_dir = self.box.session_dir("market-2026-11-09-n")
+        path = os.path.join(run_dir, "events.hcj.jsonl")
+        self.box.write(path, b"")
+        self.assertEqual(self.assert_matches_read_committed_lines(path), [])
+        self.box.write(path, canonical(EV1)[:20])
+        self.assertEqual(self.assert_matches_read_committed_lines(path), [])
+        self.assertEqual(self.projector._events_entry.offset, 0)
+        self.assertEqual(self.projector._events_entry.line_no, 0)
+
+    # -- the fail-closed fault discipline -------------------------------------
+
+    def test_events_cache_fault_shapes_match_read_committed_lines(self):
+        # a malformed committed line faults identically to the full
+        # reader and publishes nothing: the slot keeps the last good
+        # prefix (offset, line count, events) verbatim
+        for label, bad in (("empty line", b"\n"),
+                           ("not json", b"{not json}\n"),
+                           ("not an object", b"[1,2]\n")):
+            with self.subTest(label):
+                path = self.write_events(EV1)
+                self.assert_matches_read_committed_lines(path)
+                before = self.projector._events_entry
+                with open(path, "ab") as f:
+                    f.write(bad)
+                with self.assertRaises(serve.DataFault):
+                    self.projector._events_committed_lines(path)
+                with self.assertRaises(serve.DataFault):
+                    serve.read_committed_lines(path)
+                after = self.projector._events_entry
+                self.assertIs(after, before)
+                self.assertEqual(after.events, [EV1])
+                self.assertEqual(after.line_no, 1)
+                self.assertEqual(after.offset, len(canonical(EV1) + b"\n"))
+
+    def test_events_cache_fault_message_numbers_lines_from_one(self):
+        # the incremental reader's DataFault message is byte-identical
+        # to the full reader's (the same file-wide line number)
+        path = self.write_events(EV1, EV2)
+        self.assert_matches_read_committed_lines(path)
+        with open(path, "ab") as f:
+            f.write(b"{not json}\n")
+        with self.assertRaises(serve.DataFault) as inc_err:
+            self.projector._events_committed_lines(path)
+        with self.assertRaises(serve.DataFault) as full_err:
+            serve.read_committed_lines(path)
+        self.assertEqual(str(inc_err.exception), str(full_err.exception))
+
+    def test_events_cache_fault_fixed_in_place_resumes(self):
+        # the un-cached fault leaves the slot at the last good prefix,
+        # so a journal fixed in place (same inode) resumes from it and
+        # the fault is gone
+        path = self.write_events(EV1)
+        self.assert_matches_read_committed_lines(path)
+        prefix_end = self.projector._events_entry.offset
+        with open(path, "ab") as f:
+            f.write(b"{not json}\n")
+        with self.assertRaises(serve.DataFault):
+            self.projector._events_committed_lines(path)
+        with open(path, "wb") as f:
+            f.write(jsonl(EV1, EV2))
+        self.assertGreater(os.path.getsize(path), prefix_end)
+        self.assertEqual(self.assert_matches_read_committed_lines(path),
+                         [EV1, EV2])
 
 
 class TornLedgerSuite(unittest.TestCase):

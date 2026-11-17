@@ -488,6 +488,16 @@ PR #35~#41 merge분에 대한 attest·설치·검증 재측정(AGENTS.md §2.2)�
 
 한계(2026-11-12 야간, Private Home Server VS-1): (1) 이 구성은 HP 홈 서버의 전원 및 가정용 인터넷(`CB_WiFi_2G`) 가용성에 종속된다(완전한 외부 클라우드 이관은 `NF-0` 사용자 게이트 대기). (2) Let's Encrypt 인증서 발급에 따라 `hongscanner-srv.tail10d26b.ts.net` 도메인 이름은 공개 Certificate Transparency(CT) 로그에 기록된다(접근 자체는 Tailnet Grants로 차단되며 공개 DNS에 `100.x.y.z` `A` 레코드는 게시되지 않는다). (3) MagicDNS 이름 해석은 단말의 Tailscale DNS(`100.100.100.100`)를 전제하므로, 안드로이드 `private_dns_mode`는 기본값(`null`/`opportunistic`/`off`)을 유지해야 한다(수동 외부 DoT 호스트 지정 시 `*.ts.net` 조회 불가). (4) Tailscale Personal 무료 플랜은 개인 비상업적 사용 범위에서만 유효하다.
 
+### Evidence log (2026-11-17) — VS-A/B/C/D 운영 정련(PR #97, merge `15c9a3c`)·P13 2진 설치
+
+| gate | observed |
+|---|---|
+| VS-A(run_session) | `tools/run_session.sh` — collector·worker·세션 스탈의 서버측 경보 SLO(60초): 15초 워치독 폴(`HS_WATCHDOG_INTERVAL`)로 워커 유닛 실패(`WORKER_UNIT_FAILED`)와 세션 무진행(`SESSION_STALL_DETECTED`, 문턱 `HS_STALL_TIMEOUT_SECONDS` — 커밋 기본 900초)을 관측해 ops 사이드채널(`send_ops_alert`)로 승격, 세션당 1회 fail-closed — 침묵 장애 경로 제거 |
+| VS-B(sub_input) | `src/hs/sub_input.nim` — 양방향 선출 집합의 교차 중복을 결정론적 상승 우선으로 제거(`up_wins_dedup`): up에 있는 코드는 down 선출에서 제외되고 `crossDuplicates`로 반환되며, 컬렉터는 그 중복을 `cross_duplicate` 갭(`DATA_GAP_SUSPECTED`)으로 기록 — 세션 크래시 대신 정직 기록. serve.py의 가격-최신성 폴드(관측 위치가 최신인 upsert 우선)와는 별개 판정이며 계약 문언은 위 'Candidate scope' 참조 |
+| VS-C(serve) | `tools/api/serve.py` — 증분 offset/inode 폴드(경로·`st_dev`·`st_ino`·offset 일치 시 증분 바이트만 판독, 절단·치환·축소는 전체 리셋) + 기동 pre-warm: 2.0 GiB 원장 Cold 13.250s / Warm 0.062ms, `/mobile/market-view` 745.21ms |
+| VS-D(SSOT) | `tests/test_ssot_consistency.py` — 커밋 SSOT 미러의 기계적 일관성 스위트: event.schema.json ↔ notify_ledger(EVENT_TYPES·severity·data_quality·direction), delivery.schema.json ↔ notify_ledger, Dockerfile COPY ↔ attest.yml 스테이징. `tools/run_tests.sh` 게이트 등록 |
+| P3·P13(15c9a3c) | PR #97 merge `15c9a3c` push: ci 런 [44008447409](https://github.com/wintrover/hongscanner/actions/runs/44008447409) — 런 로그에서 `ALL CONTRACT SUITES PASSED` 실측. attest 런 [44008853736](https://github.com/wintrover/hongscanner/actions/runs/44008853736) → 설치 sha256: hongscanner `13b0bfd3a6368c1647bf55a3f91656449c7dd2417d6a3ce45be180edd13caa43`·collector `db240b50cedf2b564147f2dc3f11ccc35b123b23b148cd9df566e03c79d4905b` |
+
 ## Runs retention (P14 — runs/ 디스크 보존)
 
 정책·판정표·절차의 정본은 [docs/RETENTION.md](RETENTION.md)다. 요약: 판정표
