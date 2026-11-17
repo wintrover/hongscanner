@@ -17,7 +17,8 @@ committed single sources of truth:
   7. contracts/events/event.schema.json and delivery.schema.json <->
      the mobile policy copies: market_alert_channel.dart
      (marketEventTypes, marketKinds), push_service.dart (the dedupKey
-     kind literals), MainActivity.kt (the kind routing literals) and
+     kind literals), main.dart (the digest channel routing literal),
+     MainActivity.kt (the kind routing literals) and
      digest_list_screen.dart (the case-label event types)
 """
 
@@ -381,6 +382,25 @@ class SsotConsistencySuite(unittest.TestCase):
             unknown, set(),
             "digest_list_screen.dart case labels drifted from "
             "event.schema.json: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_main_kind_literals(self):
+        # main.dart's digest channel routing: every string literal the
+        # shell compares against message.kind.
+        path = os.path.join(REPO, "mobile", "lib", "main.dart")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"\bmessage\.kind\s*[!=]=\s*'([^']+)'", text)
+        self.assertTrue(
+            found,
+            "no message.kind == '...' comparisons in main.dart: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "main.dart kind literals drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
 
 
 if __name__ == "__main__":
