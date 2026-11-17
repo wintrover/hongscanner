@@ -57,6 +57,14 @@ assert_contains() { # desc haystack needle
   fi
 }
 
+assert_matches() { # desc haystack regex (grep -E)
+  if printf '%s' "$2" | grep -Eq -- "$3"; then
+    echo "ok   $1"; PASS=$((PASS + 1))
+  else
+    echo "FAIL $1: [$3] not matched"; FAILED=$((FAILED + 1))
+  fi
+}
+
 assert_file() { # desc path
   if [ -e "$2" ]; then
     echo "ok   $1"; PASS=$((PASS + 1))
@@ -488,6 +496,17 @@ chmod +x "$VSA/bin/systemctl"
 printf '{}\n' > "$VSA/notify-config.json"
 make_notify_stub "$VSA/bin" "$VSA/notify.log"
 
+# py-stamp: /bin/true stand-in for the worker (the dispatcher itself is
+# stubbed away in this scenario), except -c — run_session's _mono_stamp
+# needs a real interpreter to print mono_ns/boot_id. python3 (the gate's
+# own test interpreter) is enough: monotonic_ns predates 3.13.
+cat > "$VSA/py-stamp" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ]; then exec python3 "$@"; fi
+exit 0
+EOF
+chmod +x "$VSA/py-stamp"
+
 cat > "$VSA/collector-fail" <<'EOF'
 #!/usr/bin/env bash
 echo "collector crashing" >&2
@@ -501,7 +520,7 @@ RC=0
 PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
   HSNOTIFY_CONFIG="$VSA/notify-config.json" \
   HSCOLLECTOR_BIN="$VSA/collector-fail" \
-  HSCOLLECTOR_PYTHON=/bin/true \
+  HSCOLLECTOR_PYTHON="$VSA/py-stamp" \
   HS_NOTIFY_CMD="$VSA/bin/notify-stub" \
   HS_WATCHDOG_INTERVAL=0 \
   bash "$RUN_SESSION" --out="$VSA/out/sess-fail" >/dev/null 2>&1 || RC=$?
@@ -510,6 +529,12 @@ assert_contains "COLLECTOR_FAILED recorded" \
   "$(cat "$VSA/out/sess-fail.launcher.log")" "COLLECTOR_FAILED exit=4"
 assert_contains "notify observed collector failure" \
   "$(cat "$VSA/notify.log")" "exit=4"
+assert_matches "COLLECTOR_FAILED line carries t0_observed and stamps" \
+  "$(grep -F "COLLECTOR_FAILED exit=4" "$VSA/out/sess-fail.launcher.log")" \
+  "COLLECTOR_FAILED exit=4 t0_observed=1 mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+assert_matches "OPS_ALERT line carries the T2 stamps (no t0_observed)" \
+  "$(grep -F "OPS_ALERT title=" "$VSA/out/sess-fail.launcher.log")" \
+  "OPS_ALERT title=.+ body=.+ mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 
 # (b) worker systemd unit failed -> WORKER_UNIT_FAILED + notify
 : > "$VSA/notify.log"
@@ -518,7 +543,7 @@ PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
   SYSTEMCTL_IS_FAILED=1 \
   HSNOTIFY_CONFIG="$VSA/notify-config.json" \
   HSCOLLECTOR_BIN="$PF/collector-echo" \
-  HSCOLLECTOR_PYTHON=/bin/true \
+  HSCOLLECTOR_PYTHON="$VSA/py-stamp" \
   HS_NOTIFY_CMD="$VSA/bin/notify-stub" \
   HS_WATCHDOG_INTERVAL=0 \
   bash "$RUN_SESSION" --out="$VSA/out/sess-wfail" >/dev/null 2>&1 || RC=$?
@@ -527,6 +552,9 @@ assert_contains "WORKER_UNIT_FAILED recorded" \
   "$(cat "$VSA/out/sess-wfail.launcher.log")" "WORKER_UNIT_FAILED unit=hsnotify-sess-wfail"
 assert_contains "notify observed worker failure" \
   "$(cat "$VSA/notify.log")" "hsnotify-sess-wfail"
+assert_matches "WORKER_UNIT_FAILED line carries t0_observed and stamps" \
+  "$(grep -F "WORKER_UNIT_FAILED unit=hsnotify-sess-wfail" "$VSA/out/sess-wfail.launcher.log")" \
+  "WORKER_UNIT_FAILED unit=hsnotify-sess-wfail t0_observed=1 mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 
 # (c) silent stall -> SESSION_STALL_DETECTED + notify
 cat > "$VSA/collector-hang" <<'EOF'
@@ -540,7 +568,7 @@ RC=0
 PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
   HSNOTIFY_CONFIG="$VSA/notify-config.json" \
   HSCOLLECTOR_BIN="$VSA/collector-hang" \
-  HSCOLLECTOR_PYTHON=/bin/true \
+  HSCOLLECTOR_PYTHON="$VSA/py-stamp" \
   HS_NOTIFY_CMD="$VSA/bin/notify-stub" \
   HS_WATCHDOG_INTERVAL=1 \
   HS_STALL_TIMEOUT_SECONDS=1 \
@@ -550,6 +578,9 @@ assert_contains "SESSION_STALL_DETECTED recorded" \
   "$(cat "$VSA/out/sess-stall.launcher.log")" "SESSION_STALL_DETECTED"
 assert_contains "notify observed stall" \
   "$(cat "$VSA/notify.log")" "무응답"
+assert_matches "SESSION_STALL_DETECTED line carries t0_observed and stamps" \
+  "$(grep -F "SESSION_STALL_DETECTED" "$VSA/out/sess-stall.launcher.log")" \
+  "SESSION_STALL_DETECTED idle_seconds=[0-9]+ threshold=[0-9]+ t0_observed=1 mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 
 # ---------------------------------------------------------------- summary
 echo ""
