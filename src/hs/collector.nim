@@ -548,6 +548,11 @@ proc selectCandidates(records: var seq[RecOut]; cand: UpDownCandidates;
   ## bytes and recompute identically on replay. The gap itself still
   ## fires only for the selection truncation (excludedCount > 0).
   let sel = selectTopPerDirection(cand)
+  if sel.crossDuplicates.len > 0:
+    records.add(gapRecord("", "cross_duplicate",
+      "selection policy " & selectionPolicyId & ": up_wins_dedup count=" &
+      $sel.crossDuplicates.len & " codes=" & sel.crossDuplicates.join(","),
+      t))
   for i in 0 ..< sel.facts.len:
     let f = sel.facts[i]
     if f.excludedCount <= 0:

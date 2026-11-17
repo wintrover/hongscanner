@@ -2846,34 +2846,80 @@ class MarketFoldSuite(unittest.TestCase):
 
     def test_fold_cache_hit_and_invalidation(self):
         # same (path, size, mtime_ns) -> no rescan; a committed append
-        # changes the stat -> rescan serves the new recorded name
+        # resumes incrementally from the saved byte offset without
+        # re-reading earlier bytes
         path = self.write_input(
             om_chain(2, "1", om_rows(("005930", 75000))))
         projector = serve.Projector(self.runs, self.box.ledger)
         calls = []
-        real_fold = serve.fold_market_projection
+        real_fold = serve._fold_market_projection_inc
 
-        def counting_fold(p, session_date):
-            calls.append((p, session_date))
-            return real_fold(p, session_date)
-        serve.fold_market_projection = counting_fold
-        self.addCleanup(setattr, serve, "fold_market_projection",
+        def counting_fold(p, session_date, prev_state=None):
+            start_off = prev_state.offset if prev_state is not None else 0
+            st = real_fold(p, session_date, prev_state)
+            calls.append((start_off, st.offset))
+            return st
+        serve._fold_market_projection_inc = counting_fold
+        self.addCleanup(setattr, serve, "_fold_market_projection_inc",
                         real_fold)
         first = projector._market_projection(path, "2026-11-09")
         self.assertEqual(first, ({"005930": "삼성전자"}, [], {}))
         self.assertEqual(len(calls), 1)
-        # identical stat: served from the cache, fold not re-entered
+        self.assertEqual(calls[0][0], 0)
+        first_end = calls[0][1]
+        # identical stat: served from the cache at offset == st_size
         self.assertEqual(projector._market_projection(path, "2026-11-09"),
                          first)
-        self.assertEqual(len(calls), 1)
-        # a committed append changes size: rescan, new name served
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], (first_end, first_end))
+        # a committed append changes size: resumes from first_end, not 0
         with open(path, "ab") as f:
             f.write(canonical(om_chain(3, "1",
                                        om_rows(("006660", 45000)))) + b"\n")
         second = projector._market_projection(path, "2026-11-09")
         self.assertEqual(second[0], {"005930": "삼성전자",
                                      "006660": "LG전자"})
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[2][0], first_end)
+        self.assertGreater(calls[2][1], first_end)
+
+    def test_fold_incremental_torn_tail_truncate_and_replace(self):
+        # Torn tail leaves offset at the last committed LF; completing it
+        # consumes only the completed line; truncate or inode replacement
+        # resets cleanly from byte 0.
+        rec1 = canonical(om_chain(2, "1", om_rows(("005930", 75000)))) + b"\n"
+        rec2 = canonical(om_chain(3, "3", om_rows(("006660", 45000)))) + b"\n"
+        path = os.path.join(self.runs, "sess-inc", "input.hcj.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(rec1 + rec2[:15])
+        projector = serve.Projector(self.runs, self.box.ledger)
+        r1 = projector._market_projection(path, "2026-11-09")
+        self.assertEqual(r1[0], {"005930": "삼성전자"})
+        self.assertEqual(r1[1], [])
+        self.assertEqual(projector._fold_entry.offset, len(rec1))
+        # Complete the torn line -> snapshot closes cleanly
+        with open(path, "ab") as f:
+            f.write(rec2[15:])
+        r2 = projector._market_projection(path, "2026-11-09")
+        self.assertEqual(r2, serve.fold_market_projection(path, "2026-11-09"))
+        self.assertEqual(r2[0], {"005930": "삼성전자", "006660": "LG전자"})
+        self.assertEqual(len(r2[1]), 1)
+        # Truncate to shorter content -> rescans from 0
+        rec3 = canonical(om_chain(2, "1", om_rows(("005930", 76000)))) + b"\n"
+        with open(path, "wb") as f:
+            f.write(rec3)
+        r3 = projector._market_projection(path, "2026-11-09")
+        self.assertEqual(r3[0], {"005930": "삼성전자"})
+        self.assertEqual(r3[1], [])
+        # Replace via atomic rename (new inode, same or larger size) -> rescans
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(rec1 + rec2)
+        os.replace(tmp, path)
+        r4 = projector._market_projection(path, "2026-11-09")
+        self.assertEqual(r4[0], {"005930": "삼성전자", "006660": "LG전자"})
+        self.assertEqual(len(r4[1]), 1)
 
     def test_fold_cache_not_published_for_absent_file(self):
         # a vanished input folds to {} and publishes nothing: a later

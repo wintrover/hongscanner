@@ -217,6 +217,7 @@ type
     ## up, facts[1] is down — the §12.1 query order.
     selected*: UpDownCandidates
     facts*: array[2, DirectionSelection]
+    crossDuplicates*: seq[string]
 
 proc serr(seqNo: int; f: VendorFailure; msg: string): ref SubInputError =
   let e = newException(SubInputError, msg)
@@ -497,16 +498,20 @@ proc selectTopPerDirection*(cands: UpDownCandidates): SelectionResult =
   ## The one selection function between candidate derivation
   ## (vendor_input.upDownCandidates) and REG composition
   ## (composeRegData): keep each direction's first maxPerDirection
-  ## codes in vendor response order. Pure and deterministic — same
-  ## candidates, same selection. Candidates beyond the kept prefix are
-  ## excluded from this session's subscription: the caller records that
-  ## exclusion (the collector's subscription_truncated gap, judged
-  ## SUBSCRIPTION_TRUNCATED), it is never interpreted away. The
-  ## composeRegData caps stay untouched: this policy is what keeps the
-  ## derived sets inside them, not a replacement for the checks — a
-  ## 101-code set handed straight to composeRegData still raises.
+  ## codes in vendor response order, with deterministic rising-first
+  ## (up-wins) cross-direction deduplication. Any code present in the
+  ## selected up set is excluded from down and recorded in
+  ## crossDuplicates so the collector logs a cross_duplicate gap instead
+  ## of crashing the session. Pure and deterministic — same candidates,
+  ## same selection.
   result.selected.up = firstN(cands.up, maxPerDirection)
-  result.selected.down = firstN(cands.down, maxPerDirection)
+  var downFiltered: seq[string] = @[]
+  for code in cands.down:
+    if inArr(code, result.selected.up):
+      result.crossDuplicates.add(code)
+    else:
+      downFiltered.add(code)
+  result.selected.down = firstN(downFiltered, maxPerDirection)
   result.facts[0] = DirectionSelection(
     direction: "up", candidateCount: cands.up.len,
     selectedCount: result.selected.up.len,
@@ -515,7 +520,7 @@ proc selectTopPerDirection*(cands: UpDownCandidates): SelectionResult =
   result.facts[1] = DirectionSelection(
     direction: "down", candidateCount: cands.down.len,
     selectedCount: result.selected.down.len,
-    excludedCount: cands.down.len - result.selected.down.len,
+    excludedCount: downFiltered.len - result.selected.down.len,
     scopeExcludedCount: cands.downExcluded.len)
 
 # ---------------------------------------------------------------- composition

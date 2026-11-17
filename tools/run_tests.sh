@@ -51,5 +51,6 @@ run bash tests/test_build_contract.sh
 run bash tests/test_install_attested.sh
 run bash tests/test_retention_contract.sh
 run python3 tests/test_calendar_source.py
+run python3 tests/test_ssot_consistency.py
 
 echo "ALL CONTRACT SUITES PASSED"

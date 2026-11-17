@@ -73,6 +73,8 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
 | VS-F minimum sample sizes are unfrozen | the 0B matching-window minimum trade count, ka10080 minimum bar count and ka10027 minimum symbol count have no existing observational basis; freezing arbitrary numbers would corrupt determinism — they freeze after F-1 observation (fail-closed) | VS-F F-1 |
 | environment naming is declared but not yet unified in code | the VS-F contract names environments demo/real (official SDK `KIWOOM_MODE` values); the current replay.nim acceptance set still contains "prod" (P11 wording) — unification is announced for F-3; every sealed run to date is demo-only, so there is no impact | VS-F F-3 |
 | F-2 completion requires a real demo capture | passing the synthetic ka10080 contract tests proves implementation correctness only; F-2 is complete only with an actual demo-server ka10080 raw capture plus checksum verification (GATES VS-F F-0) | VS-F F-2 |
+| VS-A 60s failure alert is a server-side acceptance SLO, not device arrival | `T_detect` (<1s collector exit / <=15s watchdog) + `T_dispatch` (<=30s FCM HTTP v1 timeout) <= 45s covers FCM server acceptance; physical Android arrival (`T_delivery`) remains external/best-effort (P12) | VS-A runtime |
+| VS-C `<1s` market-view latency is the warm incremental path | after service restart, the cold path on a 2.0 GiB `input.hcj.jsonl` measured 13.250s; `serve.py` pre-warms the latest eligible run in a background thread on startup, and subsequent warm/append calls run in <10 ms | VS-C runtime |
 
 ## Explicit non-goals
 

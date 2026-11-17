@@ -114,6 +114,21 @@ fi
 mkdir -p "$LOG_DIR"          # the run dir itself stays the collector's (O_EXCL)
 touch "$LAUNCHER_LOG"
 
+# ------------------------------------------------------------- ops alert
+send_ops_alert() {
+  local title="$1"
+  local body="$2"
+  echo "OPS_ALERT title=$title body=$body" >> "$LAUNCHER_LOG"
+  if [ -n "${HS_NOTIFY_CMD:-}" ]; then
+    # shellcheck disable=SC2086 # the override command may carry arguments
+    $HS_NOTIFY_CMD "$title" "$body" \
+      >>"$LAUNCHER_LOG" 2>&1 || true
+  else
+    "$PY" "$OPS_ALERT_SCRIPT" --config "$NOTIFY_CONFIG" \
+      "$title" "$body" >>"$LAUNCHER_LOG" 2>&1 || true
+  fi
+}
+
 # ------------------------------------------------------ storage preflight
 # docs/RETENTION.md (Storage Preflight): the session needs room for the
 # day's raw input (observed ~4 GiB) plus sealed-copy/verify headroom
@@ -132,16 +147,8 @@ if ! printf '%s' "$PREFLIGHT_AVAIL" | grep -Eq '^[0-9]+$' || \
     echo "STORAGE_PREFLIGHT_FAILED: avail=${PREFLIGHT_AVAIL:-unavailable} required=$PREFLIGHT_MIN"
   } >> "$LAUNCHER_LOG"
   echo "run_session: STORAGE_PREFLIGHT_FAILED: avail=${PREFLIGHT_AVAIL:-unavailable} required=$PREFLIGHT_MIN" >&2
-  ALERT_TITLE="홍스캐너 STORAGE_PREFLIGHT_FAILED"
-  ALERT_BODY="세션 시작 저장공간 사전검증 실패: avail=${PREFLIGHT_AVAIL:-unavailable}바이트 required=$PREFLIGHT_MIN바이트"
-  if [ -n "${HS_NOTIFY_CMD:-}" ]; then
-    # shellcheck disable=SC2086 # the override command may carry arguments
-    $HS_NOTIFY_CMD "$ALERT_TITLE" "$ALERT_BODY" \
-      >>"$LAUNCHER_LOG" 2>&1 || true
-  else
-    "$PY" "$OPS_ALERT_SCRIPT" --config "$NOTIFY_CONFIG" \
-      "$ALERT_TITLE" "$ALERT_BODY" >>"$LAUNCHER_LOG" 2>&1 || true
-  fi
+  send_ops_alert "홍스캐너 STORAGE_PREFLIGHT_FAILED" \
+    "세션 시작 저장공간 사전검증 실패: avail=${PREFLIGHT_AVAIL:-unavailable}바이트 required=$PREFLIGHT_MIN바이트"
   exit 2
 fi
 echo "PREFLIGHT_OK avail=$PREFLIGHT_AVAIL" >> "$LAUNCHER_LOG"
@@ -150,17 +157,80 @@ echo "PREFLIGHT_OK avail=$PREFLIGHT_AVAIL" >> "$LAUNCHER_LOG"
 WORKER_MODE="none"
 WORKER_PID=0
 WORKER_STOPPED=0
+WATCHDOG_PID=0
+WATCHDOG_INTERVAL="${HS_WATCHDOG_INTERVAL:-15}"
+STALL_TIMEOUT_SECONDS="${HS_STALL_TIMEOUT_SECONDS:-900}"
+
+stop_watchdog() {
+  if [ "$WATCHDOG_PID" != "0" ]; then
+    kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=0
+  fi
+}
+
+start_watchdog() {
+  if ! printf '%s' "$WATCHDOG_INTERVAL" | grep -Eq '^[0-9]+$' || [ "$WATCHDOG_INTERVAL" -le 0 ]; then
+    return 0
+  fi
+  (
+    worker_alerted=0
+    stall_alerted=0
+    while true; do
+      sleep "$WATCHDOG_INTERVAL" || break
+      if [ "$WORKER_MODE" = "systemd" ] && [ "$worker_alerted" = "0" ]; then
+        if systemctl --user is-failed --quiet "$UNIT" 2>/dev/null; then
+          worker_alerted=1
+          echo "WORKER_UNIT_FAILED unit=$UNIT" >> "$LAUNCHER_LOG"
+          send_ops_alert "홍스캐너 워커 장애 ($SESSION)" \
+            "systemd 유닛 $UNIT 실패 감지 (로그: $LAUNCHER_LOG)"
+        fi
+      fi
+      if printf '%s' "$STALL_TIMEOUT_SECONDS" | grep -Eq '^[0-9]+$' && \
+         [ "$STALL_TIMEOUT_SECONDS" -gt 0 ] && [ "$stall_alerted" = "0" ]; then
+        now_s="$(date +%s)"
+        latest_s=0
+        for p in "$LAUNCHER_LOG" "$OUT_ABS/input.hcj.jsonl" "$EVENTS_FILE"; do
+          if [ -e "$p" ]; then
+            m="$(stat -c %Y "$p" 2>/dev/null || echo 0)"
+            if [ "$m" -gt "$latest_s" ]; then
+              latest_s="$m"
+            fi
+          fi
+        done
+        if [ "$latest_s" -gt 0 ] && [ $((now_s - latest_s)) -ge "$STALL_TIMEOUT_SECONDS" ]; then
+          stall_alerted=1
+          idle_s=$((now_s - latest_s))
+          echo "SESSION_STALL_DETECTED idle_seconds=$idle_s threshold=$STALL_TIMEOUT_SECONDS" >> "$LAUNCHER_LOG"
+          send_ops_alert "홍스캐너 세션 무응답 ($SESSION)" \
+            "세션 $SESSION 에서 ${idle_s}초 동안 신규 기록이 없습니다"
+        fi
+      fi
+    done
+  ) &
+  WATCHDOG_PID=$!
+}
 
 stop_worker() {
+  stop_watchdog
   if [ "$WORKER_STOPPED" = "1" ]; then return 0; fi
   WORKER_STOPPED=1
   if [ "$WORKER_MODE" = "systemd" ]; then
+    local pre_failed=0
+    if systemctl --user is-failed --quiet "$UNIT" 2>/dev/null; then
+      pre_failed=1
+    fi
     systemctl --user stop "$UNIT" >>"$LAUNCHER_LOG" 2>&1 || true
     local state
     state="$(systemctl --user show "$UNIT" \
                --property=ActiveState --property=ExecMainStatus \
                2>/dev/null | tr '\n' ' ')"
     echo "WORKER_UNIT $UNIT ${state:-state=<unloaded>}" >>"$LAUNCHER_LOG"
+    if [ "$pre_failed" = "1" ] && ! grep -qF "WORKER_UNIT_FAILED unit=$UNIT" "$LAUNCHER_LOG" 2>/dev/null; then
+      echo "WORKER_UNIT_FAILED unit=$UNIT" >> "$LAUNCHER_LOG"
+      send_ops_alert "홍스캐너 워커 장애 ($SESSION)" \
+        "systemd 유닛 $UNIT 실패 상태로 종료됨 ($state)"
+    fi
     systemctl --user reset-failed "$UNIT" 2>/dev/null || true
   elif [ "$WORKER_PID" != "0" ]; then
     kill -TERM "$WORKER_PID" 2>/dev/null || true
@@ -225,6 +295,7 @@ start_worker
 
 "$COLLECTOR" "$@" >>"$LAUNCHER_LOG" 2>&1 &
 COLLECTOR_PID=$!
+start_watchdog
 trap 'kill -TERM "$COLLECTOR_PID" 2>/dev/null || true' INT TERM
 
 COLLECTOR_RC=0
@@ -240,7 +311,13 @@ while true; do
   break
 done
 
+stop_watchdog
 echo "COLLECTOR_EXIT=$COLLECTOR_RC" >>"$LAUNCHER_LOG"
+if [ "$COLLECTOR_RC" -ne 0 ]; then
+  echo "COLLECTOR_FAILED exit=$COLLECTOR_RC" >>"$LAUNCHER_LOG"
+  send_ops_alert "홍스캐너 세션 장애 ($SESSION)" \
+    "수집기 비정상 종료 (exit=$COLLECTOR_RC, 로그: $LAUNCHER_LOG)"
+fi
 
 # Bounded tail drain (best effort, NOT a delivery guarantee): events
 # appended in the collector's final seconds — the close protocol's

@@ -348,80 +348,95 @@ def read_last_observed_at(path):
     return observed_at
 
 
-def fold_market_projection(path, session_date):
-    """The §3.7 market fold of one input.hcj.jsonl — one streaming scan,
-    three pure derivations of recorded bytes: the ka10027 name
-    dictionary, the ka10027 chain-pair price snapshots and the ka10081
-    MA20 close sums. Returns (names, snapshots, ma20): names is symbol
-    -> stock name (file order, last record wins); snapshots is the list
-    of {symbol: price} maps, one per completed ka10027 chain-pair in
-    file order; ma20 is symbol -> the integer sum of the last
-    MARKET_MA20_DAYS completed daily closes, absent for symbols with
-    fewer than twenty completed recorded rows.
+class _MarketFoldState:
+    """Incremental state for fold_market_projection (VS-C)."""
+    __slots__ = (
+        "path", "session_date", "st_dev", "st_ino", "offset", "line_no",
+        "names", "snapshots", "chain", "pair_rising", "bars", "ma20",
+    )
 
-    Line discipline is the committed-lines rule: a trailing line
-    without LF is not committed and stops the walk; a malformed
-    committed line is a DataFault. A rest_resp envelope the recorder
-    itself guarantees (raw object, string api_id, hex body_hex)
-    faulting that guarantee is corruption, also a DataFault. The body
-    content is NOT guaranteed (the recorder preserves every response
-    verbatim, successful or not): a body that does not decode to a
-    JSON object carrying its list key simply contributes nothing — a
-    recorded non-success response carries no ranking and no bars.
-    Rows and query fields the folds depend on are the dependent
-    recorded shape: a ka10027 ranking row must be an object with
-    string stk_cd, string stk_nm and a SIGNED_PRICE_RE cur_prc; a
-    ka10027 query must carry the recorded sort_tp (MARKET_SORT_RISING
-    or MARKET_SORT_FALLING), an integer page >= 1 and a string
-    cont_yn; a ka10081 row must be an object with a BAR_DT_RE dt and a
-    DAY_CLOSE_RE cur_prc; a ka10081 query must carry a string stk_cd.
-    Violations are DataFaults — the event fold's symbol/rank
-    discipline.
+    def __init__(self, path, session_date, st_dev=0, st_ino=0):
+        self.path = path
+        self.session_date = session_date
+        self.st_dev = st_dev
+        self.st_ino = st_ino
+        self.offset = 0
+        self.line_no = 0
+        self.names = {}
+        self.snapshots = []
+        self.chain = None
+        self.pair_rising = None
+        self.bars = {}
+        self.ma20 = {}
 
-    The chain-pair rule (rest_resp records carry no timestamp: record
-    order is time order): ka10027 records group into chains — a chain
-    ends when cont_yn leaves "Y", and a new chain starts on a sort_tp
-    change or a page-1 record (an interrupted chain is dropped, its
-    prices never enter a snapshot). Chains pair rising -> falling in
-    file order: a completed falling chain closes the pair and appends
-    the union of both chains' prices (falling rows win a same-symbol
-    collision) as one snapshot; a falling chain completing with no
-    pending rising chain contributes its own prices alone. A pair whose
-    price union is empty contributes no snapshot: a pre-open poll whose
-    response affirms success with no ranking rows still closes a pair,
-    but an empty snapshot can satisfy no correspondence subset and holds
-    no price to project — counting it would drift the snapshot index
-    against the event fold's candidate groups (non-candidate groups
-    open no group index) and break the opening mode's same-index
-    coupling. The snapshot list counts price-bearing pairs only. The ka10081
-    fold keeps, per symbol, the first MARKET_MA20_DAYS distinct rows
-    with dt < session_date in file order (rows are dt-descending, the
-    session's in-progress bar carries dt == session_date and is never
-    summed); the session_date is the selected run's own recorded
-    config value, validated here before any row is folded."""
-    names = {}
-    snapshots = []
-    ma20 = {}
+
+def _clone_fold_state(src):
+    dst = _MarketFoldState(src.path, src.session_date, src.st_dev, src.st_ino)
+    dst.offset = src.offset
+    dst.line_no = src.line_no
+    dst.names = dict(src.names)
+    dst.snapshots = list(src.snapshots)
+    dst.chain = [src.chain[0], dict(src.chain[1])] \
+        if src.chain is not None else None
+    dst.pair_rising = dict(src.pair_rising) \
+        if src.pair_rising is not None else None
+    dst.bars = {k: [set(v[0]), v[1], v[2]] for k, v in src.bars.items()}
+    dst.ma20 = dict(src.ma20)
+    return dst
+
+
+def _fold_market_projection_inc(path, session_date, prev_state=None):
+    """Incremental §3.7 market fold over committed lines of input.hcj.jsonl.
+
+    Resumes from prev_state.offset when (path, session_date, st_dev, st_ino)
+    match and st_size >= prev_state.offset; otherwise starts fresh from 0.
+    Torn trailing lines (no LF) are never consumed and leave offset at the
+    last committed LF. Returns a new _MarketFoldState on success without
+    mutating prev_state if a DataFault is raised.
+    """
     if not isinstance(session_date, str) \
             or SESSION_DATE_RE.match(session_date) is None:
         raise DataFault("%s MA20 fold session_date is not the recorded "
                         "YYYY-MM-DD shape" % INPUT_JSONL)
     session_digits = session_date.replace("-", "")
-    chain = None         # [sort_tp, prices] of the chain being read
-    pair_rising = None   # the completed rising chain's prices
-    bars = {}            # symbol -> [dts seen, close sum, row count]
     try:
+        st = os.stat(path)
         f = open(path, "rb")
     except FileNotFoundError:
-        return names, snapshots, ma20
+        return _MarketFoldState(path, session_date)
     except OSError as exc:
         raise DataFault("%s unreadable: %s"
                         % (os.path.basename(path), _reason(exc)))
     name = os.path.basename(path)
     with f:
-        for i, raw in enumerate(f, start=1):
+        if prev_state is not None \
+                and prev_state.path == path \
+                and prev_state.session_date == session_date \
+                and prev_state.st_dev == st.st_dev \
+                and prev_state.st_ino == st.st_ino \
+                and st.st_size >= prev_state.offset:
+            if st.st_size == prev_state.offset:
+                return prev_state
+            state = _clone_fold_state(prev_state)
+            f.seek(state.offset)
+        else:
+            state = _MarketFoldState(path, session_date, st.st_dev, st.st_ino)
+        names = state.names
+        snapshots = state.snapshots
+        chain = state.chain
+        pair_rising = state.pair_rising
+        bars = state.bars
+        ma20 = state.ma20
+        i = state.line_no
+        committed_offset = state.offset
+        while True:
+            raw = f.readline()
+            if not raw:
+                break
             if not raw.endswith(b"\n"):
                 break  # torn tail: a concurrent append, not committed yet
+            i += 1
+            committed_offset = f.tell()
             raw = raw[:-1]
             if not raw:
                 raise DataFault("%s line %d is empty" % (name, i))
@@ -560,10 +575,20 @@ def fold_market_projection(path, session_date):
                             entry[0].add(dt)
                             entry[1] += int(cur_prc)
                             entry[2] += 1
-    for symbol, entry in bars.items():
-        if entry[2] >= MARKET_MA20_DAYS:
-            ma20[symbol] = entry[1]
-    return names, snapshots, ma20
+                        if entry is not None and entry[2] >= MARKET_MA20_DAYS:
+                            ma20[symbol] = entry[1]
+        state.offset = committed_offset
+        state.line_no = i
+        state.chain = chain
+        state.pair_rising = pair_rising
+        return state
+
+
+def fold_market_projection(path, session_date):
+    """The §3.7 market fold of one input.hcj.jsonl — one streaming scan,
+    three pure derivations of recorded bytes."""
+    state = _fold_market_projection_inc(path, session_date)
+    return state.names, state.snapshots, state.ma20
 
 
 def _ma20_distance_order(entries, above):
@@ -699,6 +724,42 @@ class Projector:
         # slot is guarded by one lock.
         self._fold_lock = threading.Lock()
         self._fold_entry = None
+
+    def prewarm_market_projection_async(self):
+        """Warm the latest eligible run's §3.7 market fold in the background
+        on server startup so the first /mobile/market-view request hits the
+        warm incremental path instead of paying the cold-start scan."""
+        def _warm():
+            try:
+                names = self._session_names()
+                eligible = []
+                for name in names:
+                    run_dir = os.path.join(self.runs_root, name)
+                    input_path = os.path.join(run_dir, INPUT_JSONL)
+                    events_path = os.path.join(run_dir, EVENTS_JSONL)
+                    if not (os.path.isfile(input_path)
+                            and os.path.isfile(events_path)):
+                        continue
+                    config = read_head_config(input_path)
+                    if config is None:
+                        continue
+                    if config.get("environment") not in MARKET_ENVIRONMENTS:
+                        continue
+                    session_date = config.get("session_date")
+                    if not isinstance(session_date, str) \
+                            or SESSION_DATE_RE.match(session_date) is None:
+                        continue
+                    eligible.append((name, session_date,
+                                     read_last_observed_at(events_path)))
+                if eligible:
+                    session, session_date, _ = max(
+                        eligible, key=lambda r: (r[1], r[2] or "", r[0]))
+                    self._market_projection(
+                        os.path.join(self.runs_root, session, INPUT_JSONL),
+                        session_date)
+            except Exception:
+                pass  # best-effort prewarm; real requests surface DataFaults
+        threading.Thread(target=_warm, daemon=True).start()
 
     # ---- run directories -------------------------------------------------
 
@@ -920,30 +981,11 @@ class Projector:
         cached — a corrupt file faults on every request until it is
         fixed. The slot holds one entry: a different selected run
         rescans."""
-        try:
-            before = os.stat(path)
-        except FileNotFoundError:
-            return {}, [], {}
-        except OSError as exc:
-            raise DataFault("%s unreadable: %s"
-                            % (os.path.basename(path), _reason(exc)))
         with self._fold_lock:
-            entry = self._fold_entry
-        if entry is not None and entry[:3] == (path, before.st_size,
-                                               before.st_mtime_ns):
-            return entry[3], entry[4], entry[5]
-        names, snapshots, ma20 = fold_market_projection(path, session_date)
-        try:
-            after = os.stat(path)
-        except OSError:
-            return names, snapshots, ma20
-        if (after.st_size, after.st_mtime_ns) \
-                == (before.st_size, before.st_mtime_ns):
-            with self._fold_lock:
-                self._fold_entry = (path, before.st_size,
-                                    before.st_mtime_ns, names, snapshots,
-                                    ma20)
-        return names, snapshots, ma20
+            state = _fold_market_projection_inc(path, session_date,
+                                                self._fold_entry)
+            self._fold_entry = state
+            return state.names, state.snapshots, state.ma20
 
     @staticmethod
     def _market_item(ev, rank, names, pos=None):
@@ -1628,6 +1670,7 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
+    projector.prewarm_market_projection_async()
     print("SERVE %s:%d" % server.server_address, flush=True)
     try:
         server.serve_forever(poll_interval=0.2)
