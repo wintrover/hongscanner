@@ -15,8 +15,10 @@ committed single sources of truth:
      hardcoded event-type copies: TOP10_EVENT_TYPES,
      AGGREGATION_STARTED)
   7. contracts/events/event.schema.json and delivery.schema.json <->
-     mobile/lib/services/market_alert_channel.dart (the Dart routing
-     copies: marketEventTypes, marketKinds)
+     the mobile policy copies: market_alert_channel.dart
+     (marketEventTypes, marketKinds), push_service.dart (the dedupKey
+     kind literals), MainActivity.kt (the kind routing literals) and
+     digest_list_screen.dart (the case-label event types)
 """
 
 import ast
@@ -316,6 +318,69 @@ class SsotConsistencySuite(unittest.TestCase):
             unknown, set(),
             "market_alert_channel.dart marketKinds drifted from "
             "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_push_service_kind_literals(self):
+        # push_service.dart's dedupKey kind test: the message-kind
+        # literals the file compares with == / != (its only
+        # equality-compared string literals).
+        path = os.path.join(
+            REPO, "mobile", "lib", "services", "push_service.dart")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"[!=]=\s*'([^']+)'", text)
+        self.assertTrue(
+            found,
+            "no '...' equality comparisons in push_service.dart: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "push_service.dart kind literals drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_kotlin_kind_literals(self):
+        # MainActivity.kt's kind routing: every string literal compared
+        # against the `kind` argument (the batch judgment and the
+        # digest single-slot test).
+        path = os.path.join(
+            REPO, "mobile", "android", "app", "src", "main", "kotlin",
+            "com", "hongscanner", "hongscanner", "MainActivity.kt")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"\bkind\s*[!=]=\s*\"([^\"]+)\"", text)
+        self.assertTrue(
+            found,
+            "no kind == \"...\" comparisons in MainActivity.kt: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "MainActivity.kt kind literals drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_event_schema_covers_digest_list_case_types(self):
+        # digest_list_screen.dart's rank-change label switch: the
+        # event-type-shaped case labels.
+        path = os.path.join(
+            REPO, "mobile", "lib", "screens", "digest_list_screen.dart")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"case\s+'([A-Z0-9_]+)':", text)
+        self.assertTrue(
+            found,
+            "no event-type-shaped case labels in "
+            "digest_list_screen.dart: the extraction went blind")
+
+        enum = set(load_event_type_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "digest_list_screen.dart case labels drifted from "
+            "event.schema.json: %s" % sorted(unknown))
 
 
 if __name__ == "__main__":
