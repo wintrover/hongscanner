@@ -70,6 +70,14 @@ the event ledger is opened with the writer lock). Each tick
      in-sweep sleep): a 429 Retry-After wait never delays a new event.
      Nothing is parked — the resident worker resumes its own pairs.
 
+Under a service manager the worker speaks the sd_notify(3) protocol
+($NOTIFY_SOCKET): READY=1 once the single-writer locks are held and the
+watch loop begins (systemd Type=notify), WATCHDOG=1 on every tick
+(WatchdogSec=30, tools/run_session.sh) — a hung tick starves the
+manager's watchdog and the worker is restarted instead of sitting
+stuck. The notify send is best-effort datagram I/O: no socket or a
+failed send is a no-op that never breaks a tick.
+
 Run scope (README §1): the resident worker dispatches only facts of
 the run it watches. The scope is the session_id learned from the
 watched file's own ingested bytes (every fact carries it; the file is
@@ -123,6 +131,7 @@ contract violation (watched file shrank, torn report input).
 import json
 import os
 import signal
+import socket
 import sys
 import time
 
@@ -179,6 +188,28 @@ def compose_admission_units(events, cfg, allow_audible=True):
     if digest:
         units.append(("digest", digest))
     return units
+
+
+def _sd_notify(payload):
+    """One best-effort sd_notify(3) datagram to the service manager.
+    $NOTIFY_SOCKET is the manager's AF_UNIX SOCK_DGRAM socket (set in
+    the service environment for Type=notify units); a path starting with
+    '@' names the ABSTRACT namespace and is sent as a leading NUL byte.
+    No socket (unset or empty) or a failed send is a no-op: the
+    supervision protocol never judges or breaks the dispatch work."""
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+    if notify_socket.startswith("@"):
+        notify_socket = "\0" + notify_socket[1:]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        try:
+            sock.sendto(payload, notify_socket)
+        except OSError:
+            pass
+    finally:
+        sock.close()
 
 
 class Dispatcher:
@@ -729,15 +760,27 @@ class Dispatcher:
         SIGTERM/SIGINT. Returns the process exit code: 0 on clean
         shutdown. Contract/I-O violations raise (LedgerFault -> exit
         4); a refused batch is a stderr alarm and a next-tick retry,
-        never a skipped line."""
+        never a skipped line. With $NOTIFY_SOCKET set the loop also
+        speaks sd_notify(3): READY=1 once (the single-writer locks are
+        already held — acquired in the constructor — and the loop is
+        beginning) and WATCHDOG=1 after every tick, so a hung tick
+        starves the manager's WatchdogSec clock into a restart."""
         poll = self.cfg["watch_poll_seconds"]
         offset = 0
         identity = None
         self._log("watch start events=%s poll_seconds=%g pid=%d"
                   % (events_path, poll, os.getpid()))
+        # The single-writer locks are held (constructor) and the loop
+        # begins: the Type=notify start is complete. No $NOTIFY_SOCKET
+        # (one-shot tests, development mode) -> no-op.
+        _sd_notify(b"READY=1")
         while not self._stop:
             offset, identity = self.watch_tick(events_path, offset,
                                                identity)
+            # One heartbeat per completed tick (WatchdogSec=30 in the
+            # session launcher): a tick that hangs never feeds the
+            # clock and the manager restarts the worker.
+            _sd_notify(b"WATCHDOG=1")
             self.counts["watch_ticks"] = \
                 self.counts.get("watch_ticks", 0) + 1
             if not self._stop:

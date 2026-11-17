@@ -564,16 +564,23 @@ Python register 프로세스 (notify_register.py)
   <abs events 파일>`). 세션 런처 `tools/run_session.sh`가 collector
   인자를 그대로 전달하며 worker에 이 세션의 events 파일 경로를
   넘기고 시작·종료를 명시적으로 관리한다: collector는 포그라운드,
-  worker는 `systemd-run --user --unit=hsnotify-<session>`(Type=exec,
-  Restart=on-failure, RestartSec=2, —collect 없이 — failed 상태
-  관측 보존)의 transient unit이고, 런처 trap EXIT에서 유닛을 명시적
-  stop한 뒤 ActiveState·ExecMainStatus를 런처 로그
+  worker는 `systemd-run --user --unit=hsnotify-<session>`(Type=notify,
+  WatchdogSec=30, Restart=on-failure, RestartSec=2, —collect 없이 —
+  failed 상태 관측 보존)의 transient unit이고, 런처 trap EXIT에서
+  유닛을 명시적 stop한 뒤 ActiveState·ExecMainStatus를 런처 로그
   (`runs/<session>.launcher.log`, collector exit 4의 사유 캡처 포함)에
   기록하고 reset-failed로 정리한다 — transient unit의 부모는 service
   manager라 런처 종료만으로 worker가 죽지 않기 때문에 명시적 stop이
   계약이다. worker의 프로세스 감시·재시작은 systemd에 위임한다:
-  SIGTERM 정상 종료(exit 0)은 재시작을 유발하지 않고, 계약
-  위반·결함 종료(3·4)만 재시작한다. systemd 미사용 폴백(백그라운드
+  worker는 sd_notify(3) 프로토콜($NOTIFY_SOCKET, AF_UNIX SOCK_DGRAM
+  datagram — 선두 `@`는 abstract 네임스페이스)을 stdlib 소켓으로 직접
+  말한다: 단독 작성자 lock 확보 뒤 루프 시작에 `READY=1` 1회
+  (Type=notify의 기동 완료 신호), 매 틱 완료마다 `WATCHDOG=1` — 틱이
+  30초(WatchdogSec) 이상 멈추면 watchdog이 굶어 systemd가 worker를
+  재시작한다. 소켓 부재·전송 실패는 no-op다(감시 계약이 전송 계약을
+  깨지 않는다). SIGTERM 정상 종료(exit 0)은 재시작을 유발하지 않고,
+  계약 위반·결함 종료(3·4)와 watchdog 만료만 재시작한다. systemd
+  미사용 폴백(백그라운드
   프로세스)은 **개발·시험 모드로만** 런처 로그에 마킹한다 — 운영
   성공이 아니며, 실운영 승인 조건에 systemd 사용은 필수다.
 
@@ -583,7 +590,9 @@ Python register 프로세스 (notify_register.py)
   틱 계약 전반 — 비-LF 꼬리 미소비, 배치 all-or-nothing·멱등,
   (dev,ino) 전체 재스캔, 틱 사이 재시도 이연(429 중 신규 이벤트
   지속), shrink LedgerFault, watch_poll_seconds 검증, SIGTERM 정상
-  종료 + 재기동 멱등(서브프로세스), **실행 범위**(scope 미확인 0발송·
+  종료 + 재기동 멱등(서브프로세스), **sd_notify 계약**($NOTIFY_SOCKET
+  부재 no-op·datagram 전달(경로형·abstract형 `@`→NUL)·상주 프로세스의
+  READY=1 1회·틱당 WATCHDOG=1), **실행 범위**(scope 미확인 0발송·
   과거 세션 scope_skipped·재시작 미전달 재전송·세션 내 suppress);
   **admission 게이트**(기본 안B·
   admission 섹션 엄격 검증·부분 병합·suppress=type_skipped·전달 기록
@@ -608,8 +617,10 @@ Python register 프로세스 (notify_register.py)
 - OAuth 실측: 서비스 계정 JWT 교환의 실측 응답(expires_in 형상),
   token_command 경로의 실제 gcloud 출력 형상.
 - 상주 worker의 실측: 세션 런처(`tools/run_session.sh`) 경유 기동·
-  종료·유닛 상태 기록, systemd unit(Type=exec, Restart=on-failure)
-  아래의 장시간 상주 관측, 실 세션 이벤트의 observed_at→ingest→POST
+  종료·유닛 상태 기록, systemd unit(Type=notify, WatchdogSec=30,
+  Restart=on-failure) 아래의 장시간 상주 관측(READY=1 기동 완료 신호
+  수신·틱당 WATCHDOG=1의 watchdog 리스타트 경로 포함), 실 세션
+  이벤트의 observed_at→ingest→POST
   지연 분포. watch 모드의 프로세스쌍 드릴(SIGKILL 재시작 무중복
   포함)은 `tools/notify/drill/drill_watch.sh`가 게이트에 등록돼
   있고, 실측 라이브 관측이 남아 있다.
