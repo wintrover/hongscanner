@@ -493,7 +493,7 @@ PR #35~#41 merge분에 대한 attest·설치·검증 재측정(AGENTS.md §2.2)�
 | gate | observed |
 |---|---|
 | VS-A(run_session) | `tools/run_session.sh` — collector·worker·세션 스탈의 서버측 경보 SLO(60초): 15초 워치독 폴(`HS_WATCHDOG_INTERVAL`)로 워커 유닛 실패(`WORKER_UNIT_FAILED`)와 세션 무진행(`SESSION_STALL_DETECTED`, 문턱 `HS_STALL_TIMEOUT_SECONDS` — 커밋 기본 900초)을 관측해 ops 사이드채널(`send_ops_alert`)로 승격, 세션당 1회 fail-closed — 침묵 장애 경로 제거 |
-| VS-B(sub_input) | `src/hs/sub_input.nim` — 양방향 선출 집합의 교차 중복을 결정론적 상승 우선으로 제거(`up_wins_dedup`): up에 있는 코드는 down 선출에서 제외되고 `crossDuplicates`로 반환되며, 컬렉터는 그 중복을 `cross_duplicate` 갭(`DATA_GAP_SUSPECTED`)으로 기록 — 세션 크래시 대신 정직 기록. serve.py의 가격-최신성 폴드(관측 위치가 최신인 upsert 우선)와는 별개 판정이며 계약 문언은 위 'Candidate scope' 참조 |
+| VS-B(sub_input) | `src/hs/sub_input.nim` — 양방향 선출 집합의 교차 중복을 결정론적 상승 우선으로 제거(`up_wins_dedup`): up에 있는 코드는 down 선출에서 제외되고 `crossDuplicates`로 반환되며, 컬렉터는 그 중복을 `cross_duplicate` 갭(`DATA_GAP_SUSPECTED`)으로 기록. 같은 방향 목록 안의 반복 코드는 첫 등장 승(`dedupFirstWins`)으로 제거하고 `intraUpDuplicates`/`intraDownDuplicates`로 반환해 `duplicate_code` 갭으로 기록 — 세션 크래시 대신 정직 기록. serve.py의 가격-최신성 폴드(관측 위치가 최신인 upsert 우선)와는 별개 판정이며 계약 문언은 위 'Candidate scope' 참조 |
 | VS-C(serve) | `tools/api/serve.py` — 증분 offset/inode 폴드(경로·`st_dev`·`st_ino`·offset 일치 시 증분 바이트만 판독, 절단·치환·축소는 전체 리셋) + 기동 pre-warm: 2.0 GiB 원장 Cold 13.250s / Warm 0.062ms, `/mobile/market-view` 745.21ms |
 | VS-D(SSOT) | `tests/test_ssot_consistency.py` — 커밋 SSOT 미러의 기계적 일관성 스위트: event.schema.json ↔ notify_ledger(EVENT_TYPES·severity·data_quality·direction), delivery.schema.json ↔ notify_ledger, Dockerfile COPY ↔ attest.yml 스테이징. `tools/run_tests.sh` 게이트 등록 |
 | P3·P13(15c9a3c) | PR #97 merge `15c9a3c` push: ci 런 [44008447409](https://github.com/wintrover/hongscanner/actions/runs/44008447409) — 런 로그에서 `ALL CONTRACT SUITES PASSED` 실측. attest 런 [44008853736](https://github.com/wintrover/hongscanner/actions/runs/44008853736) → 설치 sha256: hongscanner `13b0bfd3a6368c1647bf55a3f91656449c7dd2417d6a3ce45be180edd13caa43`·collector `db240b50cedf2b564147f2dc3f11ccc35b123b23b148cd9df566e03c79d4905b` |
@@ -669,7 +669,9 @@ sidecar + collector core)가 계약 스위트와 함께 구현·merge됐다. 단
   담당한다. 양방향 선출 집합의 교차 중복은 `selectTopPerDirection`에서
   결정론적 상승 우선(up-wins)으로 중복 제거하며, 제외된 중복 종목과
   규칙(`up_wins_dedup`)을 `cross_duplicate` 갭(`DATA_GAP_SUSPECTED`)으로
-  기록한다(`composeRegData` 직접 호출의 중복 거부는 방어선으로 유지).
+  기록한다. 같은 방향 목록 안의 반복 코드는 첫 등장 승으로 중복 제거하고
+  `duplicate_code` 갭으로 기록한다(두 경우 모두 세션을 종료하지 않는다;
+  `composeRegData` 직접 호출의 중복 거부는 방어선으로 유지).
 
 ## PH-1 / PH-2
 

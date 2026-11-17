@@ -553,6 +553,15 @@ proc selectCandidates(records: var seq[RecOut]; cand: UpDownCandidates;
       "selection policy " & selectionPolicyId & ": up_wins_dedup count=" &
       $sel.crossDuplicates.len & " codes=" & sel.crossDuplicates.join(","),
       t))
+  if sel.intraUpDuplicates.len > 0 or sel.intraDownDuplicates.len > 0:
+    records.add(gapRecord("", "duplicate_code",
+      "selection policy " & selectionPolicyId &
+      ": intra_direction_dedup up_count=" &
+      $sel.intraUpDuplicates.len & " up_codes=" &
+      sel.intraUpDuplicates.join(",") & " down_count=" &
+      $sel.intraDownDuplicates.len & " down_codes=" &
+      sel.intraDownDuplicates.join(",") &
+      " — first appearance wins, the repeats are not registered", t))
   for i in 0 ..< sel.facts.len:
     let f = sel.facts[i]
     if f.excludedCount <= 0:

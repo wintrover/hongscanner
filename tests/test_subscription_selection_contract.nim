@@ -807,6 +807,70 @@ block crossDuplicateUpWins:
   check("cross-dup stream: verify declares MATCH",
         v.verdict == vMatch and v.matched)
 
+# ------------------------------------------- VS-B intra-direction dedup
+
+block intraDirectionDuplicate:
+  ## A same-direction repeat is a vendor answer this scanner must
+  ## survive: the first appearance keeps its position (vendor order is
+  ## the only ranking), the repeat is recorded as a duplicate_code gap,
+  ## and composeRegData still refuses any duplicate that reaches it.
+  let cands = UpDownCandidates(
+    up: @["005930", "000660", "005930", "035420"],
+    down: @["051910", "051910", "005380"])
+  let sel = selectTopPerDirection(cands)
+  check("intra-dup: up keeps first appearances in order",
+        sel.selected.up == @["005930", "000660", "035420"])
+  check("intra-dup: down keeps first appearances in order",
+        sel.selected.down == @["051910", "005380"])
+  check("intra-dup: repeated up code recorded",
+        sel.intraUpDuplicates == @["005930"])
+  check("intra-dup: repeated down code recorded",
+        sel.intraDownDuplicates == @["051910"])
+  check("intra-dup: no cross duplicates", sel.crossDuplicates.len == 0)
+  check("intra-dup: dedup is not counted as truncation",
+        sel.facts[0].excludedCount == 0 and sel.facts[1].excludedCount == 0)
+  let reg = composeRegData(sel.selected.up, sel.selected.down)
+  check("intra-dup: composeRegData accepts the deduplicated sets",
+        reg.len == 1 and reg[0].codes == @["005930", "000660", "035420",
+                                           "051910", "005380"])
+
+  ## End-to-end collector session with repeated codes in one direction:
+  ## the session completes, records the duplicate_code gap, emits
+  ## DATA_GAP_SUSPECTED, and verifies MATCH.
+  var c = newCollector()
+  var outp = c.cfg.preambleRecords()
+  proc feed(line: string) =
+    var recs: seq[RecOut]
+    discard c.handleEvent(line, recs)
+    for r in recs: outp.add(r)
+  feed(ev("ready", ts))
+  feed(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  feed(evWs(1, ackPayload()))
+  feed(evRest("up", 1, 200, "N", "",
+              restBody(@["005930", "005930", "000660"])))
+  feed(evRest("down", 1, 200, "N", "", restBody(@["051910", "051910"])))
+  feed(evWs(1, ackPayload()))
+  feed(evWs(1, tick0B(item = "005930", t20 = "090500")))
+  feed(evWs(1, state0S(value215 = "4")))
+  feed(evWs(1, ackPayload(trnm = "REMOVE", code = 0)))
+  var hasIntraGap = false
+  for r in outp:
+    if r.kind == kGap and r.raw.get("what").strVal == "duplicate_code" and
+       "intra_direction_dedup" in r.raw.get("detail").strVal and
+       "005930" in r.raw.get("detail").strVal and
+       "051910" in r.raw.get("detail").strVal:
+      hasIntraGap = true
+  check("intra-dup stream: collector records duplicate_code gap", hasIntraGap)
+  let dir = sealStream(outp)
+  let res = replayOf(dir)
+  check("intra-dup stream: replay succeeds without crashing", res.status == rsOk)
+  check("intra-dup stream: DATA_GAP_SUSPECTED emitted for duplicate_code",
+        countType(res, "DATA_GAP_SUSPECTED") >= 1)
+  let runDir = writeRunOf(dir, res)
+  let v = verifyOf(runDir)
+  check("intra-dup stream: verify declares MATCH",
+        v.verdict == vMatch and v.matched)
+
 # ------------------------------------------------------------- determinism
 
 block determinism:
