@@ -178,6 +178,24 @@ rank 10). The cold path on the same client code (server restart
 19:17:46/49/54/59 and the first `200` at 19:18:05; the app showed
 "오류 / 데이터 준비 중 (잠시 후 다시 시도)" while warming, then data —
 the 5-retry × 5 s = 25 s warming budget in `lib/state/app_store.dart`.
+Tailnet cold path (2026-11-17 19:49 KST, same client, `adb reverse
+--list` empty, no SSH tunnel): server restart requested 19:49:14.589 →
+`VERDICT MATCH provenance=OK git=05c0831` → `SERVE 19:49:15.231` →
+unit `ActiveEnter 19:49:17` → app process start 19:49:17.213. The
+journal logged four `503`s — 19:49:17.160 (the unit's `ExecStartPost`
+curl, not the app), 19:49:20.254, 19:49:25.305, 19:49:30.345 — and the
+first `200` at 19:49:35.828. On screen: +3.49 s "기록을 읽는 중...",
++10.58 s "오류 / 데이터 준비 중 (잠시 후 다시 시도)", +20.62 s real
+data (10 stocks), +30.65 s unchanged; no user retry and no app restart
+— the app's own re-poll loop alone reached `200` (the ~5 s spacing is
+the fixed warming wait above). Cold numbers: restart request→first
+`200` 21.24 s, process start→first `200` 18.62 s, the app's first
+`503` (19:49:20.254)→first `200` 15.57 s — inside the 25 s budget.
+Transport proof: the `s10` node counter moved tx 41,600→211,240 with
+zero USB/tunnel traffic in the window. The API's `as_of`
+(2026-11-17T15:30:10+09:00) matched the displayed data. The installed
+build is a debug APK (DEBUG band on screen); a production release
+build is an open decision (LIMITS).
 Serve's access log records `127.0.0.1` for every tailnet request (the
 proxy connects over loopback), so client identity cannot be
 distinguished server-side — device attribution needs device-side
