@@ -10,6 +10,17 @@ committed single sources of truth:
   4. contracts/events/event.schema.json <-> tools/api/serve.py
      (the market-view event-type constants and literals)
   5. Dockerfile COPY sources <-> .github/workflows/attest.yml staging step
+  6. contracts/events/event.schema.json <-> tools/notify/notify_fcm.py
+     (TOP10_EVENT_TYPES, the SUMMARY_WORDS keys),
+     notify_dispatcher.py (AGGREGATION_STARTED) and
+     notify_config.py (the ADMISSION_DEFAULT keys)
+  7. contracts/events/event.schema.json and delivery.schema.json <->
+     the wire/policy copies: notify_fcm.py's payload kind values and
+     the mobile copies — market_alert_channel.dart (marketEventTypes,
+     marketKinds), push_service.dart (the dedupKey kind literals),
+     main.dart (the digest channel routing literal), MainActivity.kt
+     (the kind routing literals) and digest_list_screen.dart (the
+     case-label event types)
 """
 
 import ast
@@ -31,6 +42,14 @@ def load_event_type_enum():
     with open(schema_path, "r", encoding="utf-8") as f:
         schema = json.load(f)
     return schema["properties"]["event_type"]["enum"]
+
+
+def load_message_kind_enum():
+    schema_path = os.path.join(
+        REPO, "contracts", "events", "delivery.schema.json")
+    with open(schema_path, "r", encoding="utf-8") as f:
+        schema = json.load(f)
+    return schema["properties"]["message_kind"]["enum"]
 
 
 class SsotConsistencySuite(unittest.TestCase):
@@ -198,6 +217,264 @@ class SsotConsistencySuite(unittest.TestCase):
                 src in attest_text or basename in attest_text,
                 f"Dockerfile COPY source {src!r} missing from attest.yml",
             )
+
+    def _module_assignments(self, path, name):
+        """The value node of the one assignment to `name` in the module
+        at `path` (ast, not import: the module may have import side
+        effects). Fails loudly on zero matches (the extraction went
+        blind) or on several (ambiguous copy)."""
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=path)
+        values = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == name
+                    for target in node.targets)]
+        self.assertEqual(
+            len(values), 1,
+            "%s must assign %s exactly once (found %d): the "
+            "extraction went blind or is ambiguous"
+            % (os.path.basename(path), name, len(values)))
+        return values[0]
+
+    def _module_dict_string_keys(self, path, name):
+        """The string keys of the one `name = { ... }` dict literal
+        assignment in the module at `path`."""
+        node = self._module_assignments(path, name)
+        self.assertIsInstance(
+            node, ast.Dict,
+            "%s is not a dict literal: the extraction went blind" % name)
+        keys = [
+            key.value for key in node.keys
+            if isinstance(key, ast.Constant)
+            and isinstance(key.value, str)]
+        self.assertTrue(
+            keys,
+            "no string keys in %s: the extraction went blind" % name)
+        return keys
+
+    def _dart_set_literals(self, name):
+        """The string literals of the one `name = { ... }` set literal
+        in market_alert_channel.dart. [^}] crosses the literal's
+        newlines without DOTALL and cannot overshoot the closing
+        brace."""
+        dart_path = os.path.join(
+            REPO, "mobile", "lib", "services", "market_alert_channel.dart")
+        with open(dart_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        matches = re.findall(r"\b%s\s*=\s*\{([^}]*)\}" % name, text)
+        self.assertEqual(
+            len(matches), 1,
+            "market_alert_channel.dart must define %s as exactly one "
+            "set literal (found %d): the extraction went blind or is "
+            "ambiguous" % (name, len(matches)))
+        literals = set(re.findall(r"[\"']([^\"']+)[\"']", matches[0]))
+        self.assertTrue(
+            literals,
+            "no string literals in %s: the extraction went blind" % name)
+        return literals
+
+    def test_event_schema_covers_notify_fcm_top10_types(self):
+        # The delivery policy's TOP10 allowlist (also the truth behind
+        # notify_dispatcher.NOTIFIABLE_EVENT_TYPES and
+        # notify_config.ADMISSION_UNIVERSE, which reference it): a
+        # subset of the contract vocabulary, not a mirror of it.
+        fcm_path = os.path.join(REPO, "tools", "notify", "notify_fcm.py")
+        node = self._module_assignments(fcm_path, "TOP10_EVENT_TYPES")
+        if isinstance(node, ast.Call) and len(node.args) == 1:
+            node = node.args[0]
+        self.assertIsInstance(
+            node, (ast.Tuple, ast.Set),
+            "TOP10_EVENT_TYPES is not a set/tuple literal: the "
+            "extraction went blind")
+        members = [
+            elt.value for elt in node.elts
+            if isinstance(elt, ast.Constant)
+            and isinstance(elt.value, str)]
+        self.assertTrue(
+            members,
+            "no string members in TOP10_EVENT_TYPES: the extraction "
+            "went blind")
+
+        enum = set(load_event_type_enum())
+        unknown = set(members) - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_fcm.TOP10_EVENT_TYPES drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_event_schema_covers_dispatcher_aggregation_started(self):
+        dispatcher_path = os.path.join(
+            REPO, "tools", "notify", "notify_dispatcher.py")
+        node = self._module_assignments(
+            dispatcher_path, "AGGREGATION_STARTED")
+        self.assertIsInstance(
+            node, ast.Constant,
+            "AGGREGATION_STARTED is not a literal: the extraction "
+            "went blind")
+        self.assertIsInstance(node.value, str)
+
+        enum = set(load_event_type_enum())
+        self.assertIn(
+            node.value, enum,
+            "notify_dispatcher.AGGREGATION_STARTED drifted from "
+            "event.schema.json")
+
+    def test_event_schema_covers_dart_market_event_types(self):
+        enum = set(load_event_type_enum())
+        unknown = self._dart_set_literals("marketEventTypes") - enum
+        self.assertEqual(
+            unknown, set(),
+            "market_alert_channel.dart marketEventTypes drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_dart_market_kinds(self):
+        enum = set(load_message_kind_enum())
+        unknown = self._dart_set_literals("marketKinds") - enum
+        self.assertEqual(
+            unknown, set(),
+            "market_alert_channel.dart marketKinds drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_push_service_kind_literals(self):
+        # push_service.dart's dedupKey kind test: the message-kind
+        # literals the file compares with == / != (its only
+        # equality-compared string literals).
+        path = os.path.join(
+            REPO, "mobile", "lib", "services", "push_service.dart")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"[!=]=\s*'([^']+)'", text)
+        self.assertTrue(
+            found,
+            "no '...' equality comparisons in push_service.dart: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "push_service.dart kind literals drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_kotlin_kind_literals(self):
+        # MainActivity.kt's kind routing: every string literal compared
+        # against the `kind` argument (the batch judgment and the
+        # digest single-slot test).
+        path = os.path.join(
+            REPO, "mobile", "android", "app", "src", "main", "kotlin",
+            "com", "hongscanner", "hongscanner", "MainActivity.kt")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"\bkind\s*[!=]=\s*\"([^\"]+)\"", text)
+        self.assertTrue(
+            found,
+            "no kind == \"...\" comparisons in MainActivity.kt: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "MainActivity.kt kind literals drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_event_schema_covers_digest_list_case_types(self):
+        # digest_list_screen.dart's rank-change label switch: the
+        # event-type-shaped case labels.
+        path = os.path.join(
+            REPO, "mobile", "lib", "screens", "digest_list_screen.dart")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"case\s+'([A-Z0-9_]+)':", text)
+        self.assertTrue(
+            found,
+            "no event-type-shaped case labels in "
+            "digest_list_screen.dart: the extraction went blind")
+
+        enum = set(load_event_type_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "digest_list_screen.dart case labels drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_main_kind_literals(self):
+        # main.dart's digest channel routing: every string literal the
+        # shell compares against message.kind.
+        path = os.path.join(REPO, "mobile", "lib", "main.dart")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        found = re.findall(r"\bmessage\.kind\s*[!=]=\s*'([^']+)'", text)
+        self.assertTrue(
+            found,
+            "no message.kind == '...' comparisons in main.dart: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = set(found) - enum
+        self.assertEqual(
+            unknown, set(),
+            "main.dart kind literals drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_event_schema_covers_notify_fcm_summary_words(self):
+        # notify_fcm.py's summary body word table: the event_type keys
+        # (a type outside the table falls back to its own event_type
+        # string — never an invented word).
+        fcm_path = os.path.join(REPO, "tools", "notify", "notify_fcm.py")
+        keys = self._module_dict_string_keys(fcm_path, "SUMMARY_WORDS")
+
+        enum = set(load_event_type_enum())
+        unknown = set(keys) - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_fcm.SUMMARY_WORDS keys drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_event_schema_covers_notify_config_admission_default(self):
+        # notify_config.py's default admission verdicts: the event_type
+        # keys (the values are the config's own admission modes —
+        # immediate/digest/suppress — not a schema copy).
+        config_path = os.path.join(
+            REPO, "tools", "notify", "notify_config.py")
+        keys = self._module_dict_string_keys(
+            config_path, "ADMISSION_DEFAULT")
+
+        enum = set(load_event_type_enum())
+        unknown = set(keys) - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_config.ADMISSION_DEFAULT keys drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_notify_fcm_payload_kinds(self):
+        # The FCM payload data.kind values: the wire message kinds the
+        # builders put on every push.
+        fcm_path = os.path.join(REPO, "tools", "notify", "notify_fcm.py")
+        with open(fcm_path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=fcm_path)
+        kinds = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if (isinstance(key, ast.Constant)
+                            and key.value == "kind"
+                            and isinstance(value, ast.Constant)
+                            and isinstance(value.value, str)):
+                        kinds.add(value.value)
+        self.assertTrue(
+            kinds,
+            "no \"kind\": literal payload values in notify_fcm.py: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = kinds - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_fcm.py payload kind values drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
 
 
 if __name__ == "__main__":
