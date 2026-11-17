@@ -11,15 +11,16 @@ committed single sources of truth:
      (the market-view event-type constants and literals)
   5. Dockerfile COPY sources <-> .github/workflows/attest.yml staging step
   6. contracts/events/event.schema.json <-> tools/notify/notify_fcm.py
-     and tools/notify/notify_dispatcher.py (the delivery policy's
-     hardcoded event-type copies: TOP10_EVENT_TYPES,
-     AGGREGATION_STARTED)
+     (TOP10_EVENT_TYPES, the SUMMARY_WORDS keys),
+     notify_dispatcher.py (AGGREGATION_STARTED) and
+     notify_config.py (the ADMISSION_DEFAULT keys)
   7. contracts/events/event.schema.json and delivery.schema.json <->
-     the mobile policy copies: market_alert_channel.dart
-     (marketEventTypes, marketKinds), push_service.dart (the dedupKey
-     kind literals), main.dart (the digest channel routing literal),
-     MainActivity.kt (the kind routing literals) and
-     digest_list_screen.dart (the case-label event types)
+     the wire/policy copies: notify_fcm.py's payload kind values and
+     the mobile copies — market_alert_channel.dart (marketEventTypes,
+     marketKinds), push_service.dart (the dedupKey kind literals),
+     main.dart (the digest channel routing literal), MainActivity.kt
+     (the kind routing literals) and digest_list_screen.dart (the
+     case-label event types)
 """
 
 import ast
@@ -237,6 +238,22 @@ class SsotConsistencySuite(unittest.TestCase):
             % (os.path.basename(path), name, len(values)))
         return values[0]
 
+    def _module_dict_string_keys(self, path, name):
+        """The string keys of the one `name = { ... }` dict literal
+        assignment in the module at `path`."""
+        node = self._module_assignments(path, name)
+        self.assertIsInstance(
+            node, ast.Dict,
+            "%s is not a dict literal: the extraction went blind" % name)
+        keys = [
+            key.value for key in node.keys
+            if isinstance(key, ast.Constant)
+            and isinstance(key.value, str)]
+        self.assertTrue(
+            keys,
+            "no string keys in %s: the extraction went blind" % name)
+        return keys
+
     def _dart_set_literals(self, name):
         """The string literals of the one `name = { ... }` set literal
         in market_alert_channel.dart. [^}] crosses the literal's
@@ -400,6 +417,63 @@ class SsotConsistencySuite(unittest.TestCase):
         self.assertEqual(
             unknown, set(),
             "main.dart kind literals drifted from "
+            "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_event_schema_covers_notify_fcm_summary_words(self):
+        # notify_fcm.py's summary body word table: the event_type keys
+        # (a type outside the table falls back to its own event_type
+        # string — never an invented word).
+        fcm_path = os.path.join(REPO, "tools", "notify", "notify_fcm.py")
+        keys = self._module_dict_string_keys(fcm_path, "SUMMARY_WORDS")
+
+        enum = set(load_event_type_enum())
+        unknown = set(keys) - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_fcm.SUMMARY_WORDS keys drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_event_schema_covers_notify_config_admission_default(self):
+        # notify_config.py's default admission verdicts: the event_type
+        # keys (the values are the config's own admission modes —
+        # immediate/digest/suppress — not a schema copy).
+        config_path = os.path.join(
+            REPO, "tools", "notify", "notify_config.py")
+        keys = self._module_dict_string_keys(
+            config_path, "ADMISSION_DEFAULT")
+
+        enum = set(load_event_type_enum())
+        unknown = set(keys) - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_config.ADMISSION_DEFAULT keys drifted from "
+            "event.schema.json: %s" % sorted(unknown))
+
+    def test_delivery_schema_covers_notify_fcm_payload_kinds(self):
+        # The FCM payload data.kind values: the wire message kinds the
+        # builders put on every push.
+        fcm_path = os.path.join(REPO, "tools", "notify", "notify_fcm.py")
+        with open(fcm_path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=fcm_path)
+        kinds = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if (isinstance(key, ast.Constant)
+                            and key.value == "kind"
+                            and isinstance(value, ast.Constant)
+                            and isinstance(value.value, str)):
+                        kinds.add(value.value)
+        self.assertTrue(
+            kinds,
+            "no \"kind\": literal payload values in notify_fcm.py: the "
+            "extraction went blind")
+
+        enum = set(load_message_kind_enum())
+        unknown = kinds - enum
+        self.assertEqual(
+            unknown, set(),
+            "notify_fcm.py payload kind values drifted from "
             "delivery.schema.json message_kind: %s" % sorted(unknown))
 
 
