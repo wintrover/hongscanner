@@ -124,8 +124,11 @@ class AppStore extends ChangeNotifier {
   static const Duration _warmingRetryDelay = Duration(seconds: 5);
 
   /// Warming retries per sync pass, capping the total warming wait at
-  /// 15s before the honest error state stands.
-  static const int _maxWarmingRetries = 3;
+  /// 25s before the honest error state stands. The production pre-warm
+  /// measured 15.7s after a manual restart and 17.8s from boot start, so
+  /// the earlier 15s budget could expire just before READY and leave the
+  /// honest error standing for a server that was about to succeed.
+  static const int _maxWarmingRetries = 5;
 
   final ApiClient _api;
   final PushService _push;
@@ -496,8 +499,9 @@ class AppStore extends ChangeNotifier {
   /// backoff on failure.
   ///
   /// Warming contract (503 `warming`): a pass that ended in the server's
-  /// start-up state retries on a fixed 5s wait, at most 3 times per sync
-  /// (≤15s), without consuming a regular attempt — a server that never
+  /// start-up state retries on a fixed 5s wait, at most 5 times per sync
+  /// (≤25s, covering the measured 15.7–18.0s production pre-warm),
+  /// without consuming a regular attempt — a server that never
   /// warms up ends in the visible "데이터 준비 중" error, and non-warming
   /// failures keep the plain exponential backoff.
   ///

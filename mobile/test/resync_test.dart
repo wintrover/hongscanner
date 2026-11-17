@@ -83,7 +83,7 @@ void main() {
     expect(store.marketView.value?.run?.sessionDate, '2026-11-02');
   });
 
-  test('warming retries are capped at three and end in the honest message',
+  test('warming retries are capped at five and end in the honest message',
       () async {
     final backoffs = <Duration>[];
     final transport = FakeTransport(
@@ -91,10 +91,10 @@ void main() {
     final store = makeStore(transport: transport, backoffs: backoffs);
     await store.bootstrap();
 
-    expect(transport.requests.length, 4,
-        reason: 'the first fetch plus at most 3 warming retries (≤15s)');
+    expect(transport.requests.length, 6,
+        reason: 'the first fetch plus at most 5 warming retries (≤25s)');
     expect(
-        backoffs, List<Duration>.filled(3, const Duration(seconds: 5)));
+        backoffs, List<Duration>.filled(5, const Duration(seconds: 5)));
     expect(store.marketView.phase, LoadPhase.error);
     expect(store.marketView.offline, isFalse,
         reason: 'the server answered — warming is not an offline state');
