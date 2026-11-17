@@ -165,6 +165,33 @@ Python register 프로세스 (notify_register.py)
   1회성 스위프와 `--admission-report`는 unscoped다(하위 호환·주어진
   파일 그대로의 재생).
 
+### 시각 계측 (Time instrumentation)
+
+경보·전달 관측 라인은 같은 부팅 내 단조 시계를 함께 기록한다
+(`tools/notify/notify_clock.py`):
+
+- **필드**: `mono_ns`(time.monotonic_ns(), 벽시계 조정에 영향받지
+  않는 단조 나노초), `boot_id`(커널의 부팅 식별자,
+  /proc/sys/kernel/random/boot_id; 읽을 수 없으면 `unknown`),
+  `wall`(UTC ISO 8601, 초 해상도), `t0_observed`(감지 라인에만).
+- **적용 라인**: dispatcher의 `dispatch attempt_start ...`·
+  `dispatch result=...` 라인과 `ops_alert device=...` 결과 라인은
+  끝에 `mono_ns=... boot_id=...`를 덧붙인다. 세션 런처
+  (tools/run_session.sh)의 경보 라인은 `OPS_ALERT ...`가
+  `mono_ns=... boot_id=... wall=...`를, `WORKER_UNIT_FAILED`·
+  `SESSION_STALL_DETECTED`·`COLLECTOR_FAILED`가
+  `t0_observed=1 mono_ns=... boot_id=... wall=...`를 덧붙인다.
+- **T0_OBSERVED는 감지 시점이지 실제 고장 시점이 아니다**: 런처가
+  장애를 관측한 순간이므로 실제 결함은 그보다 빠르다(하한만 성립).
+  `OPS_ALERT` 라인은 T0가 아니라 T2(경보 요청)다 — `t0_observed`가
+  없는 이유다.
+- **단조 값은 같은 boot_id 안에서만 비교 가능하다**: 기기 간·부트
+  간 `mono_ns` 차를 계산하지 않는다(부팅마다 기준점이 다르다).
+  부팅 경계를 넘는 시간 추론은 `wall`로만 한다.
+- **`ops_alert device=... result=accepted`는 FCM 인계 증거일 뿐
+  기기 도달 증거가 아니다**: ops 사이드채널은 전달 원장을 남기지
+  않으므로(§8) accepted는 서버 수락만 뜻한다.
+
 ## 2. 이벤트 ledger (notify_ledger.py)
 
 - 팩트는 생산자 파일에서 **바이트 그대로** 복사된다: ledger는 팩트를

@@ -65,6 +65,14 @@ usage() {
   printf 'usage: tools/run_session.sh <collector args...>  (--out=DIR required)\n' >&2
 }
 
+# Same-boot monotonic stamp for alert lines (tools/notify/README.md §1
+# "Time instrumentation"): mono_ns is comparable only within one boot_id,
+# never across devices or boots. $PY is resolved (and validated) in the
+# prerequisites section before any alert can be emitted.
+_mono_stamp() {
+  "$PY" -c 'import time; b=open("/proc/sys/kernel/random/boot_id").read().strip(); print("mono_ns=%d boot_id=%s" % (time.monotonic_ns(), b))'
+}
+
 # ------------------------------------------------------------- arguments
 OUT=""
 for arg in "$@"; do
@@ -121,7 +129,10 @@ touch "$LAUNCHER_LOG"
 send_ops_alert() {
   local title="$1"
   local body="$2"
-  echo "OPS_ALERT title=$title body=$body" >> "$LAUNCHER_LOG"
+  local wall
+  wall="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # T2 (the alert request), not T0: no t0_observed here.
+  echo "OPS_ALERT title=$title body=$body $(_mono_stamp) wall=$wall" >> "$LAUNCHER_LOG"
   if [ -n "${HS_NOTIFY_CMD:-}" ]; then
     # shellcheck disable=SC2086 # the override command may carry arguments
     $HS_NOTIFY_CMD "$title" "$body" \
@@ -184,7 +195,8 @@ start_watchdog() {
       if [ "$WORKER_MODE" = "systemd" ] && [ "$worker_alerted" = "0" ]; then
         if systemctl --user is-failed --quiet "$UNIT" 2>/dev/null; then
           worker_alerted=1
-          echo "WORKER_UNIT_FAILED unit=$UNIT" >> "$LAUNCHER_LOG"
+          wall="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "WORKER_UNIT_FAILED unit=$UNIT t0_observed=1 $(_mono_stamp) wall=$wall" >> "$LAUNCHER_LOG"
           send_ops_alert "홍스캐너 워커 장애 ($SESSION)" \
             "systemd 유닛 $UNIT 실패 감지 (로그: $LAUNCHER_LOG)"
         fi
@@ -204,7 +216,8 @@ start_watchdog() {
         if [ "$latest_s" -gt 0 ] && [ $((now_s - latest_s)) -ge "$STALL_TIMEOUT_SECONDS" ]; then
           stall_alerted=1
           idle_s=$((now_s - latest_s))
-          echo "SESSION_STALL_DETECTED idle_seconds=$idle_s threshold=$STALL_TIMEOUT_SECONDS" >> "$LAUNCHER_LOG"
+          wall="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "SESSION_STALL_DETECTED idle_seconds=$idle_s threshold=$STALL_TIMEOUT_SECONDS t0_observed=1 $(_mono_stamp) wall=$wall" >> "$LAUNCHER_LOG"
           send_ops_alert "홍스캐너 세션 무응답 ($SESSION)" \
             "세션 $SESSION 에서 ${idle_s}초 동안 신규 기록이 없습니다"
         fi
@@ -230,7 +243,9 @@ stop_worker() {
                2>/dev/null | tr '\n' ' ')"
     echo "WORKER_UNIT $UNIT ${state:-state=<unloaded>}" >>"$LAUNCHER_LOG"
     if [ "$pre_failed" = "1" ] && ! grep -qF "WORKER_UNIT_FAILED unit=$UNIT" "$LAUNCHER_LOG" 2>/dev/null; then
-      echo "WORKER_UNIT_FAILED unit=$UNIT" >> "$LAUNCHER_LOG"
+      local wall
+      wall="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "WORKER_UNIT_FAILED unit=$UNIT t0_observed=1 $(_mono_stamp) wall=$wall" >> "$LAUNCHER_LOG"
       send_ops_alert "홍스캐너 워커 장애 ($SESSION)" \
         "systemd 유닛 $UNIT 실패 상태로 종료됨 ($state)"
     fi
@@ -318,7 +333,8 @@ done
 stop_watchdog
 echo "COLLECTOR_EXIT=$COLLECTOR_RC" >>"$LAUNCHER_LOG"
 if [ "$COLLECTOR_RC" -ne 0 ]; then
-  echo "COLLECTOR_FAILED exit=$COLLECTOR_RC" >>"$LAUNCHER_LOG"
+  wall="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "COLLECTOR_FAILED exit=$COLLECTOR_RC t0_observed=1 $(_mono_stamp) wall=$wall" >>"$LAUNCHER_LOG"
   send_ops_alert "홍스캐너 세션 장애 ($SESSION)" \
     "수집기 비정상 종료 (exit=$COLLECTOR_RC, 로그: $LAUNCHER_LOG)"
 fi

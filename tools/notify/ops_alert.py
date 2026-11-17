@@ -33,6 +33,7 @@ import json
 import os
 import sys
 
+import notify_clock
 import notify_config
 import notify_fcm
 import notify_ledger
@@ -94,9 +95,9 @@ def _main(argv):
                 return 2
             outcome = notify_fcm.send_message(cfg["project_id"],
                                               tokens.get(), payload)
-            print("ops_alert device=%s result=%s status=%s error=%s" % (
+            print("ops_alert device=%s result=%s status=%s error=%s %s" % (
                 device_id, outcome.kind, outcome.http_status,
-                outcome.error_code), flush=True)
+                outcome.error_code, notify_clock.stamp()), flush=True)
             if outcome.kind != "accepted":
                 code = 3
         return code
