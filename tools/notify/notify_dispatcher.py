@@ -336,6 +336,8 @@ class Dispatcher:
         # and a direct sweep_pass call both need the in-scope facts,
         # not just the due pairs.
         self._last_events = []
+        # Registry invalidations already attempted in this dispatch pass.
+        self._invalid_attempted = set()
         # SIGTERM/SIGINT set this between-ticks stop request.
         self._stop = False
 
@@ -523,7 +525,10 @@ class Dispatcher:
             # every covered event and the token is retired (hash only)
             # in the registry, once for the unit.
             record_all("FAILED", error_code=outcome.error_code)
-            self.registry.mark_invalid(device_id, token)
+            invalid_key = (device_id, notify_ledger.mask_secret(token))
+            if invalid_key not in self._invalid_attempted:
+                self._invalid_attempted.add(invalid_key)
+                self.registry.mark_invalid(device_id, token)
             self.counts["token_retired"] = \
                 self.counts.get("token_retired", 0) + 1
             if msg_kind == "single":
@@ -791,6 +796,7 @@ class Dispatcher:
         is parked. `events` is the in-scope fact snapshot the audible
         watermarks read; a direct caller without one gets the last
         snapshot merged with the pairs' own facts."""
+        self._invalid_attempted = set()
         if events is None:
             events = list(self._last_events)
             known = {event["event_id"] for event in events}

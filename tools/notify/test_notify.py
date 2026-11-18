@@ -1541,6 +1541,58 @@ class TestDispatcher(Base):
         finally:
             registry.close()
 
+    def test_repeated_unregistered_sends_read_the_registry_once(self):
+        """The tick memo bounds the idempotency check: N units refused
+        UNREGISTERED for one token cost one mark_invalid (one full
+        registry read), not N. devices() reads once more for the tick
+        snapshot; both units still get honest FAILED records."""
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.seed_ledger(cfg, [
+            make_event(seq=1, observed_at="2026-11-01T09:00:00+09:00"),
+            make_event(event_type="RANK_CHANGED", rule_id="rank-changed",
+                       seq=2, previous_rank=3, rank=2,
+                       observed_at="2026-11-01T09:02:00+09:00"),
+        ])
+        self.register("dev-1")
+        transport = FakeTransport(send_responses=[
+            FakeResponse(404, {"error": {"code": 404,
+                                         "status": "UNREGISTERED"}}),
+            FakeResponse(404, {"error": {"code": 404,
+                                         "status": "UNREGISTERED"}}),
+        ])
+        dispatcher = self.dispatcher(cfg, transport)
+        mark_invalid_calls = []
+        records_reads = []
+        real_mark_invalid = dispatcher.registry.mark_invalid
+        real_records = dispatcher.registry._records
+
+        def counting_mark_invalid(device_id, fcm_token):
+            mark_invalid_calls.append(
+                (device_id, notify_ledger.mask_secret(fcm_token)))
+            return real_mark_invalid(device_id, fcm_token)
+
+        def counting_records():
+            records_reads.append(dispatcher.registry.path)
+            return real_records()
+
+        dispatcher.registry.mark_invalid = counting_mark_invalid
+        dispatcher.registry._records = counting_records
+        try:
+            code = dispatcher.sweep()
+            dispatcher.sweep_pass([], {}, {}, {}, park_beyond_cap=False,
+                                  events=[])
+            self.assertEqual(dispatcher._invalid_attempted, set())
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 2)
+        self.assertEqual(mark_invalid_calls,
+                         [("dev-1", notify_ledger.mask_secret(FCM_TOKEN))])
+        # One read for the sweep's devices() snapshot + the single
+        # mark_invalid idempotency check.
+        self.assertEqual(len(records_reads), 2)
+
     def test_404_not_found_wire_form_fails_and_retires_the_token(self):
         """The regression the 2026-11-03 live wire exposed: an invalid
         token answers HTTP 404 with error.status "NOT_FOUND" (the
