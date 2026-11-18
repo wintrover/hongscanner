@@ -109,6 +109,9 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
         onForegroundMessage: _handleForegroundAlert,
         onUnauthorized: () => _reenterCredentials(store),
       );
+      // The server is the only mode authority: poll it while the app is
+      // foregrounded (the resume path restarts the same timer).
+      store.setForeground(true);
       // Local-notification taps bypass FCM's tap APIs: a tap while the
       // app runs arrives as "onNotificationTap" on the market-alert
       // channel, a cold-start tap is consumed once via getPendingTap.
@@ -134,6 +137,9 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    // Stop the foreground poll before the observer goes away; the timer
+    // belongs to the store, which outlives this shell in tests.
+    _store?.setForeground(false);
     _marketAlert.clearTapHandler();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
@@ -145,13 +151,23 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
     _store ??= AppScope.of(context);
   }
 
-  /// Foreground resume resync: the offline / force-killed / dropped-queue
-  /// recovery path. Notification taps route through the store's push
-  /// wiring (bootstrap), not the lifecycle observer.
+  /// Foreground polling and resume resync: the store re-asks the server
+  /// every poll interval while foregrounded (the server alone decides the
+  /// mode, so no clock-derived switch runs here), and a resume refreshes
+  /// immediately — the offline / force-killed / dropped-queue recovery
+  /// path. Notification taps route through the store's push wiring
+  /// (bootstrap), not the lifecycle observer.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _store?.resync();
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _store?.setForeground(true);
+        _store?.resync();
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        _store?.setForeground(false);
     }
   }
 

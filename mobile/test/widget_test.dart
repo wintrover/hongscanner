@@ -75,6 +75,22 @@ void main() {
     },
   );
 
+  testWidgets('core mode shows the general TOP10 banner, not the opening label',
+      (WidgetTester tester) async {
+    final store = makeStore(transport: fixtureTransport());
+    await store.bootstrap();
+    await pumpTallApp(tester, store);
+
+    // The server decides the mode; the banner names its projection and
+    // separates the decision clock (mode_as_of) from the recorded data
+    // clock (data_as_of). Core mode is never labeled as the opening MA20
+    // ranking.
+    expect(find.text('일반 TOP10'), findsOneWidget);
+    expect(find.text('판정 15:30:58 · 데이터 15:30:58'), findsOneWidget);
+    expect(find.text('개장 MA20 순위'), findsNothing);
+    expect(find.textContaining('(MA20'), findsNothing);
+  });
+
   testWidgets('history tap pushes the event detail route; back pops it',
       (WidgetTester tester) async {
     final store = makeStore(transport: fixtureTransport());

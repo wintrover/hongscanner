@@ -157,6 +157,31 @@ void main() {
     expect(transport.requests.length, greaterThan(requestsAfterBootstrap));
   });
 
+  testWidgets('foreground polls the server every 30s; background stops it',
+      (WidgetTester tester) async {
+    final transport = fixtureTransport();
+    final store = makeStore(transport: transport);
+    addTearDown(store.dispose);
+    await store.bootstrap();
+    await pumpApp(tester, store);
+    store.setForeground(true);
+
+    final afterBootstrap = store.syncCount;
+    await tester.pump(const Duration(seconds: 30));
+    await tester.pump();
+    expect(store.syncCount, afterBootstrap + 1,
+        reason: 'the server is the only mode authority — the foreground '
+            'poll re-asks it on the 30s interval');
+
+    store.setForeground(false);
+    final afterStop = store.syncCount;
+    await tester.pump(const Duration(seconds: 90));
+    await tester.pump();
+    expect(store.syncCount, afterStop,
+        reason: 'backgrounding cancels the poll timer — no refresh resumes '
+            'without the foreground signal');
+  });
+
   testWidgets('pull-to-refresh on the market view resyncs',
       (WidgetTester tester) async {
     final transport = fixtureTransport();

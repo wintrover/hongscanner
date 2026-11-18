@@ -107,6 +107,7 @@ class AppStore extends ChangeNotifier {
     CredentialStore? credentialStore,
     Future<void> Function(Duration delay)? delay,
     DateTime Function()? now,
+    this._pollInterval = const Duration(seconds: 30),
     this._maxSyncAttempts = 3,
     this._backoffBase = const Duration(seconds: 1),
   })  : _api = apiClient,
@@ -136,12 +137,19 @@ class AppStore extends ChangeNotifier {
   final CredentialStore _credentialStore;
   final Future<void> Function(Duration) _delay;
   final DateTime Function() _now;
+  final Duration _pollInterval;
   final int _maxSyncAttempts;
   final Duration _backoffBase;
 
   bool _bootstrapped = false;
   bool _syncing = false;
   bool _disposed = false;
+
+  /// Foreground refresh timer: while the app is foregrounded the server
+  /// is re-asked every [_pollInterval] — the server is the only mode
+  /// authority, so the display follows its decision rather than a clock
+  /// the app computes itself.
+  Timer? _pollTimer;
 
   /// Set when any fetch in the current sync pass ended 401 — the signal
   /// for the one re-entry prompt per pass.
@@ -559,6 +567,23 @@ class AppStore extends ChangeNotifier {
     }
   }
 
+  /// Foreground polling switch: true starts the periodic refresh (a
+  /// no-op when it is already running or the store is disposed), false
+  /// stops it. The callback does not await [resync] — the `_syncing`
+  /// guard already keeps overlapping passes from stacking, and a poll
+  /// that lands during a pass simply buys nothing extra.
+  void setForeground(bool foreground) {
+    if (!foreground) {
+      _pollTimer?.cancel();
+      _pollTimer = null;
+      return;
+    }
+    if (_pollTimer != null || _disposed) return;
+    _pollTimer = Timer.periodic(_pollInterval, (_) {
+      resync();
+    });
+  }
+
   /// One pass: the single `/mobile/market-view` projection fetch. Returns
   /// true when nothing failed.
   Future<bool> _fetchOnce() async {
@@ -598,6 +623,8 @@ class AppStore extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _pollTimer?.cancel();
+    _pollTimer = null;
     _tapSub?.cancel();
     _foregroundSub?.cancel();
     _fidSub?.cancel();

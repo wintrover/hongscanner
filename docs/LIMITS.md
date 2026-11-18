@@ -99,6 +99,8 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
 | the second phone (`s25-ultra`) has never registered for push | the server's FCM registry contains only `wuyoni-sm-g977n`; an s25-ultra install receives no notification until the operator registers its token, and its app/API path has no observation | operator device lifecycle |
 | `tailscale serve` masks the client identity from the API | the proxy connects to `127.0.0.1:8080`, so serve.py logs `127.0.0.1` for every tailnet request — attributing a request to one phone (or proving it was not the phone) needs device-side evidence (screen dump, `tailscale status`, logcat), never the server log | VS-3 E2E device observation |
 | the operating APK is a debug build | both 2026-11-17 acceptances ran the debug APK (DEBUG band on screen, debug signing, debuggable); whether production ships a release build is undecided, and a debug-signed artifact is a distribution trust problem, not just a UI badge | release build/keystore decision (operator) |
+| 09:30 벽시계 교차는 실제 거래일의 실측 관측으로만 증명된다 | replay `?as_of=`는 판정 함수의 결정론을 증명하지만, 실제 시계가 그 경계를 지나며 화면이 바뀌는 것은 별개다 | VS-3 E2E acceptance (live 09:30 boundary observation) |
+| 모바일 60초 표시 SLO는 두 기기에서 측정하는 운영 SLO다 | Dart `Timer.periodic`과 OS 스케줄링은 주기를 보장하지 않는다(공식 문서: 연속 콜백 간격은 duration보다 짧거나 길 수 있다) | P12 device acceptance (s25-ultra · s10) |
 
 ## Explicit non-goals
 

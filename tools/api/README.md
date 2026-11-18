@@ -37,8 +37,8 @@ HTTP 서버 (serve.py, 기본 127.0.0.1 바인드, GET 전용)
   (config `events_contract` `"top10-v1"` 런) — 원장에 이미 존재하는
   Core 확정 TOP10 팩트를 변화 레코드 9필드로 표시 변환하는 순수
   계산, 판단 전무(팩트가 곧 확정된 변경이다) — 과 (6) §3.7이
-  명시한 **시간창 필터 + 기록값 비교 분류(개장 MA20 모드)** — 기록된
-  observed_at의 시간창 판정과 기록된 가격·종가합의 정수 비교로
+  명시한 **as_of 시간창 + 기록값 비교 분류(개장 MA20 모드)** — 요청의
+  `as_of`(KST) 시간창 판정과 기록된 가격·종가합의 정수 비교로
   top10의 배열 배치와 태그를 정하는 표시용 투영 — 만 담는다. 폴딩도
   상태 비교·팩트 translate도 시간창 분류도 새 사실을 만들지 않는다:
   랭크·순서·카운트·가격·태그는 전부 기록된 값(과 그 기록값 비교)이고,
@@ -335,10 +335,11 @@ runs 루트의 **디렉터리만**, 이름 오름차순으로:
 translate 투영(§0, 아래 이중 경로)이다. 변화 분류도 판단(시장 평가)이
 아니다 — 상태 비교의 양쪽 상태와 증명 이벤트의 모든 값이 기록값이고,
 팩트 경로에서는 값 전부가 팩트의 기록값이다. 개장 MA20 모드(VS-2,
-아래)도 같은 성격이다: 기록된 observed_at의 시간창 판정과 기록된 가격 대
+아래)도 같은 성격이다: 요청 `as_of`의 시간창 판정과 기록된 가격 대
 기록된 20일 종가합의 **정수 비교**로 top10의 배열 배치와 태그를 정할
-뿐, 어떤 값도 새로 만들지 않는다(§0의 시간창 필터 + 기록값 비교 분류).
-쿼리 파라미터·정렬 옵션·페이지네이션은
+뿐, 어떤 값도 새로 만들지 않는다(§0의 as_of 시간창 + 기록값 비교 분류).
+쿼리 파라미터는 `/mobile/market-view`의 `as_of`(판정 시각, §3.7)
+하나뿐이고 정렬 옵션·페이지네이션은
 없다. `--ledger`·`--delivery`는 읽지 않는다 — 원천은 아래 선택 규칙이
 고른 **런 디렉터리 하나**다.
 
@@ -493,16 +494,29 @@ KiB 윈도 판독):
   previous_rank가 1 이상 정수가 아님·name이 문자열이 아님 — 모두
   HTTP 500 `data_fault`(§4), 조용한 스킵 없음.
 
-**개장 MA20 모드(VS-2) — 시간창 필터 + 기록값 비교 분류** — 선택된
-런의 이벤트 폴드가 확정한 **마지막 확정 관찰 그룹**(봉인 여부 규칙은
-위 변화 이력과 동일: 미봉인 런의 마지막 그룹은 확정에서 제외되므로
-직전 그룹이 기준이 된다)이 **기준 그룹**이다. 기준 그룹의 `observed_at`
-시각부(KST, 기록된 타임스탬프를 KST로 순수 변환한 HH:MM:SS)가
-반개구간 **[09:00:00, 09:30:00)** 안이면 응답의 `rising_top10`/
+**개장 MA20 모드(VS-2) — as_of 시간창 + 기록값 비교 분류** — 모드
+판정의 유일한 시각 권위는 **명시적 `as_of`**(KST)다. HTTP 어댑터는
+`/mobile/market-view` 요청마다 `?as_of=<ISO-8601>` 쿼리를 읽고,
+값이 없으면 그 요청에 한 번만 호스트 시계를 읽어 전달한다
+(테스트·replay는 `?as_of=`로 시각을 고정한다). `as_of`의 KST
+시각부가 반개구간 **[09:00:00, 09:30:00)** 안이고 그 KST 날짜가
+선택된 런의 `session_date`와 같을 때만 응답의 `rising_top10`/
 `falling_top10`이 "현재가 vs MA20" 기준으로 재구성되고 최상위
-`mode`가 `"opening_ma20"`이 된다. 창 밖(또는 확정 그룹 없음)이면
-`mode:"core"`이고 배열은 기존 rank 폴드 그대로다. 창 판정은 **기록된
-observed_at 술어만** 쓴다 — 이 프로세스는 벽시계를 절대 읽지 않는다.
+`mode`가 `"opening_ma20"`이 된다. 날짜 불일치·창 밖이면 fail-closed로
+`mode:"core"`이고 배열은 기존 rank 폴드 그대로다. 잘못된 `as_of`
+(형식 오류·UTC 오프셋 없는 naive datetime)는 400 `bad_request`다
+(§4) — 조용한 core 폴백도, 창을 다시 열기 위해 새 그룹 확정을
+기다리는 동작도 없다. 거래일의 권위는 수집기의 달력 게이트
+(`src/hs/collector.nim:239`)이며 canonical run의 존재가 그 승인
+증거다 — API는 달력을 재파싱하지 않는다.
+
+모드의 **내용**은 계속 **마지막 확정 관찰 그룹**(봉인 여부 규칙은
+위 변화 이력과 동일: 미봉인 런의 마지막 그룹은 확정에서 제외되므로
+직전 그룹이 기준이 된다)이 **기준 그룹**이며, 이 데이터 확정 규칙은
+`as_of` 권위와 무관하게 불변이다. 확정 그룹이 없으면 개장 모드에서도
+두 목록은 빈 배열, `coverage`는 null이다(정직한 빈 목록).
+`mode_as_of`는 요청 `as_of`의 KST 텍스트(초 단위)이고, `data_as_of`는
+`as_of`(마지막 커밋 이벤트의 observed_at)의 별칭이다.
 
 - **유니버스**: 기준 그룹 확정 시점의 후보 상태 심볼집합(UP+DOWN
   원장 direction 무시, 심볼당 1회 dedup — 양쪽 후보인 심볼은 그
@@ -566,12 +580,17 @@ observed_at 술어만** 쓴다 — 이 프로세스는 벽시계를 절대 읽�
   심볼은 맵에 없다(제외 대상). 행이 객체가 아니거나 dt·cur_prc가
   위 형상을 벗어나면 DataFault다(ka10027 이름 규칙 준칙). 비성공
   본문(리스트 없음)은 아무 종가도 기여하지 않는다.
-- **`history`·`as_of`·`latest`·`status`·`run`은 모드 무변경**: 변화
-  이력은 core와 같은 규칙, 계수·선택·시각은 그대로다. 모드는 top10
-  두 배열·`mode` 필드·`ma20_tag` 태그에만 존재한다(파일 기록 없음 —
-  표시용 투영, M12).
+- **`history`·`latest`·`status`·`run`은 모드 무변경**: 변화 이력은
+  core와 같은 규칙, 계수·선택은 그대로다. `as_of`도 모드와 무관하게
+  마지막 커밋 이벤트의 observed_at 그대로이고(§3.1),
+  `data_as_of`는 그 별칭이다. `mode_as_of`만 판정 시각의 KST
+  텍스트다(요청 `as_of`, 없으면 어댑터가 읽은 요청 시각; `as_of`가
+  없는 빈 응답에서는 null). 모드는 top10 두 배열·`mode` 필드·
+  `ma20_tag` 태그에만 존재한다(파일 기록 없음 — 표시용 투영, M12).
 - **DataFault 형상**: 대응 검증 실패(세 오프셋 모두 ⊆ 실패), 기준
-  그룹 observed_at이 스키마 타임스탬프 형상·달력이 아님, ka10027
+  그룹 observed_at이 스키마 타임스탬프 형상·달력이 아님(모드 판정이
+  아니라 기록 데이터 유효성 검사다 — `as_of`가 모드를 열었을 때만
+  수행), ka10027
   행의 cur_prc가 부호 정수가 아님·query의 sort_tp가 1/3이 아님·
   page가 1 이상 정수가 아님·cont_yn이 문자열이 아님, ka10081 행의
   dt·cur_prc 형상 위반·query의 stk_cd 부재 — 모두 HTTP 500
@@ -644,6 +663,7 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
 ```json
 {
  "as_of": "2026-11-09T13:45:58+09:00",
+ "data_as_of": "2026-11-09T13:45:58+09:00",
  "falling_top10": [ {"data_quality": "OBSERVING", "direction": "DOWN",
                      "event_id": "…", "event_type": "CANDIDATE_UPDATED",
                      "ma20_tag": null, "name": "SK하이닉스",
@@ -661,6 +681,7 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
             "event_type": "SUBSCRIPTION_TRUNCATED",
             "observed_at": "…"},
  "mode": "core",
+ "mode_as_of": "2026-11-09T13:45:58+09:00",
  "rising_top10": [ {"data_quality": "OBSERVING", "direction": "UP",
                     "event_id": "…", "event_type": "CANDIDATE_ENTERED",
                     "ma20_tag": null, "name": "LG전자",
@@ -700,8 +721,14 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   디렉터리는
   있어도 적격 런이 없으면 `runs_present:true`에 같은 null/빈값.
   선택된 런에 커밋된 이벤트가 0개면 `run`은 채워지고 `as_of`·
-  `latest`는 null, 세 목록은 빈 배열, `status.by_data_quality`는
-  `{}`다(§3.1의 present-but-empty 규율과 같다).
+  `data_as_of`·`latest`는 null, 세 목록은 빈 배열,
+  `status.by_data_quality`는 `{}`다(§3.1의 present-but-empty 규율과
+  같다). 두 경우 모두 `mode_as_of`는 요청의 판정 시각 텍스트
+  (`?as_of=`가 없으면 어댑터가 읽은 요청 시각)이고, `as_of`/
+  `data_as_of`는 기록이 없으므로 null이다. 선택된 런의
+  `session_date`가 `as_of`의 KST 날짜와 같고 시각이 창 안이면
+  이벤트 0개에서도 `mode:"opening_ma20"`이고, 확정 그룹이 없으므로
+  두 목록은 빈 배열·`coverage`는 null이다(정직한 빈 목록).
 - **배열 순서는 §2에 대한 명시된 예외다**: `history`는 변화 레코드
   순서(관찰 그룹 = 원장 순, 그룹 내 = 증명 이벤트의 원장 위치 순, 최근
   100건 oldest→newest), top10 순서는 이 §의 폴드 규칙이다 — 창 밖
@@ -738,6 +765,7 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
 |---|---|
 | 미지 경로·미지 이벤트 id·미지 세션·경로 순회 시도 | 404 `not_found` (요청 값 재출력 없음) |
 | GET 이외의 메서드 (POST/PUT/DELETE/PATCH/HEAD/OPTIONS) | 405 `method_not_allowed`, `Allow: GET` |
+| `as_of` 쿼리 형식 오류·UTC 오프셋 없는 naive datetime (§3.7) | 400 `bad_request` — 조용한 core 폴백 없음 |
 | 기록 파일 불량(커밋된 라인이 불량 JSON·불량 체크섬 줄 등) | 500 `data_fault` — 조용한 스킵 없음 |
 | 콜드 패스 prewarm 진행 중 (`/mobile/market-view`만, §1) | 503 `warming` + `Retry-After: 5` — prewarm 완료 후 재시도 |
 | prewarm 실패(폴드가 예외로 끝남, §1) | 500 `data_fault` ("market projection prewarm failed: …") — 프로세스 수명 동안 종단 |
@@ -806,9 +834,13 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   부재 시 제외·봉인 시 포함·kSessionEnd 플러시 팩트(동일 스탬프
   SESSION_ENDED만 뒤따름) 미봉인 제외·봉인 포함, 100 링, top10
   목록·개장 MA20 모드는 후보 폴드 그대로, 연속 2회 요청 동일
-  바이트), §3.7 개장 MA20 모드(창
-  경계 4종 — 08:59:59·09:30:00은 core, 09:00:00·09:29:59은 모드
-  전환; 기준 그룹 = 마지막 확정 관찰 그룹; 스냅샷 검증 오프셋
+  바이트), §3.7 개장 MA20 모드(as_of 경계 — 08:59:59·09:30:00·09:31:00·
+  날짜 불일치는 core, 09:00:00·09:29:59은 모드 전환; 기록 그룹 09:10이
+  창 안이어도 as_of 09:30이면 core — 새 그룹 대기 없음; `determine_mode`
+  경계표와 순수성; `mode_as_of` KST 초 단위 텍스트·`data_as_of` 별칭;
+  `as_of` 형식 오류·naive는 400 `bad_request`; 기준 그룹 = 마지막 확정
+  관찰 그룹; 확정 그룹 없는 개장 모드는 빈 목록·coverage null; 스냅샷
+  검증 오프셋
   0/+1/−1과 전부 실패 시 DataFault; 상승 G 내림차순·하락 G 오름차순·
   동률은 symbol 코드포인트 순·십자곱 동일 비; 가격 불명·일봉 부족
   제외; 계약 위반 행·query의 DataFault; 연속 2회 요청 동일 바이트),

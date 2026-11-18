@@ -10,13 +10,15 @@ each one exits cleanly (SIGTERM -> exit 0, no residue). A malformed
 response byte, a leaked path/secret, or a surviving process fails the
 suite. Fail-closed: no assertion reports a pass on absence of evidence.
 
-The §3.7 market view is covered by six suites: MarketViewSuite holds
+The §3.7 market view is covered by eight suites: MarketViewSuite holds
 the core fold and the legacy change-history contract, MarketViewFactSuite
 the events_contract "top10-v1" dual path (the fact translation, its
-eligibility rule, the discriminator branches), MarketViewOpeningSuite
-the VS-2 opening MA20 mode (the recorded window predicate, the
-chain-pair correspondence offsets, the integer cross-product order, the
-honest exclusions and the DataFault shapes), MarketFoldSuite the
+eligibility rule, the discriminator branches), ModeAuthoritySuite the
+opening mode's pure authority (determine_mode's as_of boundary table),
+MarketViewOpeningSuite the VS-2 opening MA20 mode (the as_of window,
+the chain-pair correspondence offsets, the integer cross-product order,
+the honest exclusions, the 400 bad_request shapes and the DataFault
+shapes), MarketFoldSuite the
 pure fold_market_projection unit and its memoization, MarketEventsLinesSuite
 the events.hcj.jsonl committed-lines cache (incremental reads identical
 to read_committed_lines), LedgerTailSuite the notify ledger's aggregate
@@ -48,6 +50,7 @@ import threading
 import time
 import unittest
 
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from unittest import mock
 from urllib import request as urlrequest
@@ -442,9 +445,12 @@ MV_HISTORY_G4 = [
     mv_change("TOP10_ENTERED", MV_G4_DN03, 3, 11, MV_NAME_MAP),
 ]
 
+MV_AS_OF = "2026-11-09T10:30:00+09:00"
+
 MV_EXPECTED = {
     "as_of": MV_TEND,
     "coverage": None,
+    "data_as_of": MV_TEND,
     "falling_top10": [mv_item(MV_G4_DN09, MV_NAME_MAP),
                       mv_item(MV_G4_DN01, MV_NAME_MAP),
                       mv_item(MV_G4_DN03, MV_NAME_MAP)],
@@ -453,7 +459,8 @@ MV_EXPECTED = {
                "event_id": MV_INCOMPLETE_SUB["event_id"],
                "event_type": "SUBSCRIPTION_TRUNCATED",
                "observed_at": MV_TEND},
-    "mode": "core",  # the winner's groups are all 10:00+ stamps
+    "mode": "core",  # as_of 10:30 KST is outside the opening window
+    "mode_as_of": MV_AS_OF,
     "rising_top10": [mv_item(MV_G3B_UP01, MV_NAME_MAP),
                      mv_item(MV_G3B_UP05, MV_NAME_MAP),
                      mv_item(MV_G2_UP02, MV_NAME_MAP),
@@ -683,7 +690,11 @@ def om_item(ev, ma20_tag):
     return item
 
 
-def om_expected(ref_stamp, rising, falling, coverage=None):
+def om_expected(ref_stamp, rising, falling, coverage=None,
+                as_of=OM_REF_STAMP):
+    """One opening-mode expected body. `ref_stamp` stamps the recorded
+    reference group; `as_of` is the request's decision moment — the
+    mode authority whose KST text is served as mode_as_of."""
     history = [
         mv_change("CANDIDATE_EXITED", om_g2_017960x(ref_stamp), None, 5,
                   OM_NAMES),
@@ -699,6 +710,7 @@ def om_expected(ref_stamp, rising, falling, coverage=None):
             "rising_count": 5, "falling_count": 3,
             "rising_complete": False, "falling_complete": False,
             "status": "PARTIAL"},
+        "data_as_of": OM_TEND,
         "falling_top10": falling,
         "history": history,
         "latest": {"data_quality": "INCOMPLETE",
@@ -706,6 +718,7 @@ def om_expected(ref_stamp, rising, falling, coverage=None):
                    "event_type": "SUBSCRIPTION_TRUNCATED",
                    "observed_at": OM_TEND},
         "mode": "opening_ma20",
+        "mode_as_of": as_of,
         "run": {"environment": "demo", "run_id": OM_WINNER,
                 "session": OM_WINNER, "session_date": OM_SESSION_DATE},
         "rising_top10": rising,
@@ -714,7 +727,7 @@ def om_expected(ref_stamp, rising, falling, coverage=None):
     }
 
 
-def om_expected_bodies(ref_stamp):
+def om_expected_bodies(ref_stamp, as_of=OM_REF_STAMP):
     """The three correspondence variants' expected bodies (offset 0
     reads snapshot 2, +1 snapshot 3, -1 snapshot 1 — the trap prices
     differ per snapshot, so each variant's lists are distinct)."""
@@ -726,7 +739,8 @@ def om_expected_bodies(ref_stamp):
          om_item(g1["015760"], "ABOVE")],
         [om_item(om_g2_011060(ref_stamp), "BELOW"),
          om_item(g1["008480"], "BELOW"),
-         om_item(om_g2_006660(ref_stamp), "BELOW")])
+         om_item(om_g2_006660(ref_stamp), "BELOW")],
+        as_of=as_of)
     plus_one = om_expected(
         ref_stamp,
         [om_item(om_g2_011060(ref_stamp), "ABOVE"),
@@ -735,7 +749,8 @@ def om_expected_bodies(ref_stamp):
         {"candidate_count": 12, "computable_count": 4,
          "rising_count": 2, "falling_count": 2,
          "rising_complete": False, "falling_complete": False,
-         "status": "PARTIAL"})
+         "status": "PARTIAL"},
+        as_of=as_of)
     minus_one = om_expected(
         ref_stamp,
         [om_item(om_g2_011060(ref_stamp), "ABOVE")],
@@ -745,7 +760,8 @@ def om_expected_bodies(ref_stamp):
         {"candidate_count": 12, "computable_count": 4,
          "rising_count": 1, "falling_count": 3,
          "rising_complete": False, "falling_complete": False,
-         "status": "PARTIAL"})
+         "status": "PARTIAL"},
+        as_of=as_of)
     return zero, plus_one, minus_one
 
 
@@ -960,16 +976,20 @@ def tf_item(ev):
 TF_HISTORY_G2 = [tf_change(f, TF_NAMES) for f in TF_G2_FACTS]
 TF_HISTORY_G3 = [tf_change(f, TF_NAMES) for f in TF_G3_FLUSH_FACTS]
 
+TF_AS_OF = "2026-11-12T10:30:00+09:00"
+
 TF_EXPECTED = {
     "as_of": TF_T3,
     "coverage": None,
+    "data_as_of": TF_T3,
     "falling_top10": [tf_item(TF_G2[4]), tf_item(TF_G2[5])],
     "history": TF_HISTORY_G2,  # the unsealed run: flush facts ineligible
     "latest": {"data_quality": "OBSERVING",
                "event_id": TF_SESSION_END["event_id"],
                "event_type": "SESSION_ENDED",
                "observed_at": TF_T3},
-    "mode": "core",  # every confirmed group stamps 10:05 or earlier
+    "mode": "core",  # as_of 10:30 KST is outside the opening window
+    "mode_as_of": TF_AS_OF,
     "rising_top10": [tf_item(TF_G3[0]), tf_item(TF_G3[1]),
                      tf_item(TF_G3[3]), tf_item(TF_G3[2]),
                      tf_item(TF_G1[4]), tf_item(TF_G1[5]),
@@ -1729,7 +1749,7 @@ class MarketViewSuite(unittest.TestCase):
         # 2026-11-08 run; the observed_at tie-break beats the winner's
         # smaller dirname; smoke/bad-date/drill dirs are ineligible
         status, body, raw, headers = self.server.get_json(
-            "/mobile/market-view")
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, MV_EXPECTED)
         # the whole body is canonical bytes: keys sorted, LF-terminated
@@ -1758,7 +1778,8 @@ class MarketViewSuite(unittest.TestCase):
         # the finish() marker exists: the last observation group is
         # confirmed and its changes enter the history
         self.seal_winner()
-        status, body, raw, _ = self.server.get_json("/mobile/market-view")
+        status, body, raw, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, MV_EXPECTED_SEALED)
         self.assertEqual(raw, canonical(MV_EXPECTED_SEALED) + b"\n")
@@ -1938,7 +1959,8 @@ class MarketViewSuite(unittest.TestCase):
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
             f.write(torn[: len(torn) // 2])
-        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, MV_EXPECTED)
 
@@ -1984,20 +2006,24 @@ class MarketViewSuite(unittest.TestCase):
         # committed ka10027 record changes the file, so the next
         # request — same server, no restart — rescans and serves the
         # newly recorded name; the request after that is stable
-        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertIsNone(body["falling_top10"][0]["name"])
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "input.hcj.jsonl"), "ab") as f:
             f.write(canonical(rest_resp_record(
                 8, ka10027_body([("011060", "SK텔레콤", 17000)]))) + b"\n")
-        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body["falling_top10"][0]["symbol"], "011060")
         self.assertEqual(body["falling_top10"][0]["name"], "SK텔레콤")
-        status2, body2, raw2, _ = self.server.get_json("/mobile/market-view")
+        status2, body2, raw2, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status2, 200)
         self.assertEqual(body2, body)
-        self.assertEqual(raw2, self.server.get("/mobile/market-view")[1])
+        self.assertEqual(raw2, self.server.get(
+            "/mobile/market-view?as_of=" + MV_AS_OF)[1])
 
     def test_market_view_torn_tail_is_not_committed(self):
         # the concurrently-appending shape: a torn (non-LF) tail record
@@ -2007,7 +2033,8 @@ class MarketViewSuite(unittest.TestCase):
                                "events.hcj.jsonl"), "ab") as f:
             f.write(canonical(mv_fact(b"torn", MV_T5, "CANDIDATE_ENTERED",
                                       "002420", "UP", 1))[:24])
-        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, MV_EXPECTED)
 
@@ -2016,7 +2043,8 @@ class MarketViewSuite(unittest.TestCase):
         # between two requests — same server, no restart — is served by
         # the incremental read, so the next response reflects the new
         # last record without any full rescan
-        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, MV_EXPECTED)
         appended = event_fact(b"mv-append", "SUBSCRIPTION_TRUNCATED",
@@ -2027,13 +2055,15 @@ class MarketViewSuite(unittest.TestCase):
         with open(os.path.join(self.box.runs, MV_WINNER,
                                "events.hcj.jsonl"), "ab") as f:
             f.write(canonical(appended) + b"\n")
-        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         # a non-candidate record: never closes a group, so only the
         # as_of/latest evidence and the quality census change
         self.assertEqual(body, dict(
             MV_EXPECTED,
             as_of=appended["observed_at"],
+            data_as_of=appended["observed_at"],
             latest={"data_quality": "INCOMPLETE",
                     "event_id": appended["event_id"],
                     "event_type": "SUBSCRIPTION_TRUNCATED",
@@ -2074,11 +2104,13 @@ class MarketViewEmptySuite(unittest.TestCase):
     def test_no_directories_projects_absent(self):
         box = Sandbox()
         self.run_with(box)
-        expected = {"as_of": None, "coverage": None, "falling_top10": [],
-                    "history": [], "latest": None, "mode": "core",
+        expected = {"as_of": None, "coverage": None, "data_as_of": None,
+                    "falling_top10": [], "history": [], "latest": None,
+                    "mode": "core", "mode_as_of": MV_AS_OF,
                     "rising_top10": [], "run": None, "runs_present": False,
                     "status": None}
-        status, body, raw, _ = self.server.get_json("/mobile/market-view")
+        status, body, raw, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
@@ -2094,11 +2126,14 @@ class MarketViewEmptySuite(unittest.TestCase):
                   jsonl(MV_DOWN_ENTERED_1))
         os.makedirs(os.path.join(box.runs, "drill-like", "sub"))
         self.run_with(box)
-        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, {"as_of": None, "coverage": None,
+                                "data_as_of": None,
                                 "falling_top10": [], "history": [],
                                 "latest": None, "mode": "core",
+                                "mode_as_of": MV_AS_OF,
                                 "rising_top10": [], "run": None,
                                 "runs_present": True, "status": None})
 
@@ -2112,11 +2147,13 @@ class MarketViewEmptySuite(unittest.TestCase):
              "seq": 2}))
         box.write(os.path.join(run_dir, "events.hcj.jsonl"), b"")
         self.run_with(box)
-        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, {
-            "as_of": None, "coverage": None, "falling_top10": [],
-            "history": [], "latest": None, "mode": "core", "rising_top10": [],
+            "as_of": None, "coverage": None, "data_as_of": None,
+            "falling_top10": [], "history": [], "latest": None,
+            "mode": "core", "mode_as_of": MV_AS_OF, "rising_top10": [],
             "run": {"environment": "demo", "run_id": None,
                     "session": "market-2026-11-09-empty",
                     "session_date": "2026-11-09"},
@@ -2124,17 +2161,49 @@ class MarketViewEmptySuite(unittest.TestCase):
             "status": {"by_data_quality": {}}})
 
 
+class ModeAuthoritySuite(unittest.TestCase):
+    """determine_mode (README §3.7): the explicit as_of decision moment
+    is the mode's only time authority. A pure function — no clock read,
+    no server."""
+
+    def test_determine_mode_boundary_table(self):
+        cases = (
+            ("2026-11-10T08:59:59+09:00", "2026-11-10", "core"),
+            ("2026-11-10T09:00:00+09:00", "2026-11-10", "opening_ma20"),
+            ("2026-11-10T09:29:59+09:00", "2026-11-10", "opening_ma20"),
+            ("2026-11-10T09:30:00+09:00", "2026-11-10", "core"),
+            ("2026-11-10T09:30:01+09:00", "2026-11-10", "core"),
+            ("2026-11-11T09:10:00+09:00", "2026-11-10", "core"),
+            (None, "2026-11-10", "core"),
+            ("2026-11-10T00:10:00+00:00", "2026-11-10", "opening_ma20"),
+        )
+        for stamp, session_date, mode in cases:
+            as_of = None if stamp is None else datetime.fromisoformat(stamp)
+            self.assertEqual(serve.determine_mode(as_of, session_date),
+                             mode, stamp)
+
+    def test_determine_mode_fails_closed_on_bad_inputs(self):
+        # a naive moment has no zone authority and a non-string
+        # session_date names no day: both are core, never a guess
+        moment = datetime.fromisoformat("2026-11-10T09:10:00+09:00")
+        self.assertEqual(serve.determine_mode(
+            datetime(2026, 11, 10, 9, 10), "2026-11-10"), "core")
+        self.assertEqual(serve.determine_mode(moment, None), "core")
+        self.assertEqual(serve.determine_mode(moment, 20261110), "core")
+
+
 class MarketViewOpeningSuite(unittest.TestCase):
     """GET /mobile/market-view (README §3.7, VS-2): the opening MA20
-    mode. The window predicate reads the reference group's RECORDED
-    observed_at (converted to KST, never the wall clock); inside
-    [09:00:00, 09:30:00) the top10 lists are reconstituted from the
-    recorded chain-pair prices of that group's snapshot against the
+    mode. The mode is decided by the caller-supplied as_of (KST): inside
+    the half-open [09:00:00, 09:30:00) on the selected run's
+    session_date the top10 lists are reconstituted from the recorded
+    chain-pair prices of the reference group's snapshot against the
     recorded twenty-day close sums — the integer cross product, no
     float. Rank, event_id and direction stay the state item's own
     recorded values; the mode's only decisions are placement and
-    ma20_tag. Outside the window the response is the core
-    last-record-wins assembly (mode "core")."""
+    ma20_tag. Outside the window, on a date mismatch, or without a
+    confirmed group the response is the core last-record-wins assembly
+    (mode "core")."""
 
     def setUp(self):
         self.box = build_opening_sandbox()
@@ -2169,7 +2238,7 @@ class MarketViewOpeningSuite(unittest.TestCase):
     def test_opening_mode_full_scenario_byte_canonical(self):
         expected, _, _ = om_expected_bodies(OM_REF_STAMP)
         status, body, raw, headers = self.server.get_json(
-            "/mobile/market-view")
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
@@ -2195,8 +2264,10 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # determinism through the memoized fold: two consecutive
         # requests serve identical bytes (a cache hit is byte-identical
         # to a rescan, and never a different answer)
-        raw1 = self.server.get("/mobile/market-view")[1]
-        raw2 = self.server.get("/mobile/market-view")[1]
+        raw1 = self.server.get(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)[1]
+        raw2 = self.server.get(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)[1]
         self.assertEqual(raw1, raw2)
 
     # -- recorded fields stay verbatim --------------------------------------
@@ -2207,7 +2278,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # two ranking legs) with its recorded DOWN rank and the
         # group-2 event id; UP and DOWN mix freely across the two lists
         # because classification is price-vs-MA20, not direction
-        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        _, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         both = body["rising_top10"] + body["falling_top10"]
         self.assertEqual([i["symbol"] for i in both].count("006660"), 1)
         item = next(i for i in both if i["symbol"] == "006660")
@@ -2230,7 +2302,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # before 015760 is the integer cross product 20·P₁·ΣC₂ vs
         # 20·P₂·ΣC₁ (equal P, the larger close sum is further above).
         # below: ascending distance (furthest below first)
-        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        _, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(self.symbols(body, "rising_top10"),
                          ["000660", "009150", "012330", "005930", "015760"])
         self.assertEqual(self.symbols(body, "falling_top10"),
@@ -2246,7 +2319,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # closes but no price in the mapped snapshot, 002420 has no
         # ka10081 record, 005490 only nineteen completed days; 017960
         # left the reference group (EXITED) and no snapshot carries it
-        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        _, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         served = {i["symbol"] for i in body["rising_top10"]
                   + body["falling_top10"]}
         for symbol in ("001440", "003490", "002420", "005490", "017960"):
@@ -2259,7 +2333,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # classification (005930 +50000/+40000 would be BELOW, 011060
         # +90000 and 006660 +99000 would be ABOVE): the served tags can
         # only come from snapshot 2 — the same-index correspondence
-        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        _, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         rising = {i["symbol"]: i for i in body["rising_top10"]}
         falling = {i["symbol"]: i for i in body["falling_top10"]}
         self.assertEqual(rising["005930"]["ma20_tag"], "ABOVE")
@@ -2272,7 +2347,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # +1 mapping holds and snapshot 3's (trap) prices are served
         server = self.opening_server(variant="+1")
         _, expected, _ = om_expected_bodies(OM_REF_STAMP)
-        status, body, raw, _ = server.get_json("/mobile/market-view")
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
@@ -2283,7 +2359,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # are served
         server = self.opening_server(variant="-1")
         _, _, expected = om_expected_bodies(OM_REF_STAMP)
-        status, body, raw, _ = server.get_json("/mobile/market-view")
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
@@ -2293,7 +2370,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # upserts: the recorded backing for the mode is incomplete and
         # the endpoint fails closed — never a core fallback
         server = self.opening_server(variant="none")
-        status, _, raw, _ = server.get_json("/mobile/market-view")
+        status, _, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 500)
         self.assertIn(b"data_fault", raw)
 
@@ -2306,7 +2384,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # and the mode fails closed on sound data
         server = self.opening_server(variant="0", pre_empty_pairs=2)
         expected, _, _ = om_expected_bodies(OM_REF_STAMP)
-        status, body, raw, _ = server.get_json("/mobile/market-view")
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
@@ -2315,25 +2394,30 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # skipping empty pairs must not weaken the correspondence: the
         # upserts in no price-bearing snapshot still fail closed
         server = self.opening_server(variant="none", pre_empty_pairs=2)
-        status, _, raw, _ = server.get_json("/mobile/market-view")
+        status, _, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 500)
         self.assertIn(b"data_fault", raw)
         self.assertIn(b"chain-pair correspondence failed", raw)
 
     # -- the window -------------------------------------------------------
 
-    def test_opening_mode_window_boundaries(self):
-        # the half-open window over the reference group's recorded KST
-        # time-of-day: 09:00:00 in, 09:30:00 out. Outside it the core
-        # last-record-wins assembly is served with null ma20_tag
+    def test_as_of_decides_the_window(self):
+        # the half-open KST window over as_of: 09:00:00 in,
+        # 09:30:00 out; a KST date other than the session_date is core.
+        # Outside the window the core last-record-wins assembly is
+        # served with null ma20_tag
         for stamp, mode in (("2026-11-10T08:59:59+09:00", "core"),
                             ("2026-11-10T09:00:00+09:00", "opening_ma20"),
                             ("2026-11-10T09:29:59+09:00", "opening_ma20"),
-                            ("2026-11-10T09:30:00+09:00", "core")):
-            server = self.opening_server(ref_stamp=stamp)
-            status, body, _, _ = server.get_json("/mobile/market-view")
+                            ("2026-11-10T09:30:00+09:00", "core"),
+                            ("2026-11-10T09:31:00+09:00", "core"),
+                            ("2026-11-11T09:10:00+09:00", "core")):
+            status, body, _, _ = self.server.get_json(
+                "/mobile/market-view?as_of=" + stamp)
             self.assertEqual(status, 200, stamp)
             self.assertEqual(body["mode"], mode, stamp)
+            self.assertEqual(body["mode_as_of"], stamp, stamp)
             if mode == "opening_ma20":
                 # the reference group is the last CONFIRMED group: the
                 # unsealed 10:05 group never takes over
@@ -2344,7 +2428,8 @@ class MarketViewOpeningSuite(unittest.TestCase):
                                  ["011060", "008480", "006660"], stamp)
                 stamps = {i["observed_at"] for i in body["rising_top10"]
                           + body["falling_top10"]}
-                self.assertEqual(stamps, {stamp, OM_T1})
+                self.assertEqual(stamps, {OM_REF_STAMP, OM_T1}, stamp)
+                self.assertIsNotNone(body["coverage"], stamp)
             else:
                 self.assertEqual(self.symbols(body, "rising_top10"),
                                  ["005930", "006660", "012330", "015760",
@@ -2355,22 +2440,120 @@ class MarketViewOpeningSuite(unittest.TestCase):
                 self.assertTrue(all(i["ma20_tag"] is None for i
                                     in body["rising_top10"]
                                     + body["falling_top10"]), stamp)
+                self.assertIsNone(body["coverage"], stamp)
 
-    def test_opening_mode_stamp_zone_is_converted(self):
-        # the window predicate converts the recorded stamp to KST:
-        # 00:20+00:00 is 09:20 KST — inside the window
+    def test_as_of_after_the_window_does_not_wait_for_a_new_group(self):
+        # the regression this authority split exists for: the recorded
+        # reference group's 09:10 stamp is INSIDE the window, but the
+        # evaluation moment 09:30:00 is not — the mode is core at once,
+        # never "wait for a new confirmed group to leave the window"
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=2026-11-10T09:30:00+09:00")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "core")
+        self.assertIsNone(body["coverage"])
+        self.assertEqual(body["as_of"], OM_TEND)
+        self.assertEqual(body["data_as_of"], OM_TEND)
+        self.assertEqual(body["mode_as_of"], "2026-11-10T09:30:00+09:00")
+
+    def test_mode_as_of_is_kst_at_second_precision(self):
+        # the request minute in +00:00 is converted to KST text: the
+        # recorded stamp's zone never decides the mode, as_of does
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=2026-11-10T00:10:00+00:00")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "opening_ma20")
+        self.assertEqual(body["mode_as_of"], "2026-11-10T09:10:00+09:00")
+        self.assertEqual(body["as_of"], OM_TEND)
+        self.assertEqual(body["data_as_of"], OM_TEND)
+
+    def test_as_of_garbage_is_bad_request(self):
+        # a malformed decision moment is a client error, never a silent
+        # core fallback (fail-closed)
+        status, body, raw, _ = self.server.get_json(
+            "/mobile/market-view?as_of=garbage")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad_request")
+        self.assertEqual(raw, canonical(body) + b"\n")
+        # a present-but-empty value is a client error too, never the
+        # absent-as_of clock path
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad_request")
+
+    def test_as_of_naive_is_bad_request(self):
+        # a naive datetime has no zone authority: 400, not a guess at
+        # the server's local zone
+        status, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=2026-11-10T09:10:00")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "bad_request")
+
+    def test_as_of_absent_reads_the_host_clock(self):
+        # no as_of: the adapter reads the clock once for this request —
+        # the fixture session is 2026-11-10, so any later KST day is
+        # core, and mode_as_of names today's KST date
+        before = datetime.now(serve.KST).date().isoformat()
+        status, body, _, _ = self.server.get_json("/mobile/market-view")
+        after = datetime.now(serve.KST).date().isoformat()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "core")
+        self.assertIn(body["mode_as_of"][:10], {before, after})
+        self.assertEqual(body["as_of"], OM_TEND)
+        self.assertEqual(body["data_as_of"], OM_TEND)
+
+    def test_opening_mode_without_confirmed_group_is_empty(self):
+        # no committed events: the selected run still has a
+        # session_date, so as_of picks opening_ma20 — but there is no
+        # confirmed observation group to reconstitute, so the lists are
+        # honestly empty and coverage is null (never a core fallback)
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        run_dir = box.session_dir("market-2026-11-10-empty")
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "calendar", "raw": {}, "seq": 1},
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "run_id": "market-2026-11-10-empty",
+                                       "session_date": OM_SESSION_DATE},
+             "seq": 2}))
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"), b"")
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        status, body, _, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "opening_ma20")
+        self.assertEqual(body["rising_top10"], [])
+        self.assertEqual(body["falling_top10"], [])
+        self.assertIsNone(body["coverage"])
+        self.assertEqual(body["mode_as_of"], OM_REF_STAMP)
+        self.assertIsNone(body["as_of"])
+        self.assertIsNone(body["data_as_of"])
+
+    def test_opening_mode_stamp_zone_is_not_the_authority(self):
+        # the recorded reference stamp in +00:00 (00:20 = 09:20 KST) is
+        # parsed as data; the mode still follows as_of — opening for
+        # the in-window request, core for the out-of-window one
         server = self.opening_server(ref_stamp="2026-11-10T00:20:00+00:00")
-        status, body, _, _ = server.get_json("/mobile/market-view")
+        status, body, _, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 200)
         self.assertEqual(body["mode"], "opening_ma20")
         self.assertEqual(self.symbols(body, "falling_top10"),
                          ["011060", "008480", "006660"])
+        status, body, _, _ = server.get_json(
+            "/mobile/market-view?as_of=2026-11-10T09:30:00+09:00")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "core")
 
     def test_opening_mode_stamp_shape_violation_is_data_fault(self):
         # the reference group's stamp is not the event schema's offset
-        # shape: the predicate never guesses, it fails closed
+        # shape: the data validity check never guesses, it fails closed
+        # even though as_of alone selected the mode
         server = self.opening_server(ref_stamp="2026-11-10T09:10:00")
-        status, _, raw, _ = server.get_json("/mobile/market-view")
+        status, _, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 500)
         self.assertIn(b"data_fault", raw)
 
@@ -2424,7 +2607,7 @@ class MarketViewFactSuite(unittest.TestCase):
         # the final live candidate state; status counts every event
         # including the facts; the whole body is canonical bytes
         status, body, raw, headers = self.server.get_json(
-            "/mobile/market-view")
+            "/mobile/market-view?as_of=" + TF_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, TF_EXPECTED)
         self.assertEqual(raw, canonical(TF_EXPECTED) + b"\n")
@@ -2438,12 +2621,14 @@ class MarketViewFactSuite(unittest.TestCase):
         # same-stamp SESSION_ENDED: unsealed they stay out of history
         # (the seal is their only confirmation), sealed they enter —
         # the same file, no restart, the server re-reads per request
-        _, body, _, _ = self.server.get_json("/mobile/market-view")
+        _, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + TF_AS_OF)
         self.assertEqual(body["history"], TF_HISTORY_G2)
         self.assertTrue(all(c["observed_at"] != TF_T3
                             for c in body["history"]))
         self.seal_winner(self.box)
-        status, body, raw, _ = self.server.get_json("/mobile/market-view")
+        status, body, raw, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + TF_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body, TF_EXPECTED_SEALED)
         self.assertEqual(raw, canonical(TF_EXPECTED_SEALED) + b"\n")
@@ -2451,8 +2636,10 @@ class MarketViewFactSuite(unittest.TestCase):
 
     def test_fact_path_consecutive_requests_identical(self):
         # determinism: two consecutive requests serve identical bytes
-        raw1 = self.server.get("/mobile/market-view")[1]
-        raw2 = self.server.get("/mobile/market-view")[1]
+        raw1 = self.server.get(
+            "/mobile/market-view?as_of=" + TF_AS_OF)[1]
+        raw2 = self.server.get(
+            "/mobile/market-view?as_of=" + TF_AS_OF)[1]
         self.assertEqual(raw1, raw2)
 
     # -- the translation ---------------------------------------------------
@@ -2625,7 +2812,8 @@ class MarketViewFactSuite(unittest.TestCase):
         # history — the facts are ordinary non-candidate events there
         # (counted in status, never folded into groups or history)
         box, server = self.fact_server(events_contract=None)
-        status, body, raw, _ = server.get_json("/mobile/market-view")
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + TF_AS_OF)
         self.assertEqual(status, 200)
         expected = dict(TF_EXPECTED, history=TF_LEGACY_HISTORY_G2)
         self.assertEqual(body, expected)
@@ -2633,7 +2821,8 @@ class MarketViewFactSuite(unittest.TestCase):
         # sealed, the legacy derivation confirms group 3 on the same
         # events — the facts still never enter history
         self.seal_winner(box)
-        status, body, _, _ = server.get_json("/mobile/market-view")
+        status, body, _, _ = server.get_json(
+            "/mobile/market-view?as_of=" + TF_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(body["history"],
                          TF_LEGACY_HISTORY_G2 + TF_LEGACY_HISTORY_G3)
@@ -2708,7 +2897,8 @@ class MarketViewFactSuite(unittest.TestCase):
                         history=[tf_change(f, OM_NAMES) for f in facts],
                         status={"by_data_quality": {"INCOMPLETE": 1,
                                                     "OBSERVING": 19}})
-        status, body, raw, _ = server.get_json("/mobile/market-view")
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
@@ -3754,11 +3944,14 @@ class MarketReadinessSuite(unittest.TestCase):
         # recorded projection — no restart, no second ask
         gate.set()
         self.wait_state(projector, "READY")
-        status, body, headers = self.get(port, "/mobile/market-view")
+        status, body, headers = self.get(
+            port, "/mobile/market-view?as_of=" + MV_AS_OF)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body.decode("utf-8")), MV_EXPECTED)
         self.assertIsNone(headers.get("Retry-After"))
-        self.assertEqual(projector.market_view(), MV_EXPECTED)
+        self.assertEqual(
+            projector.market_view(datetime.fromisoformat(MV_AS_OF)),
+            MV_EXPECTED)
 
     # -- (e) startup ordering: the prewarm precedes the socket -----------
 

@@ -10,10 +10,12 @@ names (sha256 comparison against a recorded CHECKSUMS.sha256, presence
 of recorded markers and operator-recorded verify output). Running the
 Nim verify binary is outside this process's scope, always. The one
 display classification beyond the fold is the §3.7 opening MA20 mode:
-a time-window filter over a recorded observed_at plus an
-integer-only comparison of recorded prices against recorded close
-sums — recorded values in, tags out, never a market judgment. The
-§3.7 change history is dual-path: pre-contract runs project the
+a time-window test over the caller-supplied decision moment (as_of,
+KST) plus an integer-only comparison of recorded prices against
+recorded close sums — recorded values in, tags out, never a market
+judgment. The wall clock is read in exactly one place: the HTTP
+adapter's market-view branch, once per request, when as_of is absent.
+The §3.7 change history is dual-path: pre-contract runs project the
 state-comparison changes, runs whose config record declares
 events_contract "top10-v1" translate the Core-confirmed TOP10 facts
 already recorded in the journal field-for-field — a display
@@ -89,8 +91,10 @@ CHECKSUM_LINE_RE = re.compile(r"^([0-9a-f]{64})  (.+)$")
 # safe path component only. Anything else is refused, never opened.
 SAFE_ARTIFACT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 # The event schema's own observed_at shape (numeric offset, KST form in
-# every recorded stamp): the opening-mode window predicate parses the
-# recorded stamp only, never the wall clock.
+# every recorded stamp): the opening-mode reference group's recorded
+# stamp is validated against it before its moment is parsed. A data
+# validity check — the mode itself is decided by the caller-supplied
+# as_of, never by a recorded stamp or the wall clock.
 OBSERVED_AT_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"[+-][0-9]{2}:[0-9]{2}$")
@@ -101,9 +105,10 @@ SIGNED_PRICE_RE = re.compile(r"^[+-][0-9]+$")
 DAY_CLOSE_RE = re.compile(r"^[0-9]+$")
 # The ka10081 daily-row dt shape: YYYYMMDD.
 BAR_DT_RE = re.compile(r"^[0-9]{8}$")
-# Korea Standard Time: the recorded observed_at stamps are converted to
-# this zone for the window predicate — a pure string-to-moment
-# conversion, the wall clock is never read.
+# Korea Standard Time: the decision moment (as_of) and the response's
+# as_of texts are expressed in this zone. The HTTP adapter reads the
+# host clock once per request when as_of is absent; every projection
+# below receives the moment as a value.
 KST = timezone(timedelta(hours=9))
 
 RUN_JSON = "run.json"
@@ -159,8 +164,9 @@ MARKET_MA20_API = "ka10081"
 MARKET_MA20_LIST_KEY = "stk_dt_pole_chart_qry"
 MARKET_MA20_DAYS = 20
 # The VS-2 opening window (README §3.7): a half-open interval over the
-# time-of-day of the reference group's RECORDED observed_at (KST) —
-# [09:00:00, 09:30:00). Never the wall clock.
+# KST time-of-day of the caller-supplied decision moment (as_of) —
+# [09:00:00, 09:30:00), applied only when as_of's KST date equals the
+# selected run's session_date.
 OPENING_WINDOW_START = "09:00:00"
 OPENING_WINDOW_END = "09:30:00"
 # The §3.7 item whitelist: the projection is field-bounded so the
@@ -211,6 +217,12 @@ class DataFault(Exception):
     Fail-closed: the endpoint answers HTTP 500, it never silently skips
     a corrupted record. Messages carry file basenames only — never
     absolute paths."""
+
+
+class BadRequest(Exception):
+    """A request parameter violates its contract (README §4): the
+    endpoint answers HTTP 400. Fail-closed — a malformed value is never
+    replaced by a silent default."""
 
 
 class ServiceWarming(Exception):
@@ -847,18 +859,51 @@ def _ma20_distance_order(entries, above):
     return entries
 
 
-def opening_market_top10(confirmed, snapshots, ma20):
+def determine_mode(as_of, session_date):
+    """The §3.7 mode decision (README §3.7): the opening MA20 mode
+    applies only when `as_of` — the caller-supplied decision moment —
+    falls in the half-open KST window [OPENING_WINDOW_START,
+    OPENING_WINDOW_END) on the selected run's session_date. `as_of` is
+    the only time authority: this function never reads a clock. A
+    missing or naive as_of, a non-string session_date, or an as_of
+    whose KST date is not the session_date fails closed to "core"."""
+    if as_of is None or as_of.tzinfo is None \
+            or not isinstance(session_date, str):
+        return "core"
+    moment = as_of.astimezone(KST)
+    if moment.date().isoformat() != session_date:
+        return "core"
+    clock = moment.strftime("%H:%M:%S")
+    if OPENING_WINDOW_START <= clock < OPENING_WINDOW_END:
+        return "opening_ma20"
+    return "core"
+
+
+def _as_of_text(as_of):
+    """The response's as_of texts (README §3.7): the decision moment in
+    KST at second precision, None when absent."""
+    if as_of is None:
+        return None
+    return as_of.astimezone(KST).isoformat(timespec="seconds")
+
+
+def opening_market_top10(mode, confirmed, snapshots, ma20):
     """The VS-2 opening MA20 projection (README §3.7): the top10 lists
     reconstituted from the recorded prices of the reference group's
     chain-pair against the recorded 20-day close sums — a display-only
     classification of recorded values (recorded price vs recorded
-    average), never a market judgment. Returns ("core", [], []) when
-    the projection does not apply — no confirmed observation group, or
-    the reference group's recorded observed_at time-of-day (KST) is
-    outside the half-open window [OPENING_WINDOW_START,
-    OPENING_WINDOW_END); the recorded predicate only, never the wall
-    clock — and ("opening_ma20", rising, falling) otherwise. A
-    correspondence failure raises DataFault (fail-closed).
+    average), never a market judgment. `mode` is the caller's decision
+    (determine_mode): any value other than "opening_ma20", or a
+    missing confirmed observation group, returns ([], [], None) — the
+    honest empty lists. Otherwise the projected lists and their
+    coverage are returned. A correspondence failure raises DataFault
+    (fail-closed).
+
+    The reference group's recorded observed_at is parsed and validated
+    as recorded data (canonical timestamp shape, calendar moment) —
+    a data validity check, never the window predicate: as_of is the
+    caller-supplied decision moment; this function never reads a
+    clock.
 
     `confirmed` is the event fold's capture of the last CONFIRMED
     observation group: (1-based group index, observed_at stamp, the
@@ -883,20 +928,17 @@ def opening_market_top10(confirmed, snapshots, ma20):
     _ma20_distance_order and cut to MARKET_TOP_N. The projected items
     are the recorded candidate state verbatim — only the placement and
     the ma20_tag are the mode's."""
-    if confirmed is None:
-        return "core", [], [], None
+    if mode != "opening_ma20" or confirmed is None:
+        return [], [], None
     index, stamp, state, upserts = confirmed
     if OBSERVED_AT_RE.match(stamp) is None:
         raise DataFault("%s observed_at is not the canonical timestamp "
                         "shape" % EVENTS_JSONL)
     try:
-        moment = datetime.fromisoformat(stamp)
+        datetime.fromisoformat(stamp)
     except ValueError:
         raise DataFault("%s observed_at is not a calendar moment"
                         % EVENTS_JSONL)
-    clock = moment.astimezone(KST).strftime("%H:%M:%S")
-    if not (OPENING_WINDOW_START <= clock < OPENING_WINDOW_END):
-        return "core", [], [], None
     snapshot = None
     for offset in (0, 1, -1):
         candidate = index + offset - 1
@@ -939,7 +981,7 @@ def opening_market_top10(confirmed, snapshots, ma20):
         "status": ("COMPLETE" if rising_complete and falling_complete
                    else "PARTIAL"),
     }
-    return "opening_ma20", rising, falling, coverage
+    return rising, falling, coverage
 
 
 class Projector:
@@ -1552,7 +1594,7 @@ class Projector:
             records.append(Projector._market_fact_change(ev, names))
         return records[-MARKET_HISTORY_N:]
 
-    def market_view(self):
+    def market_view(self, as_of=None):
         """GET /mobile/market-view (README §3.7): the bounded,
         deterministic, read-only projection of the latest ELIGIBLE
         market-collection run. No judgment happens here: ranks are
@@ -1566,13 +1608,15 @@ class Projector:
         facts already in the journal, translated field-for-field —
         still no judgment: the facts are the confirmed changes). The
         VS-2 opening MA20 mode is one more recorded projection on the
-        same fold: when the reference group's recorded observed_at
-        falls in the opening window, the top10 lists are reconstituted
-        by opening_market_top10 from recorded prices against recorded
+        same fold: `as_of` — the caller-supplied decision moment — is
+        the mode's only time authority (determine_mode); inside the
+        opening window the top10 lists are reconstituted by
+        opening_market_top10 from recorded prices against recorded
         close sums (§3.7) — orthogonal to the history path. The runs
         root is listed once per request and every identity is read
-        from recorded bytes (the committed config record), never the
-        wall clock. The event fold and the response stay per-request
+        from recorded bytes (the committed config record); this method
+        never reads a clock (the HTTP adapter passes the request's
+        moment in). The event fold and the response stay per-request
         locals; the cached objects are the derived market fold
         (§3.7, _market_projection) and the journal's committed-lines
         cache (_events_committed_lines).
@@ -1613,8 +1657,9 @@ class Projector:
                              read_last_observed_at(events_path),
                              config.get("events_contract")))
         if not eligible:
-            return {"as_of": None, "coverage": None, "history": [],
-                    "latest": None, "mode": "core", "run": None,
+            return {"as_of": None, "coverage": None, "data_as_of": None,
+                    "history": [], "latest": None, "mode": "core",
+                    "mode_as_of": _as_of_text(as_of), "run": None,
                     "rising_top10": [],
                     "falling_top10": [], "runs_present": bool(names),
                     "status": None}
@@ -1622,6 +1667,10 @@ class Projector:
         # committed observed_at (None ranks last), then max dirname.
         session, environment, session_date, run_id, _, events_contract = \
             max(eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        # The §3.7 mode decision: as_of (the caller's moment) against
+        # the selected run's recorded session_date — the run's recorded
+        # bytes never decide the mode.
+        mode = determine_mode(as_of, session_date)
         # The §3.7 history dual-path discriminator: the selected run's
         # own recorded config value. Absence is the pre-contract legacy
         # projection; "top10-v1" is the fact path. Any other value is a
@@ -1851,8 +1900,8 @@ class Projector:
             # comparison records confirm_group never wrote.
             changes = self._fact_history(facts, last_stamp_pos, sealed,
                                          stock_names)
-        (mode, opening_rising, opening_falling, coverage) = \
-            opening_market_top10(confirmed, snapshots, ma20)
+        (opening_rising, opening_falling, coverage) = \
+            opening_market_top10(mode, confirmed, snapshots, ma20)
         if mode == "opening_ma20":
             rising, falling = opening_rising, opening_falling
         else:
@@ -1870,14 +1919,17 @@ class Projector:
                     target.append({field: entry[field]
                                    for field in MARKET_ITEM_FIELDS})
         last = events[-1] if events else None
+        data_as_of = last["observed_at"] if last else None
         return {
-            "as_of": last["observed_at"] if last else None,
+            "as_of": data_as_of,
             "coverage": coverage,
+            "data_as_of": data_as_of,
             "history": changes,
             "latest": ({field: last[field] for field in
                         ("data_quality", "event_id", "event_type",
                          "observed_at")} if last else None),
             "mode": mode,
+            "mode_as_of": _as_of_text(as_of),
             "run": {"environment": environment, "run_id": run_id,
                     "session": session, "session_date": session_date},
             "rising_top10": rising,
@@ -2063,9 +2115,31 @@ class Handler(BaseHTTPRequestHandler):
                 if body is None:
                     return self._not_found()
             elif path == "/mobile/market-view":
-                body = projector.market_view()
+                # The decision moment (README §3.7/§4): an explicit
+                # as_of is parsed and must carry an offset; absent, the
+                # adapter reads the host clock once for this request.
+                # '+' is escaped before parse_qs — the KST offset sign
+                # is a literal '+', which parse_qs would otherwise
+                # decode to a space and reject every valid stamp.
+                values = parse_qs(
+                    split.query.replace("+", "%2B"),
+                    keep_blank_values=True).get("as_of")
+                if values is None:
+                    as_of = datetime.now(KST)
+                else:
+                    try:
+                        as_of = datetime.fromisoformat(values[0])
+                    except ValueError:
+                        raise BadRequest("as_of is not an ISO-8601 "
+                                         "datetime")
+                    if as_of.tzinfo is None:
+                        raise BadRequest("as_of must carry a UTC offset")
+                body = projector.market_view(as_of)
             else:
                 return self._not_found()
+        except BadRequest as exc:
+            return self._send_json(400, {"error": {"code": "bad_request",
+                                                    "message": str(exc)}})
         except DataFault as exc:
             return self._send_json(500, {"error": {"code": "data_fault",
                                                    "message": str(exc)}})
