@@ -527,7 +527,7 @@ OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once
 
 ### Evidence log (2026-11-17 저녁) — 운영 서버 `hongscanner-srv` production 배포·OC-1 무로그인 재부팅
 
-운영 호스트는 워크스테이션(`192.168.0.7`)이 아니라 **HP ProBook 470 G2 `hongscanner-srv`**다: `wlo1` `192.168.0.82/24`(DHCP via `192.168.0.1`, MAC `ac:d1:b8:9b:60:bd`), tailnet `100.125.164.8`, `https://hongscanner-srv.tail10d26b.ts.net` (tailnet only, `tailscale serve` → `127.0.0.1:8080`), 유닛 `hongscanner-serve.service`, `Linger=yes`.
+운영 호스트는 워크스테이션(`192.168.0.7`)이 아니라 **HP ProBook 470 G2 `hongscanner-srv`**다: `wlo1` `192.168.0.82/24`(DHCP via `192.168.0.1`, MAC `ac:d1:b8:9b:60:bd`), tailnet `100.125.164.8`, `https://hongscanner-srv.tail10d26b.ts.net` (tailnet only, `tailscale serve` → `127.0.0.1:8080`), 유닛 `hongscanner-serve.service`, `Linger=yes`. 호스트·기기 역할의 정본은 ASSUMPTIONS **P29**(2026-11-18 사용자 결정)다 — 테스트·실전 실행 호스트는 `hongscanner-srv` 하나이고, `s25-ultra`는 실전, `s10`은 테스트 클라이언트이며, 이 개발 머신은 운영 실행 주체가 아니다.
 
 | gate | observed |
 |---|---|
