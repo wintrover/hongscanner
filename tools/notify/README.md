@@ -94,6 +94,18 @@ Python register 프로세스 (notify_register.py)
   - 창 안의 `TOP10_ENTERED`/`TOP10_EXITED`는 그룹의 무음 `digest`
     유닛(`market_rank_digest`)에 접힌다. ledger와 `data.event_ids`에는
     모든 사건이 남는다 — 왕복 상쇄는 없다.
+- **개장 피크 예산 (P28 개정)**: 세션 달력이 증명한 개장 시각부터 30분
+  (`market_time.in_window`, Asia/Seoul, 시작 포함·종료 제외) 안에서
+  **관측된**(`observed_at`) 그룹은 그룹당 사운드 1통을 가지며, 그룹
+  사이의 60분 전역 상한(`audible_cooldown_seconds`)을 소비하지 않는다
+  — 피크 동안 그룹 간 상한은 없다. 자격은 두 시간의 분리로 판정한다:
+  창은 `observed_at`, 신선도는 판정 시각 `as_of`
+  (`0 ≤ as_of − observed_at ≤ peak_window.freshness_seconds`, 기본
+  900) — 미래 시각(음수 나이)은 `digest`로 fail-closed다. 달력·세션
+  개장 시각이 UNKNOWN이면 특권은 **없고** P28이 그대로 적용된다:
+  09:00을 추측하지 않는다. 피크 사운드도 P28 high-water mark를
+  갱신해 재시작 후 예산이 일관된다. 재생 판정 입력은 명시적
+  `--as-of`다(§9).
 
 - 3상태 3보금(전달 상태는 이벤트 팩트에 절대 병합되지 않는다,
   스키마 x-separation-rule): 중요도/신뢰는 팩트의 필드, 검증은 세션
@@ -397,6 +409,9 @@ Python register 프로세스 (notify_register.py)
   "backoff_cap_seconds": 900,
   "watch_poll_seconds": 1.0,         // 상주 worker 틱 간격, 0 < x <= 60
   "audible_cooldown_seconds": 3600,  // 사운드 전역 예산(초), 1 이상 정수
+  "peak_window": {"enable": true,    // 개장 피크 예산(선택, §7 아래)
+                  "freshness_seconds": 900,
+                  "audible": "unlimited_per_group"},
   "service_account_path": "/abs/outside-repo/sa.json",  // 또는 아래
   "token_command": ["gcloud", "auth", "application-default",
                     "print-access-token"],
@@ -421,6 +436,22 @@ Python register 프로세스 (notify_register.py)
   fail-closed 거부다(§0 Global Attention Budget v1). 창의 판정은
   `observed_at`(시장 관측 시각)과 `updated_at`/현재 dispatcher
   시계(실제 발송·예약 시각) 두 축을 모두 요구한다.
+
+- **`peak_window` 섹션(선택)**: 개장 피크 예산(P28 v2, 2026-11-18
+  사용자 결정). 기본값 `{"enable": true, "freshness_seconds": 900,
+  "audible": "unlimited_per_group"}`. 섹션이 있으면 엄격 검증한다 —
+  객체가 아니거나, 위 3키 밖의 키거나, `enable`이 bool이 아니거나,
+  `freshness_seconds`가 1 미만 정수(bool 포함 거부)이거나,
+  `audible`이 `"unlimited_per_group"`이 아니면 ConfigError(exit 2).
+  **`enable`은 특권 자체가 아니다**: dispatcher는 그 런의 기록된 세션
+  개장(`--run-dir`의 `input.hcj.jsonl` 첫 calendar 레코드
+  `days[session_date].open`)이 확인되고 관측이 신선할 때
+  (`0 <= as_of - observed_at <= freshness_seconds`)에만 창 안 그룹의
+  사운드 상한을 해제한다(그룹당 1통, 그룹 간 상한 없음). 세션 개장이
+  UNKNOWN이거나 `--run-dir`이 없으면 P28 60분 예산이 그대로
+  적용된다(fail-closed). 창 산술은 `tools/market_time.py` 하나가
+  소유한다(P30) — 이 파일도 dispatcher도 09:00 상수를 갖지 않는다.
+  음수 나이(미래 관측)는 fail-closed로 창 특권을 받지 못한다.
 
 - **`min_severity`는 제거됐다** — 발송 정책은 §0의 어드미션 게이트로
   옮겨갔다. 설정 파일에 키가 남아 있으면 **무시된다**
@@ -474,10 +505,15 @@ Python register 프로세스 (notify_register.py)
   팩트 수다(전달 기록 없음, §1). `type_skipped`는 scope 안에서 정책이
   suppress로 판정한 수만 센다 — 범위 밖 팩트는 어드미션 판정 전에
   제외된다.
-- **`--admission-report <abs events 파일>` — 재생 도구**: 발송도
-  원장 기록도 없이(Dispatcher를 만들지도 않는다) 파일의 모든 사건을
-  실운용과 **같은 어드미션 코드**(admission_mode·
-  compose_admission_units)로 판정해 stdout에 출력한다. 출력 구조:
+- **`--admission-report <abs events 파일> --as-of <ISO-8601>` — 재생
+  도구**: 발송도 원장 기록도 없이(Dispatcher를 만들지도 않는다) 파일의
+  모든 사건을 실운용과 **같은 어드미션 코드**(admission_mode·
+  compose_admission_units)로 판정해 stdout에 출력한다. `--as-of`는
+  **필수**이며 aware 시각이어야 한다(누락·naive는 exit 2): 피크 창
+  자격이 판정 시각에 의존하기 때문이다. 피크가 세션 달력 스냅샷의
+  개장 시각을 쓰도록 `--run-dir`을 함께 준다(없으면 피크 비활성 =
+  P28 그대로). `--session-open HH:MM:SS`는 가상 replay 전용
+  오버라이드다(운영 경로 아님). 출력 구조:
   첫 줄 `admission policy source=<default|config>` + 전체 매핑(섹션
   없음이 설정 정책과 혼동되지 않게), 사건별 판정 1줄씩(`verdict=
   ADMIT|DIGEST|SUPPRESS`, form=single|summary|digest|suppress|
@@ -485,9 +521,9 @@ Python register 프로세스 (notify_register.py)
   (`admission group ... events=N sound=S silent=D`)과 조립 플랜
   (`admission plan ... kind=K count=N title=... body=...
   event_ids=...` — 4096 초과 조립은 `refused=HS_PAYLOAD_OVER_LIMIT`),
-  총계 라인. 시계가 없으므로 **같은 입력·같은 config면 바이트 단위로
-  동일**하다. config 검증은 "dispatch" 역할로 실운용과 같은 경로를
-  지난다(재생==실운용 정책).
+  총계 라인. 결정 입력은 파일·config·`--as-of`·달력 스냅샷뿐이므로
+  **같은 입력·같은 config면 바이트 단위로 동일**하다. config 검증은
+  "dispatch" 역할로 실운용과 같은 경로를 지난다(재생==실운용 정책).
 
 ### 상주(--watch) 모드의 종료·시그널
 

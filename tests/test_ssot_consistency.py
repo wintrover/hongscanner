@@ -304,22 +304,31 @@ class SsotConsistencySuite(unittest.TestCase):
             "notify_fcm.TOP10_EVENT_TYPES drifted from "
             "event.schema.json: %s" % sorted(unknown))
 
-    def test_event_schema_covers_dispatcher_aggregation_started(self):
-        dispatcher_path = os.path.join(
-            REPO, "tools", "notify", "notify_dispatcher.py")
-        node = self._module_assignments(
-            dispatcher_path, "AGGREGATION_STARTED")
-        self.assertIsInstance(
-            node, ast.Constant,
-            "AGGREGATION_STARTED is not a literal: the extraction "
-            "went blind")
-        self.assertIsInstance(node.value, str)
-
+    def test_dispatcher_never_sends_aggregation_started(self):
+        # P27 (user decision 2026-11-18): AGGREGATION_STARTED is a
+        # session-lifecycle fact — recorded in the ledger, never pushed
+        # to consumers. The type must stay in the schema (the fact is
+        # still recorded) and must not be assigned in the dispatcher
+        # (a reassignment would mean the consumer filter regressed).
         enum = set(load_event_type_enum())
         self.assertIn(
-            node.value, enum,
-            "notify_dispatcher.AGGREGATION_STARTED drifted from "
-            "event.schema.json")
+            "AGGREGATION_STARTED", enum,
+            "event.schema.json must keep AGGREGATION_STARTED: the fact "
+            "is recorded even though it is never pushed")
+        dispatcher_path = os.path.join(
+            REPO, "tools", "notify", "notify_dispatcher.py")
+        with open(dispatcher_path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=dispatcher_path)
+        assigned = [
+            target.id for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+            and target.id == "AGGREGATION_STARTED"]
+        self.assertEqual(
+            assigned, [],
+            "notify_dispatcher.py assigns AGGREGATION_STARTED: the "
+            "dispatcher must never deliver it to consumers (P27)")
 
     def test_event_schema_covers_dart_market_event_types(self):
         enum = set(load_event_type_enum())
@@ -400,18 +409,24 @@ class SsotConsistencySuite(unittest.TestCase):
             "digest_list_screen.dart case labels drifted from "
             "event.schema.json: %s" % sorted(unknown))
 
-    def test_delivery_schema_covers_main_kind_literals(self):
-        # main.dart's digest channel routing: every string literal the
-        # shell compares against message.kind.
+    def test_main_kind_literals_and_foreground_silence(self):
+        # main.dart used to route the digest channel by message.kind and
+        # post a local notification; since 2026-11-18 the foreground
+        # posts nothing to the OS, so the channel comparison may be
+        # gone. Two mechanical checks: any remaining kind comparison
+        # must name a delivery.schema.json message_kind, and the shell
+        # must never call the local-notification poster again.
         path = os.path.join(REPO, "mobile", "lib", "main.dart")
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
+        self.assertNotIn(
+            "postNotification(",
+            text,
+            "main.dart calls postNotification: the foreground must "
+            "never post a system notification or sound (2026-11-18)")
         found = re.findall(r"\bmessage\.kind\s*[!=]=\s*'([^']+)'", text)
-        self.assertTrue(
-            found,
-            "no message.kind == '...' comparisons in main.dart: the "
-            "extraction went blind")
-
+        if not found:
+            return
         enum = set(load_message_kind_enum())
         unknown = set(found) - enum
         self.assertEqual(
@@ -475,6 +490,41 @@ class SsotConsistencySuite(unittest.TestCase):
             unknown, set(),
             "notify_fcm.py payload kind values drifted from "
             "delivery.schema.json message_kind: %s" % sorted(unknown))
+
+    def test_market_time_is_the_single_window_authority(self):
+        """The opening window has one owner (P30): the API's mode
+        decision and the dispatcher's peak budget must both consume
+        tools/market_time.py, and neither may keep its own 09:00/09:30
+        boundary literal — the duplicated-fact shape that let the two
+        copies drift apart."""
+        consumers = (
+            ("tools/api/serve.py",
+             os.path.join(REPO, "tools", "api", "serve.py")),
+            ("tools/notify/notify_dispatcher.py",
+             os.path.join(REPO, "tools", "notify", "notify_dispatcher.py")),
+        )
+        for label, path in consumers:
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=path)
+            imported = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported = imported or any(
+                        alias.name == "market_time" for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imported = imported or node.module == "market_time"
+            self.assertTrue(
+                imported,
+                "%s must import market_time (P30 single time authority)"
+                % label)
+            literals = {
+                node.value for node in ast.walk(tree)
+                if isinstance(node, ast.Constant)
+                and isinstance(node.value, str)}
+            self.assertEqual(
+                literals & {"09:00:00", "09:30:00"}, set(),
+                "%s keeps a duplicated opening-window boundary literal; "
+                "the window lives in market_time only" % label)
 
 
 if __name__ == "__main__":

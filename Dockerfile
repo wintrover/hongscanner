@@ -51,6 +51,11 @@ FROM python:3.13-slim
 # dependency its wire contract is measured against
 # (tools/collector/requirements.txt: websockets==17.3).
 COPY tools/api/serve.py /opt/hongscanner/serve.py
+# The session-time authority (P30) keeps its repo-relative tools/ path in
+# the image: serve.py and the notify dispatcher both resolve
+# market_time.py through the same directory they use in the checkout
+# (serve.py's bootstrap below, dispatcher's _TOOLS_DIR).
+COPY tools/market_time.py /opt/hongscanner/tools/market_time.py
 COPY bin/hongscanner /opt/hongscanner/bin/hongscanner
 COPY calendars/CALENDAR_INDEX.sha256 /opt/hongscanner/CALENDAR_INDEX.sha256
 
@@ -59,8 +64,12 @@ COPY calendars/CALENDAR_INDEX.sha256 /opt/hongscanner/CALENDAR_INDEX.sha256
 # the sidecar SCRIPT next to its own binary (getAppDir()/sidecar.py,
 # collector.nim:74-79) and the sidecar INTERPRETER through
 # $HSCOLLECTOR_PYTHON first (collector.nim:62-72) — pinned by ENV below.
-# The notify dispatcher imports its siblings flat (notify_config /
-# notify_fcm / notify_ledger), so all four live in one directory. The
+# The notify dispatcher imports its siblings flat (notify_clock /
+# notify_config / notify_fcm / notify_ledger), so all five live in one
+# directory. notify_clock was the second missing module of the
+# market_time class: the dispatcher's module-level import failed inside
+# the image while every suite stayed green (tests/test_container_contract.sh
+# now derives this set from the imports instead of trusting this list). The
 # final entry-point wiring (which process the supervisor starts with
 # which args/env) is PR-4's cloud_supervisor surface: after PR-4 merges,
 # the supervisor's environment variables name these paths (README §8).
@@ -68,6 +77,7 @@ COPY bin/collector /opt/hongscanner/bin/collector
 COPY tools/collector/sidecar.py /opt/hongscanner/bin/sidecar.py
 COPY tools/collector/requirements.txt /opt/hongscanner/tools/collector/requirements.txt
 COPY tools/notify/notify_dispatcher.py /opt/hongscanner/tools/notify/notify_dispatcher.py
+COPY tools/notify/notify_clock.py /opt/hongscanner/tools/notify/notify_clock.py
 COPY tools/notify/notify_config.py /opt/hongscanner/tools/notify/notify_config.py
 COPY tools/notify/notify_fcm.py /opt/hongscanner/tools/notify/notify_fcm.py
 COPY tools/notify/notify_ledger.py /opt/hongscanner/tools/notify/notify_ledger.py

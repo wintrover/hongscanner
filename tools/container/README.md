@@ -16,7 +16,7 @@
 |---|---|
 | base | `python:3.13-slim` — serve.py는 표준 라이브러리만 사용(http.server), **serve.py를 위한 pip 설치 금지**; 유일한 pip 설치는 collector sidecar의 버전 고정 의존성(websockets==17.3, `tools/collector/requirements.txt`) |
 | 사용자 | 비루트 `hongscanner` (system user, nologin) |
-| 코드 | `/opt/hongscanner/` — `serve.py` · `cloud_supervisor.py` · `bin/hongscanner` · `bin/collector` · `bin/sidecar.py`(collector 바이너리 옆) · `tools/collector/requirements.txt` · `tools/notify/{notify_dispatcher,notify_config,notify_fcm,notify_ledger}.py` · `CALENDAR_INDEX.sha256` |
+| 코드 | `/opt/hongscanner/` — `serve.py` · `tools/market_time.py`(세션 시간 권위, P30) · `cloud_supervisor.py` · `bin/hongscanner` · `bin/collector` · `bin/sidecar.py`(collector 바이너리 옆) · `tools/collector/requirements.txt` · `tools/notify/{notify_dispatcher,notify_clock,notify_config,notify_fcm,notify_ledger}.py` · `CALENDAR_INDEX.sha256` |
 | 데이터 | `/var/lib/hongscanner/` — `runs/` · `notify/` (볼륨 마운트 지점, 빈 상태로 이미지에 존재) |
 | 환경 | `ENV HSCOLLECTOR_PYTHON=python3` — sidecar 인터프리터 탐색(`$HSCOLLECTOR_PYTHON` → 바이너리 옆 `.venv/bin/python` → `python3`)의 첫 경로를 고정. + supervisor 핀 6건: `HS_API_BIND=0.0.0.0` · `HS_API_PORT=8080` · `HS_SUPERVISOR_PROBE_PORT=8081` · `HS_DATA_ROOT=/var/lib/hongscanner` · `HS_CALENDAR_DIR=/var/lib/hongscanner/calendars` · `HS_CALENDAR_INDEX=/opt/hongscanner/CALENDAR_INDEX.sha256` — §7.4 코드 기본값과 동일한 값으로 이미지 표면을 자기완결적으로 만든다 |
 | 노출 | `EXPOSE 8080 8081`, `STOPSIGNAL SIGTERM` |
@@ -56,11 +56,17 @@ Docker의 일반 COPY는 **빌드 컨텍스트 밖 파일에 도달할 수 없�
    파일을 그 안으로 복사**한다.
 2. 그 디렉터리를 컨텍스트로 `docker build`한다.
 3. Dockerfile은 **컨텍스트 내 상대 경로만** COPY한다: `bin/hongscanner`,
-   `bin/collector`, `tools/api/serve.py`,
+   `bin/collector`, `tools/api/serve.py`, `tools/market_time.py`,
    `tools/container/cloud_supervisor.py`,
    `tools/collector/{sidecar.py,requirements.txt}`,
-   `tools/notify/{notify_dispatcher,notify_config,notify_fcm,
-   notify_ledger}.py`, `calendars/CALENDAR_INDEX.sha256`.
+   `tools/notify/{notify_dispatcher,notify_clock,notify_config,
+   notify_fcm,notify_ledger}.py`, `calendars/CALENDAR_INDEX.sha256`.
+   `market_time.py`는 이미지에서도 `tools/` 상대 경로를 유지한다 —
+   디스패처의 `_TOOLS_DIR` import가 체크아웃과 동일하고, 평면 배치된
+   `serve.py`는 부트스트랩이 `./tools/market_time.py`를 찾는다.
+   이 목록은 신뢰 대상이 아니다: 계약 테스트가 `serve.py`·
+   `notify_dispatcher.py`의 import 폐포에서 복사 집합을 유도해 누락을
+   기계적으로 검출한다.
 
 스테이징 절차(운영·테스트 공통):
 
@@ -71,11 +77,13 @@ mkdir -p "$CTX/bin" "$CTX/tools/api" "$CTX/tools/collector" \
 cp Dockerfile                      "$CTX/Dockerfile"
 cp .dockerignore                   "$CTX/.dockerignore"
 cp tools/api/serve.py              "$CTX/tools/api/serve.py"
+cp tools/market_time.py            "$CTX/tools/market_time.py"
 cp tools/container/cloud_supervisor.py "$CTX/tools/container/cloud_supervisor.py"
 cp calendars/CALENDAR_INDEX.sha256 "$CTX/calendars/CALENDAR_INDEX.sha256"
 cp tools/collector/sidecar.py      "$CTX/tools/collector/sidecar.py"
 cp tools/collector/requirements.txt "$CTX/tools/collector/requirements.txt"
 cp tools/notify/notify_dispatcher.py "$CTX/tools/notify/notify_dispatcher.py"
+cp tools/notify/notify_clock.py      "$CTX/tools/notify/notify_clock.py"
 cp tools/notify/notify_config.py     "$CTX/tools/notify/notify_config.py"
 cp tools/notify/notify_fcm.py        "$CTX/tools/notify/notify_fcm.py"
 cp tools/notify/notify_ledger.py     "$CTX/tools/notify/notify_ledger.py"
@@ -166,9 +174,9 @@ docker build -t <tag> [--label org.hongscanner.image-purpose=ci-test] "$CTX"
 
 - `bash tests/test_container_contract.sh`: 실측 스모크. mktemp 샌드박스 →
   테스트 바이너리 두 개(hongscanner·collector) nim 직접 컴파일 →
-  스테이징 컨텍스트(Dockerfile·.dockerignore·serve.py·
+  스테이징 컨텍스트(Dockerfile·.dockerignore·serve.py·market_time.py·
   cloud_supervisor.py·INDEX·두 바이너리·sidecar·requirements·
-  notify 4모듈) →
+  notify 5모듈, import 폐포 유도 검사) →
   `docker build --label org.hongscanner.image-purpose=ci-test` →
   .dockerignore 효력 실측(decoy calendar json의 COPY 실패) →
   이미지 내부 검증(레이아웃·실행 비트·바인드 바이트 일치·INDEX·라벨·비루트·
@@ -332,9 +340,9 @@ main push 하나가 **세 개의 SLSA 증명 대상**을 만든다. 모두 동�
 
 - **스테이징**(§2 계약 그대로, attest.yml의 이미지 페이즈): mktemp 컨텍스트 =
   CI_BUILD_OUT 두 바이너리(**sha256 바이트 일치 단언**) + git 추적 파일
-  (Dockerfile·.dockerignore·serve.py·cloud_supervisor.py·INDEX·sidecar·
-  requirements·notify 4모듈). 스테이징 calendars 디렉터리에 `*.json`이
-  나타나면 거부(단언).
+  (Dockerfile·.dockerignore·serve.py·market_time.py·cloud_supervisor.py·
+  INDEX·sidecar·requirements·notify 5모듈). 스테이징 calendars 디렉터리에
+  `*.json`이 나타나면 거부(단언).
 - **표식 없음**: 운영 이미지는 `org.hongscanner.image-purpose` 라벨을
   갖지 않는다(§3 — 라벨이 있으면 배치 금지 대상). BuildKit 내장
   provenance/sbom 매니페스트도 생성하지 않는다 — 이미지의 SLSA 증명은

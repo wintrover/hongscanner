@@ -156,7 +156,7 @@ void main() {
         await channel.postNotification(
             eventId: evUpEnterId, title: 't', body: 'b'),
         isFalse,
-        reason: 'the caller falls back to the in-app banner',
+        reason: 'no platform end — answers false instead of throwing',
       );
       expect(await channel.getPendingTap(), isNull,
           reason: 'a null never invents a route');
