@@ -630,9 +630,23 @@ class Registry:
 
     def mark_invalid(self, device_id, fcm_token):
         """Retire a token the provider rejected (UNREGISTERED). The raw
-        token value is never written here — the sha256 mask only."""
+        token value is never written here — the sha256 mask only.
+
+        Idempotent: when the device's latest record already retires
+        this exact token, nothing is appended. A stale devices
+        snapshot can repeat the same rejection for many events; the
+        registry records state transitions, not one line per failed
+        send."""
+        fcm_token_hash = mask_secret(fcm_token)
+        for obj in reversed(self._records()):
+            if obj["device_id"] != device_id:
+                continue
+            if obj["kind"] == "token_invalid" and \
+               obj["fcm_token_hash"] == fcm_token_hash:
+                return
+            break
         self._append({"kind": "token_invalid", "device_id": device_id,
-                      "fcm_token_hash": mask_secret(fcm_token),
+                      "fcm_token_hash": fcm_token_hash,
                       "at": now_iso()})
 
 

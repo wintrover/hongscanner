@@ -832,6 +832,48 @@ class TestRegistry(Base):
         self.assertIn(notify_ledger.mask_secret(FCM_TOKEN),
                       raw.splitlines()[-1])
 
+    def test_mark_invalid_is_idempotent_for_the_same_token(self):
+        """Repeated rejections of one (device, token hash) pair are
+        one state transition. The 2026-11-09 incident appended 4,431
+        token_invalid lines for a single pair."""
+        self.register("dev-a")
+        registry = notify_ledger.Registry(self.registry_path, lock=True)
+        try:
+            registry.mark_invalid("dev-a", FCM_TOKEN)
+            with open(self.registry_path, "rb") as f:
+                after_first = f.read()
+            registry.mark_invalid("dev-a", FCM_TOKEN)
+            registry.mark_invalid("dev-a", FCM_TOKEN)
+            with open(self.registry_path, "rb") as f:
+                self.assertEqual(f.read(), after_first)
+            self.assertEqual(registry.devices(), {})
+        finally:
+            registry.close()
+        with open(self.registry_path, "r", encoding="utf-8") as f:
+            kinds = [json.loads(line)["kind"] for line in f]
+        self.assertEqual(kinds, ["device", "token_invalid"])
+
+    def test_mark_invalid_after_re_registration_appends_again(self):
+        """The no-op suppresses only the pair's current retirement: a
+        device that re-registers starts a new state history, and its
+        next rejection is a new transition (devices() stays
+        order-dependent)."""
+        self.register("dev-a")
+        registry = notify_ledger.Registry(self.registry_path, lock=True)
+        try:
+            registry.mark_invalid("dev-a", FCM_TOKEN)
+            self.assertEqual(registry.devices(), {})
+            registry.add_device("dev-a", FCM_TOKEN)
+            self.assertEqual(registry.devices(), {"dev-a": FCM_TOKEN})
+            registry.mark_invalid("dev-a", FCM_TOKEN)
+            self.assertEqual(registry.devices(), {})
+        finally:
+            registry.close()
+        with open(self.registry_path, "r", encoding="utf-8") as f:
+            kinds = [json.loads(line)["kind"] for line in f]
+        self.assertEqual(kinds, ["device", "token_invalid", "device",
+                                 "token_invalid"])
+
     def test_single_writer_lock_is_enforced(self):
         first = notify_ledger.Registry(self.registry_path, lock=True)
         with self.assertRaises(notify_ledger.LedgerBusy):
@@ -1459,6 +1501,45 @@ class TestDispatcher(Base):
         finally:
             second.close()
         self.assertEqual(transport.send_count(), 1)
+
+    def test_repeated_unregistered_sends_append_one_token_invalid(self):
+        """The 2026-11-09 incident shape: one sweep holds a frozen
+        devices snapshot, so every due unit for the same token is
+        attempted and rejected UNREGISTERED. Each failure is an honest
+        FAILED delivery record, but the registry records the token's
+        retirement once (the incident appended 4,431 token_invalid
+        lines for one pair)."""
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.seed_ledger(cfg, [
+            make_event(seq=1, observed_at="2026-11-01T09:00:00+09:00"),
+            make_event(event_type="RANK_CHANGED", rule_id="rank-changed",
+                       seq=2, previous_rank=3, rank=2,
+                       observed_at="2026-11-01T09:02:00+09:00"),
+        ])
+        self.register("dev-1")
+        transport = FakeTransport(send_responses=[
+            FakeResponse(404, {"error": {"code": 404,
+                                         "status": "UNREGISTERED"}}),
+            FakeResponse(404, {"error": {"code": 404,
+                                         "status": "UNREGISTERED"}}),
+        ])
+        dispatcher = self.dispatcher(cfg, transport)
+        try:
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 2)
+        self.assertEqual([r["state"] for r in self.delivery_records(cfg)],
+                         ["FAILED", "FAILED"])
+        raw = open(self.registry_path, "r", encoding="utf-8").read()
+        self.assertEqual(raw.count('"token_invalid"'), 1)
+        registry = notify_ledger.Registry(self.registry_path, lock=False)
+        try:
+            self.assertEqual(registry.devices(), {})
+        finally:
+            registry.close()
 
     def test_404_not_found_wire_form_fails_and_retires_the_token(self):
         """The regression the 2026-11-03 live wire exposed: an invalid
