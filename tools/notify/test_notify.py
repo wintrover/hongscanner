@@ -466,6 +466,36 @@ class TestConfig(Base):
             notify_config.admission_mode(loaded, "SESSION_ENDED"),
             "suppress")
 
+    def test_disabled_devices_is_an_exact_string_array_deny_list(self):
+        # Absent -> [] (deny-list polarity: a missing key can never
+        # silence a device). Present -> strict: the value must be an
+        # array of exact DEVICE_ID_RE ids; a bare string, a number
+        # array, null and a glob/regex pattern are all ConfigError.
+        path, cfg = self.config()
+        loaded = notify_config.load_config(path, "dispatch")
+        self.assertEqual(loaded["disabled_devices"], [])
+        good = ["wuyoni-sm-s938n", "wuyoni-sm-g977n"]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(cfg, disabled_devices=good), f)
+        loaded = notify_config.load_config(path, "dispatch")
+        self.assertEqual(loaded["disabled_devices"], good)
+        bad_values = (
+            "wuyoni-sm-g977n",          # a string, not an array
+            3,                          # a number, not an array
+            None,                       # present null != absent key
+            [1, 2],                     # number array
+            ["wuyoni-*"],               # glob/regex pattern
+            [""],                       # empty id
+            ["a b"],                    # whitespace fails DEVICE_ID_RE
+            ["x" * 129],                # beyond the 128-char limit
+            {"wuyoni-sm-g977n": True},  # object, not an array
+        )
+        for bad in bad_values:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(dict(cfg, disabled_devices=bad), f)
+            with self.assertRaises(notify_config.ConfigError):
+                notify_config.load_config(path, "dispatch")
+
 
 # ------------------------------------------------- schema validation
 
@@ -2021,6 +2051,106 @@ class TestDispatcher(Base):
         second = run("two")
         self.assertEqual(first, second)
         self.assertEqual(len(first), 2)  # one single + one digest
+
+
+class TestDisabledDevices(Base):
+    """The send deny-list (README §7): an absent key dispatches every
+    active device; a present key removes EXACT device ids from the
+    send targets BEFORE candidates are formed. The registry is never
+    written — a disabled device stays registered, it is only never a
+    send target (no delivery record, no retry-schedule entry)."""
+
+    S25 = "wuyoni-sm-s938n"
+    S10 = "wuyoni-sm-g977n"
+
+    def _resident_run(self, name, disabled, lines):
+        """One resident watch tick over `lines` with two registered
+        devices. `disabled` None omits the key (baseline); a list is
+        written as the config's deny-list. Returns
+        (worker, transport, loaded cfg, captured stdout)."""
+        sub = os.path.join(self.tmp, name)
+        os.makedirs(sub, exist_ok=True)
+        overrides = {
+            "ledger_path": os.path.join(sub, "ledger.hcj.jsonl"),
+            "delivery_path": os.path.join(sub, "delivery.hcj.jsonl"),
+        }
+        if disabled is not None:
+            overrides["disabled_devices"] = disabled
+        path, _ = self.config(**overrides)
+        cfg = notify_config.load_config(path, "dispatch")
+        self.write_service_account(cfg)
+        events_path = os.path.join(sub, "events.hcj.jsonl")
+        self._append_lines(events_path, lines)
+        transport = FakeTransport()
+        worker = self.dispatcher(cfg, transport, resident=True)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                worker.watch_tick(events_path, 0, None)
+        finally:
+            worker.close()
+        return worker, transport, cfg, out.getvalue()
+
+    def _pair_count(self, worker, device_id):
+        return sum(1 for (_event_id, device) in worker._next_due
+                   if device == device_id)
+
+    def test_absent_key_dispatches_every_active_device(self):
+        # Regression guard: without the key every active device still
+        # forms a pair and receives the push — a missing deny-list must
+        # never silence anyone.
+        self.register("dev-1")
+        self.register("dev-2")
+        line = self.event_line(session_id="2026-11-12", seq=1,
+                               observed_at="2026-11-12T09:12:33+09:00")
+        worker, transport, cfg, out = self._resident_run(
+            "absent", None, [line])
+        self.assertEqual(cfg["disabled_devices"], [])
+        self.assertEqual(worker.counts.get("devices_active"), 2)
+        self.assertEqual({device for (_event_id, device) in worker._next_due},
+                         {"dev-1", "dev-2"})
+        self.assertEqual(transport.send_count(), 2)
+        self.assertEqual(
+            {record["device_id"] for record in self.delivery_records(cfg)},
+            {"dev-1", "dev-2"})
+        self.assertIn("dispatch devices_active=2", out)
+
+    def test_disabled_device_forms_no_pair_and_other_device_is_unchanged(self):
+        # S25 stays registered but is never a send target; S10's pair
+        # count is exactly the baseline's. The filter must run before
+        # candidates: S25 never enters the retry schedule and gets no
+        # delivery record.
+        self.register(self.S25)
+        self.register(self.S10)
+        lines = [
+            self.event_line(session_id="2026-11-12", seq=1,
+                            observed_at="2026-11-12T09:12:33+09:00"),
+            self.event_line(session_id="2026-11-12", seq=2,
+                            symbol="000660",
+                            observed_at="2026-11-12T09:13:33+09:00"),
+        ]
+        base_worker, _base_transport, base_cfg, _ = self._resident_run(
+            "baseline", None, lines)
+        self.assertEqual(base_worker.counts.get("devices_active"), 2)
+        self.assertEqual(self._pair_count(base_worker, self.S10), 2)
+        self.assertEqual(self._pair_count(base_worker, self.S25), 2)
+        base_s10 = [record for record in self.delivery_records(base_cfg)
+                    if record["device_id"] == self.S10]
+        self.assertEqual(len(base_s10), 2)
+
+        worker, transport, cfg, out = self._resident_run(
+            "disabled", [self.S25], lines)
+        self.assertEqual(cfg["disabled_devices"], [self.S25])
+        self.assertEqual(worker.counts.get("devices_active"), 1)
+        self.assertEqual(self._pair_count(worker, self.S25), 0)
+        self.assertEqual(self._pair_count(worker, self.S10),
+                         self._pair_count(base_worker, self.S10))
+        records = self.delivery_records(cfg)
+        self.assertEqual({record["device_id"] for record in records},
+                         {self.S10})
+        self.assertEqual(len(records), len(base_s10))
+        self.assertEqual(transport.send_count(), len(base_s10))
+        self.assertIn("dispatch devices_active=1", out)
 
 
 class TestGlobalAttentionBudget(Base):

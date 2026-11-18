@@ -78,9 +78,15 @@ def _main(argv):
         devices = registry.devices()
     finally:
         registry.close()
+    # The dispatcher's send deny-list (README §7) also applies to the
+    # ops side-channel: a disabled device stays registered but is never
+    # a send target here either. The registry is not written.
+    disabled = set(cfg.get(notify_config.DISABLED_DEVICES_KEY) or ())
+    devices = {device_id: token for device_id, token in devices.items()
+               if device_id not in disabled}
     if not devices:
-        print("ops_alert: no active devices in the registry",
-              file=sys.stderr)
+        print("ops_alert: no active send targets (registry empty or every "
+              "device disabled by config)", file=sys.stderr)
         return 3
 
     try:

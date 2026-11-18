@@ -348,6 +348,26 @@ class Dispatcher:
 
     # ------------------------------------------------------ selection
 
+    def _send_devices(self):
+        """The active send targets: the registry's active devices
+        minus the config's disabled_devices deny-list (README §7).
+        The filter runs BEFORE candidates are formed — a disabled
+        device gets no pair, no retry-schedule entry and no delivery
+        record, and its registry record is untouched (it stays a
+        registered device; only sending to it is off). Ids are matched
+        exactly: the deny-list never carries a pattern. The active
+        count is logged on every pass ("dispatch devices_active=N") so
+        the operational log shows what the tick actually targeted."""
+        devices = self.registry.devices()
+        disabled = set(self.cfg.get(notify_config.DISABLED_DEVICES_KEY) or
+                       ())
+        if disabled:
+            devices = {device_id: token
+                       for device_id, token in devices.items()
+                       if device_id not in disabled}
+        self._log("dispatch devices_active=%d" % len(devices))
+        return devices
+
     def _candidates(self, events, state, devices, session_id=None,
                     run_scoped=False):
         """The worklist in deterministic order (ledger order, then
@@ -837,7 +857,7 @@ class Dispatcher:
         state = self.delivery.read_state()
         events = self.ledger.events(strict=False)
         self._last_events = events
-        devices = self.registry.devices()
+        devices = self._send_devices()
         pairs = self._candidates(events, state, devices)
         self.counts["pairs_to_send"] = len(pairs)
 
@@ -1019,7 +1039,7 @@ class Dispatcher:
         state = self.delivery.read_state()
         events = self.ledger.events(strict=False)
         self._last_events = events
-        devices = self.registry.devices()
+        devices = self._send_devices()
         pairs = self._candidates(events, state, devices,
                                  session_id=self._session_id,
                                  run_scoped=True)
