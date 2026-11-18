@@ -1,7 +1,12 @@
 name: ci
 
+# `push` stays main-only: branch commits are validated by `pull_request`,
+# and `attest.yml` polls for a same-SHA `ci` success on main pushes. Any
+# other push branch would run this suite twice per commit for no extra
+# coverage.
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:

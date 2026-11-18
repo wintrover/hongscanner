@@ -18,7 +18,10 @@ on:
     paths:
       - 'mobile/**'
       - '.github/workflows/mobile.yml'
+  # main-only: branch pushes are covered by `pull_request`; the paths
+  # filter applies to both events.
   push:
+    branches: [main]
     paths:
       - 'mobile/**'
       - '.github/workflows/mobile.yml'
