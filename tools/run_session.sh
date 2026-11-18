@@ -45,11 +45,13 @@
 ##                              <repo>/tools/collector/collector)
 ##          HSCOLLECTOR_PYTHON  worker interpreter (default
 ##                              <repo>/tools/collector/.venv/bin/python)
-##          HS_NOTIFY_CMD       preflight alert command override (the
+##          HS_NOTIFY_CMD       operator-only alert command override (the
 ##                              contract tests' stub; may carry
-##                              arguments); unset = the ops side-channel
-##                              default: ops_alert.py on the SAME Python
-##                              3.13 interpreter as the worker
+##                              arguments); unset = record-only. The
+##                              launcher never pushes to a consumer
+##                              device: every alert is recorded in the
+##                              launcher log and nothing else runs
+##                              unless this override is set
 ##          HS_PREFLIGHT_MIN_AVAIL  storage preflight threshold in bytes
 ##                              (default 21474836480 = 20 GiB)
 ## Exit:    the collector's exit code (0/4 per its README §8); 2 for
@@ -59,7 +61,6 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 NOTIFY_SCRIPT="$REPO/tools/notify/notify_dispatcher.py"
-OPS_ALERT_SCRIPT="$REPO/tools/notify/ops_alert.py"
 
 usage() {
   printf 'usage: tools/run_session.sh <collector args...>  (--out=DIR required)\n' >&2
@@ -126,6 +127,11 @@ mkdir -p "$LOG_DIR"          # the run dir itself stays the collector's (O_EXCL)
 touch "$LAUNCHER_LOG"
 
 # ------------------------------------------------------------- ops alert
+# The failure fact stays in the launcher log (and therefore the journal
+# that captures it); no consumer-device push is ever emitted from this
+# launcher. HS_NOTIFY_CMD is an operator-only override: when set, that
+# command is the ONLY thing that runs (operator debugging); when unset,
+# the launcher records the alert and stops there.
 send_ops_alert() {
   local title="$1"
   local body="$2"
@@ -133,13 +139,11 @@ send_ops_alert() {
   wall="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   # T2 (the alert request), not T0: no t0_observed here.
   echo "OPS_ALERT title=$title body=$body $(_mono_stamp) wall=$wall" >> "$LAUNCHER_LOG"
+  echo "OPS_ALERT_SUPPRESSED reason=consumer_push_removed $(_mono_stamp) wall=$wall" >> "$LAUNCHER_LOG"
   if [ -n "${HS_NOTIFY_CMD:-}" ]; then
     # shellcheck disable=SC2086 # the override command may carry arguments
     $HS_NOTIFY_CMD "$title" "$body" \
       >>"$LAUNCHER_LOG" 2>&1 || true
-  else
-    "$PY" "$OPS_ALERT_SCRIPT" --config "$NOTIFY_CONFIG" \
-      "$title" "$body" >>"$LAUNCHER_LOG" 2>&1 || true
   fi
 }
 
@@ -149,9 +153,9 @@ send_ops_alert() {
 # (16 GiB) BEFORE the collector starts writing — a disk that fills
 # mid-session is an unobserved outage. Fail-closed: avail below the
 # threshold, or a df that cannot answer at all, stops the session with
-# exit 2 before anything starts and alerts through the ops side-channel:
-# $HS_NOTIFY_CMD when set (the contract tests' stub), else the default
-# ops_alert.py below on the SAME Python 3.13 interpreter as the worker.
+# exit 2 before anything starts and records the alert in the launcher
+# log through send_ops_alert() (no consumer-device push; $HS_NOTIFY_CMD
+# is the operator-only override).
 PREFLIGHT_MIN="${HS_PREFLIGHT_MIN_AVAIL:-21474836480}"
 PREFLIGHT_AVAIL=""
 PREFLIGHT_AVAIL="$(df -B1 --output=avail "$LOG_DIR" 2>/dev/null | tail -n 1 | tr -d ' ')" || true
