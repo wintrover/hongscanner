@@ -126,7 +126,7 @@ On the operating front the phones reach
 per device in the tailnet policy — there is no app-level credential on
 this path, and the API itself has no authentication, so the tailnet ACL
 is the only authorization boundary. Measured policy (2026-11-18, owner
-tailnet `T9FRhf9DGL11CNTRL`, applied as a tailnet policy file):
+tailnet, applied as a tailnet policy file):
 
 ```json
 "tagOwners": { "tag:hongscanner-srv": ["autogroup:owner"] },

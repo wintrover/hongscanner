@@ -602,7 +602,7 @@ OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once
 
 ### Evidence log (2026-11-18, 저녁) — Tailnet ACL 확장(`hs-dev` 개발 경로)·S10 무선 adb(고정 5555)·실기기 FCM 3분할·08:57 세션 재시작 완주
 
-tailnet `hongscanner-srv.tail10d26b.ts.net`(id `T9FRhf9DGL11CNTRL`, owner `wuyon914@gmail.com`)에서 운영 호스트는 `100.125.164.8`(`tag:hongscanner-srv`)이고, API는 `tools/api/serve.py --bind 127.0.0.1 --port 8080`으로 루프백에만 바인딩되며 `tailscale serve`가 443 → `http://127.0.0.1:8080` 프록시(tailnet only, Funnel OFF)를 맡는다. **API 자체에는 인증이 없고 tailnet ACL이 유일한 인가 경계**다.
+tailnet `hongscanner-srv.tail10d26b.ts.net`(owner `autogroup:owner` — 개인 식별자는 기록하지 않는다)에서 운영 호스트는 `100.125.164.8`(`tag:hongscanner-srv`)이고, API는 `tools/api/serve.py --bind 127.0.0.1 --port 8080`으로 루프백에만 바인딩되며 `tailscale serve`가 443 → `http://127.0.0.1:8080` 프록시(tailnet only, Funnel OFF)를 맡는다. **API 자체에는 인증이 없고 tailnet ACL이 유일한 인가 경계**다.
 
 | gate | observed |
 |---|---|
