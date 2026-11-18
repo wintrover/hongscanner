@@ -600,6 +600,22 @@ OC 단계 매핑: **OC-0**(내부 계약 — readiness 3값·FAILED exactly-once
 
 한계(2026-11-18, Peak Attention v2): 이 기록의 피크 판정은 **가상 시나리오**(`--session-open`)와 **달력 스냅샷 경계 실측**이며, 11-19 10:00–10:30의 실장 관측은 그 거래일 이전이므로 미래다. S10 실기기 수용(Foreground 무알림 / Background 알림 / 화면 잠금·Doze 소리)은 USB 연결 대기로 **미완**이며, FCM HTTP 200·CI green은 기기 표시·소리를 증명하지 않는다. 디스패처의 `send → record` 순서는 크래시 창에서 중복 push를 허용한다(exactly-once 주장 아님). 전달 우선순위 HIGH는 `android.priority`일 뿐 채널 importance·소리·Doze 최종 도달을 보장하지 않는다. MA20 후보 `computable 9 / candidate 2441`은 스윕 유니버스 제약으로 범위 밖이다. 이 개발 머신의 `flutter analyze`는 비-ASCII 경로에서 LSP 크래시(exit 255)라 판정은 CI가 권위다.
 
+### Evidence log (2026-11-18, 저녁) — Tailnet ACL 확장(`hs-dev` 개발 경로)·S10 무선 adb(고정 5555)·실기기 FCM 3분할·08:57 세션 재시작 완주
+
+tailnet `hongscanner-srv.tail10d26b.ts.net`(id `T9FRhf9DGL11CNTRL`, owner `wuyon914@gmail.com`)에서 운영 호스트는 `100.125.164.8`(`tag:hongscanner-srv`)이고, API는 `tools/api/serve.py --bind 127.0.0.1 --port 8080`으로 루프백에만 바인딩되며 `tailscale serve`가 443 → `http://127.0.0.1:8080` 프록시(tailnet only, Funnel OFF)를 맡는다. **API 자체에는 인증이 없고 tailnet ACL이 유일한 인가 경계**다.
+
+| gate | observed |
+|---|---|
+| tailnet 노드·정책 적용 | 노드: 서버 `hongscanner-srv` `100.125.164.8`(`tag:hongscanner-srv`), 개발 노트북 `hs-dev` `100.69.132.70`, S10 `sm-g977n` `100.101.144.92`, S25 `sm-s938n` `100.80.46.69`. 정책 파일(tailnet policy file): `acls: []`(deny by default), `hosts` `{sm-g977n, sm-s938n, dev-laptop: 100.69.132.70/32}`, `grants` `[{sm-s938n,sm-g977n → tag:hongscanner-srv tcp:443}, {dev-laptop → tag:hongscanner-srv *}, {dev-laptop → sm-g977n *}]`, `tests` 6개(수락 4 + 거부 2). `POST /api/v2/tailnet/-/acl` → **200**(tests를 통과해야만 반영) |
+| ping·curl 전후(hs-dev) | 적용 전 `tailscale ping 100.125.164.8` → `no matching peer`; 적용 후 `tailscale ping 100.125.164.8` → `pong … 5ms`, `curl https://hongscanner-srv.tail10d26b.ts.net/status` → `http=200` |
+| S10 무선 adb(고정 5555) | USB 1회 연결 후 `adb tcpip 5555` → `adb connect 100.101.144.92:5555`. **케이블 분리 후에도** `adb -s 100.101.144.92:5555 shell echo` → `ALIVE`, `getprop ro.product.model` → `SM-G977N`. 포트 5555 고정. 재부팅 시 USB 재연결 필요. 무선 디버깅 페어링(랜덤 포트)은 자동화에 부적합 |
+| APK 설치·화면 | `mobile/build/app/outputs/flutter-apk/app-debug.apk`, `--dart-define=HS_API_BASE=https://hongscanner-srv.tail10d26b.ts.net`. tailnet 경유 `adb install -r` **16.9초** → `Success`. 앱 화면: `일반 TOP10 / 판정 19:07:42 · 데이터 15:30:10` |
+| FCM 3분할(S10 실기기, 19:50~19:54) | 포그라운드 알림 **0건**(FCM `status=200`), 백그라운드 알림 **1건**, `dumpsys deviceidle force-idle`로 `get deep`=`IDLE` 유지 중에도 알림 도달. 채널 실측: `market_rank_changes` importance=4 sound=`content://settings/system/notification_sound`, `market_rank_digest` importance=2 sound=null. P28 예산 소진 시 digest로 강등되는 것도 관측 |
+| 세션 08:57 이벤트·retry 완주 | `2026-11-18 08:57:07` 외부 SIGTERM → 수집기 `exit=143` → `OPS_ALERT` 양 기기 `200` → `08:57:19` retry1 시작 → `15:30:10`까지 데이터 완주. `hongscanner-session.service`는 `failed` 기록으로 남음 — 외부 SIGTERM의 systemd 기록이며 코드 결함이 아니다 |
+| 로컬 게이트 | `bash tools/run_tests.sh` → exit 0 + `ALL CONTRACT SUITES PASSED` 1회 실측 |
+
+한계(2026-11-18, 저녁): (1) tailnet 정책은 저장소 밖(테일넷 콘솔/API)에 있으므로 저장소는 관측된 결과만 기록한다 — 정책 드리프트를 검출하는 저장소 테스트는 없다. (2) `dev-laptop → tag:hongscanner-srv *`는 포트·프로토콜 무제한 grant다 — 개발 노트북은 443 API뿐 아니라 호스트가 tailnet에 노출한 다른 서비스에도 도달할 수 있으며, 이는 P29의 개발/제어 역할 범위다. (3) API에는 인증이 없다 — 정책이 허용한 기기는 누구든 API를 읽을 수 있고(tailnet ACL이 유일한 경계), `tailscale serve`가 루프백으로 프록시하므로 서버 접근 로그는 모든 요청을 `127.0.0.1`로 기록해 클라이언트 귀속은 기기측 증거로만 성립한다. (4) S10의 무선 adb는 고정 5555 리스너이며 재부팅 후 USB 재연결 없이는 복구되지 않는다 — 무인 재장전 경로는 이번 관측에 없다. (5) FCM `status=200`은 접수이지 기기 도달이 아니다; 이번 3분할은 기기측 표시(백그라운드 1건·Doze 도달)를 관측한 것이고, 포그라운드 0건은 앱이 포그라운드에서 OS 알림을 게시하지 않고 배너만 쓰는 현행 동작과 일치한다. digest 강등은 서버측 어드미션 관측이며 무음 채널의 실제 표시·소리는 OS 설정에 종속된다. (6) 08:57 retry 완주는 수집 데이터의 완주이며 봉인·replay `VERDICT MATCH` 증거는 이 항목에 없다 — P9/P11/P12 판정은 바뀌지 않는다. (7) 본 변경은 docs-only(추적 코드 수정 0줄)다.
+
 ## Runs retention (P14 — runs/ 디스크 보존)
 
 정책·판정표·절차의 정본은 [docs/RETENTION.md](RETENTION.md)다. 요약: 판정표
