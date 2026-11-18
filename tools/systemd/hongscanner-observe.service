@@ -1,0 +1,11 @@
+## 관측자는 관측 대상과 독립이다(세션 서비스가 죽어도 체크포인트는 남는다).
+## 이 유닛은 세션 유닛을 After=/Requires=로 묶지 않는다. 세션이 실패·종료된
+## 뒤에도(15:45), 세션이 아직 시작되지 않은 시각(08:45)에도 체크포인트는 남는다.
+## hongscanner-session.service를 건드리지 않고 읽기만 한다.
+[Unit]
+Description=Hong Scanner Independent Session Observer (read-only checkpoint)
+
+[Service]
+Type=oneshot
+ExecStart=/home/wintrover/hongscanner/tools/observe_session.sh
+Environment=PYTHONUNBUFFERED=1

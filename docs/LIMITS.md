@@ -106,6 +106,26 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
 | 세션 개장이 UNKNOWN이면 피크 특권이 없다 | 달력 레코드 부재·휴장(`open: null`)·비정규 타임스탬프에서 `session_open=None`이면 API는 `core`, dispatcher는 P28 60분 예산을 쓴다. 09:00을 추측하지 않는다 — 실패 방향은 "피크에 조용해짐"이고 오발송이 아니다 | P30 fail-closed |
 | 2026-11-19 시각의 1차 출처 본문은 확보되지 않았다 | KRX 공지(`noti_no=261115880`, `noti_dd=20261105`)는 "대학수학능력시험일(11.19) 증시장 등 거래시간 임시 변경" 제목과 함께 첨부 참조만 제공하고 첨부 본문이 0바이트로 차단됐다. 10:00/16:30은 2차 보도 3곳 일치로 기록했고 운영 달력은 `CAL-2026Q4-KRX-4150e8a04230`(open 10:00, close 16:30)으로 개정했다. `tools/check_calendar_source.py`는 특별 개·폐장시간 변경을 증명하지 못하므로 이 개정은 운영자 승인(P25) 근거다 | P25 operator approval |
 
+## Independent session observer (`tools/observe_session.sh`)
+
+세션 내부에서 관측하면 관측 대상이 죽을 때 관측자도 죽는다(08:45에는 08:50
+타이머가 아직 발화하지 않았고, 15:45에는 세션이 이미 끝난다). 그래서 관측은
+세션과 분리된 systemd **user** 타이머
+`tools/systemd/hongscanner-observe.timer`가 맡는다.
+
+- 체크포인트(평일, KST): `08:45` · `08:55` · `09:55` · `10:05` · `10:15` ·
+  `10:25` · `10:31` · `15:45`
+- 증거 파일: `~/.local/share/hongscanner/observe/observe-<KST session_date>.hcj.jsonl`
+  — 실행마다 한 줄 JSON을 append한다(덮어쓰지 않는다).
+- **이 타이머는 세션과 독립이다** — 세션 서비스가 죽거나 끝나도 체크포인트는
+  남는다. 세션 유닛과의 `After=`/`Requires=` 의존성은 없다.
+- **`Persistent=false`라 꺼져 있던 시간은 기록하지 않는다.** 놓친 체크포인트는
+  소급 생성되지 않으며, 파일에 없는 것 자체가 그 시간의 증거다.
+- 한계: 체크포인트는 표본이고 연속 감시가 아니다 — 8줄 사이의 상태 변화는
+  기록되지 않는다. 각 줄의 `null`은 "0"이 아니라 "측정 실패"이고 `errors`가
+  이유를 적는다. 08:45에는 당일 런 디렉터리가 아직 없으므로 `run_dir`과
+  `calendar_open`은 정직한 null이다.
+
 ## Explicit non-goals
 
 - No order execution, no shorting, no position sizing.
