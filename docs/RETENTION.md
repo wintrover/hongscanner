@@ -77,15 +77,19 @@ Preflight이며, 구현이 이 문서와 어긋나면 구현이 틀린 것이다
   판단해 억제하는 것이 아니라 아예 만들지 않는다). 발송은 **ops
   side-channel**(`tools/notify/ops_alert.py`): notify 이벤트 원장·전달
   원장 기록 없는 일회성 발송, 재시도 없음. 시도와 결과(exit code·기기별
-  결과 라인)는 호출부 기록에만 남는다 — ops side-channel의 호출부는
-  넷이다(2026-11 추가): retention 스크립트(`RETENTION_BLOCKED` —
-  retention-log.jsonl의 NOTIFY 행), Storage Preflight
-  (`STORAGE_PREFLIGHT_FAILED` — 런처 로그), 세션 런처의 세션 장애 경보
-  (`WORKER_UNIT_FAILED`·`SESSION_STALL_DETECTED`·`COLLECTOR_FAILED` —
-  런처 로그의 `OPS_ALERT` 라인), API 서비스 `serve.py`(readiness FAILED
-  전환 시 프로세스당 1회 발송 — tools/api/README.md §8.1). 네 번째
-  호출부의 기록 위치는 **systemd journal/stderr**(OPS_ALERT_* 저널
-  라인)이며 파일 쓰기는 없다. accepted ≠ delivered
+  결과 라인)는 호출부 기록에만 남는다 — 2026-11-18(S1) 이후 ops
+  side-channel의 **자동 호출부는 둘**이다: retention 스크립트
+  (`RETENTION_BLOCKED` — retention-log.jsonl의 NOTIFY 행)와 API 서비스
+  `serve.py`(readiness FAILED 전환 시 프로세스당 1회, `HS_OPS_ALERT_CMD`가
+  빈 값이면 `OPS_ALERT_SKIPPED reason=disabled`만 남기고 미실행 —
+  tools/api/README.md §8.1). 세션 런처(`tools/run_session.sh`)와 세션
+  래퍼(`hongscanner-session-start.sh`)는 **이 도구를 호출하지 않는다**:
+  런처는 `OPS_ALERT`·`OPS_ALERT_SUPPRESSED reason=consumer_push_removed`를
+  런처 로그에만, 래퍼의 EXIT 트랩은 `OPS_ALERT_SUPPRESSED` journal 한 줄만
+  남긴다 — 운영 경보를 소비자 기기로 보내지 않는다는 P27 경계의 집행이며,
+  운영자 전용 경보 채널은 P1이다. 기록 위치는 **systemd
+  journal/stderr**(OPS_ALERT_* 저널 라인)이며 파일 쓰기는 없다.
+  accepted ≠ delivered
   (tools/notify/README.md §6). 향후 ops 경보에 지속 알림(재시도·
   전달 기록)이 필요하면 신규 인프라를 만들지 않고
   **AGGREGATION_STARTED 선례의 이벤트 계약 확장**(contracts/events +
@@ -142,10 +146,12 @@ Preflight이며, 구현이 이 문서와 어긋나면 구현이 틀린 것이다
 
 ### ops side-channel — tools/notify/ops_alert.py
 
-`HS_NOTIFY_CMD`가 설정돼 있으면 `<title> <body>` 두 인자로 호출하고 그
-exit code를 NOTIFY 기록에 남긴다(계약테스트의 stub 경로). **미설정 시
-기본 발송 경로**는 `tools/notify/ops_alert.py`다 — "작업 특화 CLI"
-(notify_register.py 선례):
+이 절은 **retention 스크립트의** 경보 경로다. `HS_NOTIFY_CMD`가 설정돼
+있으면 `<title> <body>` 두 인자로 호출하고 그 exit code를 NOTIFY 기록에
+남긴다(계약테스트의 stub 경로). **미설정 시 기본 발송 경로**는
+`tools/notify/ops_alert.py`다 — "작업 특화 CLI"
+(notify_register.py 선례). 세션 런처(`tools/run_session.sh`)는 이 경로를
+쓰지 않는다(기록 전용, 위 "retention의 ops 알림" 절).
 
 ```
 <Python 3.13 해석: $HSCOLLECTOR_PYTHON → collector venv → python3.13 → uv>
@@ -171,10 +177,10 @@ fail-closed). exit 0 = 전 기기 accepted, 2 = 사용법·설정·페이로드 
 
 `--out` 인자 파싱 후 `mkdir -p "$LOG_DIR"`·`touch "$LAUNCHER_LOG"` 직후,
 `start_worker`·collector 기동 **전에** 실행한다. 미달·df 실패 시 stderr +
-런처 로그 `STORAGE_PREFLIGHT_FAILED: avail=<값> required=<값>` + ops
-side-channel 알림(`HS_NOTIFY_CMD` 설정 시 그 명령, 미설정 시 기본
-ops_alert.py — 워커와 동일한 Python 3.13 인터프리터 사용, 이 스크립트의
-PY 해석이 preflight보다 먼저 완료되므로 항상 실행 가능) + exit 2(기존
+런처 로그 `STORAGE_PREFLIGHT_FAILED: avail=<값> required=<값>` + 기록
+전용 경보(`OPS_ALERT`·`OPS_ALERT_SUPPRESSED reason=consumer_push_removed`
+런처 로그 2행 — `HS_NOTIFY_CMD`가 설정된 경우에만 그 명령을 실행하며,
+미설정 시 외부 호출은 0회다) + exit 2(기존
 usage 오류 exit 2와 같은 코드 — "아무 것도 시작하지 않은" 거부). 통과 시
 `PREFLIGHT_OK avail=<값>` 1행. 기존 인자·순서·동작은 그대로다.
 
@@ -206,8 +212,12 @@ ExecStart=bash /home/wintrover/hongscanner/tools/runs_retention.sh --apply
 ### 서버 배포 절차 (이 문서가 tools/ bash의 서버 반영 계약을 처음 명문화)
 
 기존 유닛(`hongscanner-session.timer`·`hongscanner-serve.service`)과
-git 밖 래퍼(`~/.local/bin/hongscanner-*-start.sh`)은 **수정하지 않는다** —
-참조만 한다(SERVICE_DEPENDENCY 판정). 배포는:
+git 밖 래퍼(`~/.local/bin/hongscanner-*-start.sh`)은 **참조만** 한다
+(SERVICE_DEPENDENCY 판정). 예외는 2026-11-18 S1의 소비자 발송 차단이다:
+래퍼 `hongscanner-session-start.sh`의 EXIT 트랩은 journal 한 줄만 남기도록
+바뀌었고(백업 `.bak-20261118-s1`), `hongscanner-serve.service`에는
+`Environment=HS_OPS_ALERT_CMD=`(빈 값), `hongscanner-retention.service`에는
+`Environment=HS_NOTIFY_CMD=/bin/echo` 드롭인이 붙는다. 배포는:
 
 1. `cd ~/hongscanner && git pull --ff-only` (main merge 커밋 일치 확인)
 2. 위 유닛 전문 2개를 `~/.config/systemd/user/`에 작성
@@ -217,12 +227,13 @@ git 밖 래퍼(`~/.local/bin/hongscanner-*-start.sh`)은 **수정하지 않는�
    hongscanner-retention.service` → exit 0·journal 실행 기록·
    retention-log.jsonl 추가·`runs/` 무변경(현 시점 전 런 보호) 관측
 
-preflight 알림(`STORAGE_PREFLIGHT_FAILED`)은 별도 설정 없이 기본
-ops_alert.py 경로로 발송된다 — run_session.sh가 워커 인터프리터로 이미
-요구하는 것과 동일한 Python 3.13 해석을 재사용하므로 세션 서비스가
-동작하는 환경이면 알림 경로도 동작한다. 기존 세션 유닛·래퍼 수정·환경
-변수 주입은 필요 없다. retention 스크립트의 `RETENTION_BLOCKED` 알림도
-같은 기본 경로다.
+preflight 알림(`STORAGE_PREFLIGHT_FAILED`)은 **기록 전용**이다 — 런처
+로그에 `OPS_ALERT`와 `OPS_ALERT_SUPPRESSED reason=consumer_push_removed`
+두 줄을 남기고 외부 발송을 하지 않는다(2026-11-18 S1). 소비자 기기로
+운영 경보를 보내지 않는다는 P27 경계의 집행이며, 세션 유닛·래퍼에
+환경변수를 주입할 필요가 없다(정책이 스크립트 본문에 있다). retention
+스크립트의 `RETENTION_BLOCKED` 알림은 여전히 ops side-channel을 기본으로
+하며, 서버는 `HS_NOTIFY_CMD=/bin/echo` 드롭인으로 journal 기록만 남긴다.
 
 ## 알려진 한계
 
