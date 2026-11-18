@@ -483,14 +483,15 @@ jobs:
           cp Dockerfile "$ctx/Dockerfile"
           cp .dockerignore "$ctx/.dockerignore"
           cp tools/api/serve.py "$ctx/tools/api/serve.py"
+          cp tools/market_time.py "$ctx/tools/market_time.py"
           cp tools/container/cloud_supervisor.py \
              "$ctx/tools/container/cloud_supervisor.py"
           cp calendars/CALENDAR_INDEX.sha256 "$ctx/calendars/CALENDAR_INDEX.sha256"
           cp tools/collector/sidecar.py "$ctx/tools/collector/sidecar.py"
           cp tools/collector/requirements.txt \
              "$ctx/tools/collector/requirements.txt"
-          for f in notify_dispatcher.py notify_config.py notify_fcm.py \
-                   notify_ledger.py; do
+          for f in notify_dispatcher.py notify_clock.py notify_config.py \
+                   notify_fcm.py notify_ledger.py; do
             cp "tools/notify/$f" "$ctx/tools/notify/$f"
           done
           # The staged binaries ARE the attested CI_BUILD_OUT binaries:

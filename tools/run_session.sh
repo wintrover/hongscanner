@@ -287,6 +287,7 @@ start_worker() {
        --property=StandardOutput=append:"$LAUNCHER_LOG" \
        --property=StandardError=append:"$LAUNCHER_LOG" \
        "$PY" "$NOTIFY_SCRIPT" --config "$NOTIFY_CONFIG" \
+       --run-dir "$OUT_ABS" \
        --watch "$EVENTS_FILE" >>"$LAUNCHER_LOG" 2>&1; then
     WORKER_MODE="systemd"
     echo "WORKER_START systemd unit=$UNIT (Type=notify, WatchdogSec=30, Restart=on-failure)" \
@@ -297,6 +298,7 @@ start_worker() {
     echo "WORKER_START background FALLBACK (development mode — NOT an" \
       "operational run: no auto-restart, README §11)" >>"$LAUNCHER_LOG"
     "$PY" "$NOTIFY_SCRIPT" --config "$NOTIFY_CONFIG" \
+      --run-dir "$OUT_ABS" \
       --watch "$EVENTS_FILE" >>"$LAUNCHER_LOG" 2>&1 &
     WORKER_PID=$!
   fi
@@ -306,7 +308,7 @@ start_worker() {
 {
   echo "=== run_session start $(date --iso-8601=seconds)"
   echo "collector=$COLLECTOR"
-  echo "worker=$NOTIFY_SCRIPT --config $NOTIFY_CONFIG --watch $EVENTS_FILE"
+  echo "worker=$NOTIFY_SCRIPT --config $NOTIFY_CONFIG --run-dir $OUT_ABS --watch $EVENTS_FILE"
   echo "log=$LAUNCHER_LOG"
 } >>"$LAUNCHER_LOG"
 

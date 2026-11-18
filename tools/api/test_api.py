@@ -50,7 +50,7 @@ import threading
 import time
 import unittest
 
-from datetime import datetime
+from datetime import datetime, time as wall_time
 from http.server import ThreadingHTTPServer
 from unittest import mock
 from urllib import request as urlrequest
@@ -765,15 +765,32 @@ def om_expected_bodies(ref_stamp, as_of=OM_REF_STAMP):
     return zero, plus_one, minus_one
 
 
+def market_calendar(session_date, open_text="09:00:00+09:00"):
+    """The run input's first record (P24): the recorded calendar
+    snapshot whose day entry names the session's opening. The §3.7
+    mode window is [open, open + 30min) — no 09:00 default is ever
+    substituted for this record."""
+    return {"kind": "calendar", "seq": 1,
+            "raw": {"days": {session_date: {
+                        "close": "15:30:00+09:00",
+                        "half_day": False,
+                        "open": open_text,
+                        "reason": None}},
+                    "market": "KRX"}}
+
+
 def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0",
-                          pre_empty_pairs=0):
-    """The §3.7 opening-mode fixture tree: the eligible winner run and
-    one smoke-like ineligible directory (runs_present stays true while
-    selection has exactly one eligible run)."""
+                          pre_empty_pairs=0,
+                          open_text="09:00:00+09:00"):
+    """The §3.7 opening-mode fixture tree: the eligible winner run
+    whose calendar snapshot opens at `open_text` (the mode window's
+    recorded evidence) and one smoke-like ineligible directory
+    (runs_present stays true while selection has exactly one eligible
+    run)."""
     box = Sandbox()
     run_dir = box.session_dir(OM_WINNER)
     box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
-        {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+        market_calendar(OM_SESSION_DATE, open_text),
         {"kind": "config", "raw": {"environment": "demo",
                                    "run_id": OM_WINNER,
                                    "session_date": OM_SESSION_DATE},
@@ -2163,47 +2180,95 @@ class MarketViewEmptySuite(unittest.TestCase):
 
 class ModeAuthoritySuite(unittest.TestCase):
     """determine_mode (README §3.7): the explicit as_of decision moment
-    is the mode's only time authority. A pure function — no clock read,
-    no server."""
+    is the mode's only time authority, and the window is the session
+    opening recorded in the run's calendar snapshot (tools/market_time.py
+    P30). A pure function — no clock read, no server. The regular
+    session's recorded open is 09:00 KST; a delayed opening moves the
+    whole window; an unproven opening grants no privilege."""
 
     def test_determine_mode_boundary_table(self):
+        # regular session (recorded open 09:00): [09:00:00, 09:30:00)
         cases = (
-            ("2026-11-10T08:59:59+09:00", "2026-11-10", "core"),
-            ("2026-11-10T09:00:00+09:00", "2026-11-10", "opening_ma20"),
-            ("2026-11-10T09:29:59+09:00", "2026-11-10", "opening_ma20"),
-            ("2026-11-10T09:30:00+09:00", "2026-11-10", "core"),
-            ("2026-11-10T09:30:01+09:00", "2026-11-10", "core"),
-            ("2026-11-11T09:10:00+09:00", "2026-11-10", "core"),
-            (None, "2026-11-10", "core"),
-            ("2026-11-10T00:10:00+00:00", "2026-11-10", "opening_ma20"),
+            ("2026-11-10T08:59:59+09:00", "2026-11-10", wall_time(9, 0),
+             "core"),
+            ("2026-11-10T09:00:00+09:00", "2026-11-10", wall_time(9, 0),
+             "opening_ma20"),
+            ("2026-11-10T09:29:59+09:00", "2026-11-10", wall_time(9, 0),
+             "opening_ma20"),
+            ("2026-11-10T09:30:00+09:00", "2026-11-10", wall_time(9, 0),
+             "core"),
+            ("2026-11-10T09:30:01+09:00", "2026-11-10", wall_time(9, 0),
+             "core"),
+            ("2026-11-11T09:10:00+09:00", "2026-11-10", wall_time(9, 0),
+             "core"),
+            (None, "2026-11-10", wall_time(9, 0), "core"),
+            ("2026-11-10T00:10:00+00:00", "2026-11-10", wall_time(9, 0),
+             "opening_ma20"),
         )
-        for stamp, session_date, mode in cases:
+        for stamp, session_date, open_time, mode in cases:
             as_of = None if stamp is None else datetime.fromisoformat(stamp)
-            self.assertEqual(serve.determine_mode(as_of, session_date),
-                             mode, stamp)
+            self.assertEqual(
+                serve.determine_mode(as_of, session_date, open_time),
+                mode, stamp)
+
+    def test_determine_mode_special_session_boundaries(self):
+        # a delayed opening (recorded 10:00): the window moves with the
+        # recorded open — [10:00:00, 10:30:00), 09:10 is core
+        open_time = wall_time(10, 0)
+        for stamp, mode in (
+                ("2026-11-10T09:10:00+09:00", "core"),
+                ("2026-11-10T10:00:00+09:00", "opening_ma20"),
+                ("2026-11-10T10:29:59+09:00", "opening_ma20"),
+                ("2026-11-10T10:30:00+09:00", "core")):
+            self.assertEqual(
+                serve.determine_mode(datetime.fromisoformat(stamp),
+                                     "2026-11-10", open_time),
+                mode, stamp)
+
+    def test_determine_mode_without_recorded_open_is_core(self):
+        # fail-closed: the calendar snapshot proves no opening (absent
+        # record, holiday, malformed value) -> no privilege; the legacy
+        # 09:00 constant is never applied implicitly
+        for stamp in ("2026-11-10T09:00:00+09:00",
+                      "2026-11-10T09:10:00+09:00"):
+            self.assertEqual(
+                serve.determine_mode(datetime.fromisoformat(stamp),
+                                     "2026-11-10", None),
+                "core", stamp)
 
     def test_determine_mode_fails_closed_on_bad_inputs(self):
-        # a naive moment has no zone authority and a non-string
-        # session_date names no day: both are core, never a guess
+        # a naive moment has no zone authority, a non-string
+        # session_date names no day and a non-time open_time proves no
+        # window: all core, never a guess
+        open_time = wall_time(9, 0)
         moment = datetime.fromisoformat("2026-11-10T09:10:00+09:00")
         self.assertEqual(serve.determine_mode(
-            datetime(2026, 11, 10, 9, 10), "2026-11-10"), "core")
-        self.assertEqual(serve.determine_mode(moment, None), "core")
-        self.assertEqual(serve.determine_mode(moment, 20261110), "core")
+            datetime(2026, 11, 10, 9, 10), "2026-11-10", open_time), "core")
+        self.assertEqual(serve.determine_mode(moment, None, open_time),
+                         "core")
+        self.assertEqual(serve.determine_mode(moment, 20261110, open_time),
+                         "core")
+        for bad_open in (None, "09:00:00",
+                         datetime(2026, 11, 10, 9, 0)):
+            self.assertEqual(serve.determine_mode(
+                moment, "2026-11-10", bad_open), "core")
 
 
 class MarketViewOpeningSuite(unittest.TestCase):
     """GET /mobile/market-view (README §3.7, VS-2): the opening MA20
-    mode. The mode is decided by the caller-supplied as_of (KST): inside
-    the half-open [09:00:00, 09:30:00) on the selected run's
-    session_date the top10 lists are reconstituted from the recorded
-    chain-pair prices of the reference group's snapshot against the
-    recorded twenty-day close sums — the integer cross product, no
-    float. Rank, event_id and direction stay the state item's own
-    recorded values; the mode's only decisions are placement and
-    ma20_tag. Outside the window, on a date mismatch, or without a
-    confirmed group the response is the core last-record-wins assembly
-    (mode "core")."""
+    mode. The mode is decided by the caller-supplied as_of (KST) against
+    the window the selected run's calendar snapshot proves — the
+    half-open [recorded open, recorded open + 30min) on its
+    session_date (tools/market_time.py, P30; the regular session opens
+    at 09:00, a delayed opening moves the window). Inside it the top10
+    lists are reconstituted from the recorded chain-pair prices of the
+    reference group's snapshot against the recorded twenty-day close
+    sums — the integer cross product, no float. Rank, event_id and
+    direction stay the state item's own recorded values; the mode's
+    only decisions are placement and ma20_tag. Outside the window, on a
+    date mismatch, without a proven opening, or without a confirmed
+    group the response is the core last-record-wins assembly (mode
+    "core")."""
 
     def setUp(self):
         self.box = build_opening_sandbox()
@@ -2222,8 +2287,10 @@ class MarketViewOpeningSuite(unittest.TestCase):
         server.assert_gone()
 
     def opening_server(self, ref_stamp=OM_REF_STAMP, variant="0",
-                       pre_empty_pairs=0):
-        box = build_opening_sandbox(ref_stamp, variant, pre_empty_pairs)
+                       pre_empty_pairs=0,
+                       open_text="09:00:00+09:00"):
+        box = build_opening_sandbox(ref_stamp, variant, pre_empty_pairs,
+                                    open_text)
         self.addCleanup(box.cleanup)
         server = ServerProc(box, with_delivery=False)
         self.addCleanup(self._reap, server)
@@ -2442,6 +2509,61 @@ class MarketViewOpeningSuite(unittest.TestCase):
                                     + body["falling_top10"]), stamp)
                 self.assertIsNone(body["coverage"], stamp)
 
+    def test_special_session_window_follows_the_recorded_open(self):
+        # a delayed opening recorded as 10:00 moves the whole window:
+        # 09:10 is core and no list is reconstituted; 10:00:00 in,
+        # 10:29:59 in, 10:30:00 out
+        server = self.opening_server(open_text="10:00:00+09:00")
+        for stamp, mode in (
+                ("2026-11-10T09:10:00+09:00", "core"),
+                ("2026-11-10T10:00:00+09:00", "opening_ma20"),
+                ("2026-11-10T10:29:59+09:00", "opening_ma20"),
+                ("2026-11-10T10:30:00+09:00", "core")):
+            status, body, _, _ = server.get_json(
+                "/mobile/market-view?as_of=" + stamp)
+            self.assertEqual(status, 200, stamp)
+            self.assertEqual(body["mode"], mode, stamp)
+            self.assertEqual(body["mode_as_of"], stamp, stamp)
+            if mode == "opening_ma20":
+                self.assertEqual(self.symbols(body, "falling_top10"),
+                                 ["011060", "008480", "006660"], stamp)
+                self.assertIsNotNone(body["coverage"], stamp)
+            else:
+                self.assertIsNone(body["coverage"], stamp)
+                self.assertTrue(all(i["ma20_tag"] is None for i in
+                                    body["rising_top10"]
+                                    + body["falling_top10"]), stamp)
+
+    def test_without_a_calendar_record_the_mode_is_always_core(self):
+        # fail-closed: the run's input carries no calendar snapshot, so
+        # no session opening is proven — every moment is core, even the
+        # legacy 09:00 window; the response schema is unchanged
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        run_dir = box.session_dir(OM_WINNER)
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "run_id": OM_WINNER,
+                                       "session_date": OM_SESSION_DATE},
+             "seq": 1},
+            *om_winner_input("0")))
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+                  jsonl(*om_winner_events(OM_REF_STAMP)))
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        for stamp in ("2026-11-10T09:00:00+09:00",
+                      OM_REF_STAMP,
+                      "2026-11-10T09:29:59+09:00"):
+            status, body, _, _ = server.get_json(
+                "/mobile/market-view?as_of=" + stamp)
+            self.assertEqual(status, 200, stamp)
+            self.assertEqual(body["mode"], "core", stamp)
+            self.assertEqual(body["mode_as_of"], stamp, stamp)
+            self.assertIsNone(body["coverage"], stamp)
+            self.assertTrue(all(i["ma20_tag"] is None for i in
+                                body["rising_top10"]
+                                + body["falling_top10"]), stamp)
+
     def test_as_of_after_the_window_does_not_wait_for_a_new_group(self):
         # the regression this authority split exists for: the recorded
         # reference group's 09:10 stamp is INSIDE the window, but the
@@ -2512,7 +2634,7 @@ class MarketViewOpeningSuite(unittest.TestCase):
         self.addCleanup(box.cleanup)
         run_dir = box.session_dir("market-2026-11-10-empty")
         box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
-            {"kind": "calendar", "raw": {}, "seq": 1},
+            market_calendar(OM_SESSION_DATE),
             {"kind": "config", "raw": {"environment": "demo",
                                        "run_id": "market-2026-11-10-empty",
                                        "session_date": OM_SESSION_DATE},
@@ -2867,7 +2989,7 @@ class MarketViewFactSuite(unittest.TestCase):
         self.addCleanup(box.cleanup)
         run_dir = box.session_dir(OM_WINNER)
         box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
-            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+            market_calendar(OM_SESSION_DATE),
             {"kind": "config", "raw": {"environment": "demo",
                                        "events_contract": "top10-v1",
                                        "run_id": OM_WINNER,

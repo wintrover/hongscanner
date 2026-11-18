@@ -499,10 +499,15 @@ KiB 윈도 판독):
 `/mobile/market-view` 요청마다 `?as_of=<ISO-8601>` 쿼리를 읽고,
 값이 없으면 그 요청에 한 번만 호스트 시계를 읽어 전달한다
 (테스트·replay는 `?as_of=`로 시각을 고정한다). `as_of`의 KST
-시각부가 반개구간 **[09:00:00, 09:30:00)** 안이고 그 KST 날짜가
+시각부가 그 런의 기록된 세션 개장에서 시작하는 반개구간
+**[session_open, session_open + 30m)** 안이고 그 KST 날짜가
 선택된 런의 `session_date`와 같을 때만 응답의 `rising_top10`/
 `falling_top10`이 "현재가 vs MA20" 기준으로 재구성되고 최상위
-`mode`가 `"opening_ma20"`이 된다. 날짜 불일치·창 밖이면 fail-closed로
+`mode`가 `"opening_ma20"`이 된다. `session_open`은 그 런의
+`input.hcj.jsonl` 첫 calendar 레코드 `days[session_date].open`이며
+(`tools/market_time.py`가 유일한 판정 구현), 달력 레코드 부재·휴장
+(`open: null`)·비정규 타임스탬프는 UNKNOWN이므로 **`core`**다 —
+09:00을 추측하지 않는다. 날짜 불일치·창 밖이면 fail-closed로
 `mode:"core"`이고 배열은 기존 rank 폴드 그대로다. 잘못된 `as_of`
 (형식 오류·UTC 오프셋 없는 naive datetime)는 400 `bad_request`다
 (§4) — 조용한 core 폴백도, 창을 다시 열기 위해 새 그룹 확정을
@@ -834,8 +839,10 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   부재 시 제외·봉인 시 포함·kSessionEnd 플러시 팩트(동일 스탬프
   SESSION_ENDED만 뒤따름) 미봉인 제외·봉인 포함, 100 링, top10
   목록·개장 MA20 모드는 후보 폴드 그대로, 연속 2회 요청 동일
-  바이트), §3.7 개장 MA20 모드(as_of 경계 — 08:59:59·09:30:00·09:31:00·
-  날짜 불일치는 core, 09:00:00·09:29:59은 모드 전환; 기록 그룹 09:10이
+  바이트), §3.7 개장 MA20 모드(기록된 세션 개장 09:00 경계 — 08:59:59·
+  09:30:00·09:31:00·날짜 불일치는 core, 09:00:00·09:29:59은 모드 전환;
+  특별장 개장 10:00이면 09:10 core·10:00 전환·10:30 core; 달력 레코드
+  없는 런은 항상 core; 기록 그룹 09:10이
   창 안이어도 as_of 09:30이면 core — 새 그룹 대기 없음; `determine_mode`
   경계표와 순수성; `mode_as_of` KST 초 단위 텍스트·`data_as_of` 별칭;
   `as_of` 형식 오류·naive는 400 `bad_request`; 기준 그룹 = 마지막 확정

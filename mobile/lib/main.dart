@@ -77,18 +77,20 @@ class RootShell extends StatefulWidget {
 class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
   AppStore? _store;
 
-  /// The OS market-alert path (MainActivity.kt owns the platform end):
-  /// foreground posting, local-notification taps, the pending cold-start
-  /// tap. One instance per shell; see [MarketAlertChannel].
+  /// The market-alert method channel (MainActivity.kt owns the platform
+  /// end): local-notification taps and the pending cold-start tap. The
+  /// foreground path no longer posts OS notifications — the channel
+  /// stays for these tap paths. One instance per shell; see
+  /// [MarketAlertChannel].
   final MarketAlertChannel _marketAlert = const MarketAlertChannel();
 
-  /// Foreground alert units already surfaced (an OS notification or the
-  /// in-app banner), so a burst of repeated deliveries shows one alert,
-  /// not a stack. A unit is one event (its event id) or one summary/
-  /// digest notification (kind + first covered id) — a single event and
-  /// a digest covering it are different units, and both surface. The
-  /// keys come from [PushMessage.dedupKey]. Bounded: the oldest key
-  /// drops out once the history is full.
+  /// Foreground alert units already surfaced (the in-app banner), so a
+  /// burst of repeated deliveries shows one banner, not a stack. A unit
+  /// is one event (its event id) or one summary/digest notification
+  /// (kind + first covered id) — a single event and a digest covering
+  /// it are different units, and both surface. The keys come from
+  /// [PushMessage.dedupKey]. Bounded: the oldest key drops out once the
+  /// history is full.
   final Set<String> _surfacedUnits = <String>{};
 
   static const int _maxSurfacedHistory = 64;
@@ -171,28 +173,19 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
     }
   }
 
-  /// Foreground delivery policy: with notification+data messages the OS
-  /// does not display the notification while the app is foregrounded
-  /// (official firebase_messaging behavior), so the app surfaces the
-  /// alert itself. TOP10 state changes (TOP10_ENTERED / TOP10_EXITED /
-  /// RANK_CHANGED) and immediate summaries are re-posted to the OS
-  /// `market_rank_changes` channel, silent digest roll-ups to
-  /// `market_rank_digest` (IMPORTANCE_LOW — the post lands in the shade
-  /// with no heads-up: the quiet display a digest is) — with the
-  /// dispatcher's own title/body, display delivery only; the app never
-  /// re-assembles or re-computes the text. A refused post (notification
-  /// permission off, no platform end) falls back to the in-app banner.
-  /// Alerts dedup by message unit with a bounded history (an event id
-  /// for singles, a kind+first-id key for summary/digest — a single
-  /// event and a digest covering it are different units and both
+  /// Foreground delivery policy: while the user is looking at the app,
+  /// the alert is a silent in-app signal only — no OS notification, no
+  /// sound. Background / terminated delivery keeps the official path:
+  /// Android displays the FCM notification payload itself and the app
+  /// does not re-post it. Every foreground message surfaces the same
+  /// banner; alerts dedup by message unit with a bounded history (an
+  /// event id for singles, a kind+first-id key for summary/digest — a
+  /// single event and a digest covering it are different units and both
   /// surface), and a new banner replaces the current one instead of
   /// queueing behind it. Data-only payloads plus local notification
-  /// re-synthesis of text the server did not send stay forbidden —
-  /// terminated-state display remains the OS notification (the
-  /// official path).
-  Future<void> _handleForegroundAlert(PushMessage message) async {
+  /// re-synthesis of text the server did not send stay forbidden.
+  void _handleForegroundAlert(PushMessage message) {
     if (!mounted) return;
-    final eventId = message.representativeEventId;
     final dedupKey = message.dedupKey;
     if (dedupKey != null) {
       if (_surfacedUnits.contains(dedupKey)) return;
@@ -202,23 +195,6 @@ class _RootShellState extends State<RootShell> with WidgetsBindingObserver {
       }
       _surfacedUnits.add(dedupKey);
     }
-    final title = message.notificationTitle;
-    final body = message.notificationBody;
-    if (eventId != null && title != null && body != null &&
-        MarketAlertChannel.isMarketAlert(message)) {
-      final posted = await _marketAlert.postNotification(
-        eventId: eventId,
-        title: title,
-        body: body,
-        kind: message.kind,
-        eventIds: message.eventIds?.join(','),
-        channelId: message.kind == 'digest'
-            ? MarketAlertChannel.digestChannelId
-            : null,
-      );
-      if (posted) return; // the OS notification owns the display
-    }
-    if (!mounted) return; // the post awaited: the shell may be gone
     final label = message.eventType ??
         message.kind ??
         message.representativeEventId ??

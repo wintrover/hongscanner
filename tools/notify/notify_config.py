@@ -17,6 +17,13 @@ vendor minimum and only synthetic drills/tests override it, on record.
 The resident worker's tick interval (watch_poll_seconds, README §1/§7)
 defaults to 1.0 and is bounded 0 < x <= 60: a zero or negative poll
 would spin, an unbounded one would stall delivery.
+
+The opening-peak section (peak_window) defaults to enabled, a 900-second
+freshness bound and the one supported audible mode
+("unlimited_per_group"); its validation is strict like admission's.
+Being enabled is not the privilege: the dispatcher grants peak sound
+only when the run's recorded session opening is KNOWN and the
+observation is fresh (market_time owns the window arithmetic).
 """
 
 import json
@@ -58,6 +65,24 @@ ADMISSION_DEFAULT = {
     "TOP10_ENTERED": "immediate",
     "TOP10_EXITED": "immediate",
     "RANK_CHANGED": "digest",
+}
+
+# The opening peak window (README §0/§7; the market_time authority):
+# inside [open, open + 30m) KST on the run's session_date the per-group
+# sound cap is lifted — every observation group may ring once (a group
+# still yields at most one sound), with no global budget between
+# groups. The privilege is granted only to a FRESH observation: 0 <=
+# dispatch time - observed_at <= freshness_seconds. A future
+# observation (negative age) is fail-closed. The section is strict (a
+# typo would silently change when phones ring); absent -> these
+# defaults. `enable` alone does not grant the privilege when the run's
+# session opening is UNKNOWN (no --run-dir / no calendar record): the
+# caller then keeps the P28 budget (fail-closed).
+PEAK_AUDIBLE_MODES = ("unlimited_per_group",)
+PEAK_WINDOW_DEFAULT = {
+    "enable": True,
+    "freshness_seconds": 900,
+    "audible": "unlimited_per_group",
 }
 
 
@@ -139,13 +164,60 @@ def admission_mode(cfg, event_type):
     return effective_admission(cfg).get(event_type, "suppress")
 
 
+def peak_window_settings(cfg):
+    """The effective opening-peak section, validated with defaults.
+
+    Absent -> PEAK_WINDOW_DEFAULT (enable true, freshness 900s,
+    audible "unlimited_per_group"). A present section is strict like
+    admission: a non-object, an unknown key, a non-bool `enable`, a
+    non-positive/non-int `freshness_seconds` or any `audible` other
+    than the one supported mode is a ConfigError. A raw dict built
+    without load_config (direct construction, tests) gets the same
+    defaults filled in — a missing section never silently disables the
+    policy, and a typo never silently changes it."""
+    section = cfg.get("peak_window")
+    if section is None:
+        section = {}
+    if not isinstance(section, dict):
+        raise ConfigError("peak_window must be a JSON object "
+                          "{enable, freshness_seconds, audible}")
+    unknown = set(section) - set(PEAK_WINDOW_DEFAULT)
+    if unknown:
+        raise ConfigError("peak_window names unknown keys: %s"
+                          % ", ".join(sorted(unknown)))
+    enable = section.get("enable", PEAK_WINDOW_DEFAULT["enable"])
+    if not isinstance(enable, bool):
+        raise ConfigError("peak_window.enable must be a boolean")
+    freshness = section.get("freshness_seconds",
+                            PEAK_WINDOW_DEFAULT["freshness_seconds"])
+    if not isinstance(freshness, int) or isinstance(freshness, bool) or \
+       freshness < 1:
+        raise ConfigError("peak_window.freshness_seconds must be a "
+                          "positive integer")
+    audible = section.get("audible", PEAK_WINDOW_DEFAULT["audible"])
+    if audible not in PEAK_AUDIBLE_MODES:
+        raise ConfigError("peak_window.audible must be one of %s "
+                          "(got %r)" % (", ".join(PEAK_AUDIBLE_MODES),
+                                        audible))
+    return {"enable": enable,
+            "freshness_seconds": freshness,
+            "audible": audible}
+
+
+def _validate_peak_window(cfg):
+    """Normalize the peak section into the loaded config (defaults
+    filled); strict validation is peak_window_settings' job."""
+    cfg["peak_window"] = peak_window_settings(cfg)
+
+
 def load_config(path, for_command):
     """Load and validate the config JSON for one command. Raises
     ConfigError on any deviation; there are no silent defaults except
-    the documented INT/POSITIVE_INT/FLOAT/ADMISSION defaults. Unknown
-    keys (a stale min_severity among them — the key is removed from the
-    contract, README §7) pass through unvalidated: the policy no longer
-    reads them. The admission section is the one validated exception."""
+    the documented INT/POSITIVE_INT/FLOAT/ADMISSION/PEAK defaults.
+    Unknown top-level keys (a stale min_severity among them — the key
+    is removed from the contract, README §7) pass through unvalidated:
+    the policy no longer reads them. The admission and peak_window
+    sections are the validated exceptions."""
     if not isinstance(path, str) or not path:
         raise ConfigError("no config path (--config or $HSNOTIFY_CONFIG)")
     try:
@@ -212,4 +284,5 @@ def load_config(path, for_command):
         cfg[key] = float(value)
 
     _validate_admission(cfg)
+    _validate_peak_window(cfg)
     return cfg

@@ -11,10 +11,12 @@ of recorded markers and operator-recorded verify output). Running the
 Nim verify binary is outside this process's scope, always. The one
 display classification beyond the fold is the §3.7 opening MA20 mode:
 a time-window test over the caller-supplied decision moment (as_of,
-KST) plus an integer-only comparison of recorded prices against
-recorded close sums — recorded values in, tags out, never a market
-judgment. The wall clock is read in exactly one place: the HTTP
-adapter's market-view branch, once per request, when as_of is absent.
+KST) against the window opened by the selected run's recorded calendar
+snapshot (tools/market_time.py, P30) plus an integer-only comparison
+of recorded prices against recorded close sums — recorded values in,
+tags out, never a market judgment. The wall clock is read in exactly
+one place: the HTTP adapter's market-view branch, once per request,
+when as_of is absent.
 The §3.7 change history is dual-path: pre-contract runs project the
 state-comparison changes, runs whose config record declares
 events_contract "top10-v1" translate the Core-confirmed TOP10 facts
@@ -79,6 +81,19 @@ from datetime import datetime, timedelta, timezone
 from functools import cmp_to_key
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
+
+# The session-time authority (tools/market_time.py, P30). Two layouts
+# carry this file: the checkout (<repo>/tools/api/serve.py, authority at
+# ../market_time.py) and the container image (Dockerfile flattens
+# serve.py to /opt/hongscanner/serve.py, authority kept at
+# ./tools/market_time.py). The authority's own file is the probe — an
+# absent one still fails the import loudly (no fallback clock).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _authority_dir in (os.path.dirname(_HERE), os.path.join(_HERE, "tools")):
+    if os.path.isfile(os.path.join(_authority_dir, "market_time.py")):
+        sys.path.insert(0, _authority_dir)
+        break
+import market_time  # noqa: E402
 
 # --bind default: a no-option call binds loopback only, as before.
 BIND_HOST = "127.0.0.1"
@@ -163,12 +178,10 @@ MARKET_SORT_FALLING = "3"
 MARKET_MA20_API = "ka10081"
 MARKET_MA20_LIST_KEY = "stk_dt_pole_chart_qry"
 MARKET_MA20_DAYS = 20
-# The VS-2 opening window (README §3.7): a half-open interval over the
-# KST time-of-day of the caller-supplied decision moment (as_of) —
-# [09:00:00, 09:30:00), applied only when as_of's KST date equals the
-# selected run's session_date.
-OPENING_WINDOW_START = "09:00:00"
-OPENING_WINDOW_END = "09:30:00"
+# The VS-2 opening window (README §3.7) is owned by the single session-
+# time authority, tools/market_time.py (P30): [recorded session open,
+# open + PEAK_WINDOW) on the selected run's session_date. No 09:00
+# constant lives here — an unproven opening grants no privilege.
 # The §3.7 item whitelist: the projection is field-bounded so the
 # response size is mechanically capped (at most 120 items). ma20_tag is
 # the opening mode's display classification ("ABOVE"/"BELOW" inside the
@@ -859,24 +872,20 @@ def _ma20_distance_order(entries, above):
     return entries
 
 
-def determine_mode(as_of, session_date):
-    """The §3.7 mode decision (README §3.7): the opening MA20 mode
-    applies only when `as_of` — the caller-supplied decision moment —
-    falls in the half-open KST window [OPENING_WINDOW_START,
-    OPENING_WINDOW_END) on the selected run's session_date. `as_of` is
-    the only time authority: this function never reads a clock. A
-    missing or naive as_of, a non-string session_date, or an as_of
-    whose KST date is not the session_date fails closed to "core"."""
-    if as_of is None or as_of.tzinfo is None \
-            or not isinstance(session_date, str):
-        return "core"
-    moment = as_of.astimezone(KST)
-    if moment.date().isoformat() != session_date:
-        return "core"
-    clock = moment.strftime("%H:%M:%S")
-    if OPENING_WINDOW_START <= clock < OPENING_WINDOW_END:
-        return "opening_ma20"
-    return "core"
+def determine_mode(as_of, session_date, open_time):
+    """The §3.7 mode decision (README §3.7): delegates to the single
+    session-time authority (tools/market_time.py, P30). The opening
+    MA20 mode applies only when `as_of` — the caller-supplied decision
+    moment — falls in the half-open KST window [open_time, open_time +
+    PEAK_WINDOW) on the selected run's session_date. `open_time` is the
+    session opening recorded in that run's calendar snapshot
+    (read_session_open); UNKNOWN is not 09:00 — a missing or
+    unparseable record grants no privilege. `as_of` is the only time
+    authority: this function never reads a clock. A missing or naive
+    as_of, a non-string session_date, a non-time open_time, or an
+    as_of whose KST date is not the session_date fails closed to
+    "core"."""
+    return market_time.mode_for(as_of, session_date, open_time)
 
 
 def _as_of_text(as_of):
@@ -1007,6 +1016,16 @@ class Projector:
         # by its own lock.
         self._events_lock = threading.Lock()
         self._events_entry = None
+        # The selected run's recorded session opening (P30: the calendar
+        # snapshot's open time, read by market_time.read_session_open):
+        # one slot, (input path, session_date) -> time | None, read once
+        # at prewarm / first use and reused per request — the calendar
+        # snapshot is the input's first record, written at run start and
+        # never rewritten. The same single-entry discipline as the slots
+        # above, guarded by its own lock; an unproven opening (None) is
+        # cached too — the fail-closed answer is a value, not a fault.
+        self._open_time_lock = threading.Lock()
+        self._open_time_entry = None
         # The notify ledger's aggregate cursor (README §3.1/§3.4): one
         # slot, the last published incremental read (path, st_dev,
         # st_ino, offset, line_no, counters, latest event) — never the
@@ -1077,6 +1096,11 @@ class Projector:
                 if eligible:
                     session, session_date, _ = max(
                         eligible, key=lambda r: (r[1], r[2] or "", r[0]))
+                    run_dir = os.path.join(self.runs_root, session)
+                    # The §3.7 mode's evidence is warmed with the fold:
+                    # the calendar snapshot's recorded open time is read
+                    # once here (P30), never per request.
+                    self._session_open(run_dir, session_date)
                     self._market_projection(
                         os.path.join(self.runs_root, session, INPUT_JSONL),
                         session_date)
@@ -1464,6 +1488,26 @@ class Projector:
             self._fold_entry = state
             return state.names, state.snapshots, state.ma20
 
+    def _session_open(self, run_dir, session_date):
+        """The session opening recorded in the run's calendar snapshot
+        (tools/market_time.py, P30): read once per selected run — at
+        prewarm for the startup run — and memoized in one slot, so a
+        request never re-reads the input's first record. The snapshot
+        is written at run start and never rewritten, so (input path,
+        session_date) pins the value; a different selected run re-reads.
+        An unproven opening (absent record, holiday, malformed value)
+        is cached as None — the fail-closed answer the mode decision
+        turns into "core"; it is never substituted with 09:00."""
+        path = os.path.join(run_dir, INPUT_JSONL)
+        key = (path, session_date)
+        with self._open_time_lock:
+            entry = self._open_time_entry
+            if entry is not None and entry[0] == key:
+                return entry[1]
+            open_time = market_time.read_session_open(run_dir, session_date)
+            self._open_time_entry = (key, open_time)
+            return open_time
+
     def _events_committed_lines(self, path):
         """The memoized committed-lines read of one events.hcj.jsonl —
         the market view's event source (README §3.7: the journal grows
@@ -1609,8 +1653,10 @@ class Projector:
         still no judgment: the facts are the confirmed changes). The
         VS-2 opening MA20 mode is one more recorded projection on the
         same fold: `as_of` — the caller-supplied decision moment — is
-        the mode's only time authority (determine_mode); inside the
-        opening window the top10 lists are reconstituted by
+        the mode's only time authority (determine_mode), and the window
+        itself is the session opening recorded in the selected run's
+        calendar snapshot (tools/market_time.py, P30). Inside the
+        window the top10 lists are reconstituted by
         opening_market_top10 from recorded prices against recorded
         close sums (§3.7) — orthogonal to the history path. The runs
         root is listed once per request and every identity is read
@@ -1667,10 +1713,14 @@ class Projector:
         # committed observed_at (None ranks last), then max dirname.
         session, environment, session_date, run_id, _, events_contract = \
             max(eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        run_dir = os.path.join(self.runs_root, session)
         # The §3.7 mode decision: as_of (the caller's moment) against
-        # the selected run's recorded session_date — the run's recorded
-        # bytes never decide the mode.
-        mode = determine_mode(as_of, session_date)
+        # the window opened by the selected run's RECORDED calendar
+        # snapshot (market_time, P30). An unproven opening — absent
+        # record, holiday, malformed value — grants no privilege: the
+        # mode is "core", never a 09:00 fallback.
+        mode = determine_mode(as_of, session_date,
+                              self._session_open(run_dir, session_date))
         # The §3.7 history dual-path discriminator: the selected run's
         # own recorded config value. Absence is the pre-contract legacy
         # projection; "top10-v1" is the fact path. Any other value is a
@@ -1681,7 +1731,6 @@ class Projector:
             raise DataFault("%s config events_contract is not %s"
                             % (INPUT_JSONL, MARKET_EVENTS_CONTRACT))
         fact_path = events_contract == MARKET_EVENTS_CONTRACT
-        run_dir = os.path.join(self.runs_root, session)
         stock_names, snapshots, ma20 = self._market_projection(
             os.path.join(run_dir, INPUT_JSONL), session_date)
         events, _ = self._events_committed_lines(

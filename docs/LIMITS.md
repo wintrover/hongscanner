@@ -101,6 +101,10 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
 | the operating APK is a debug build | both 2026-11-17 acceptances ran the debug APK (DEBUG band on screen, debug signing, debuggable); whether production ships a release build is undecided, and a debug-signed artifact is a distribution trust problem, not just a UI badge | release build/keystore decision (operator) |
 | 09:30 벽시계 교차는 실제 거래일의 실측 관측으로만 증명된다 | replay `?as_of=`는 판정 함수의 결정론을 증명하지만, 실제 시계가 그 경계를 지나며 화면이 바뀌는 것은 별개다 | VS-3 E2E acceptance (live 09:30 boundary observation) |
 | 모바일 60초 표시 SLO는 두 기기에서 측정하는 운영 SLO다 | Dart `Timer.periodic`과 OS 스케줄링은 주기를 보장하지 않는다(공식 문서: 연속 콜백 간격은 duration보다 짧거나 길 수 있다) | P12 device acceptance (s25-ultra · s10) |
+| 피크 알림의 "그룹당 정확히 1통"은 서버 판정이며 기기 소리를 보장하지 않는다 | 서버는 그룹당 FCM 발송 1회를 보장하지만 FCM 도착·Android 게시·스피커 출력은 Android/OEM/사용자 설정(방해 금지·볼륨·채널 무음)의 권한이다. FCM HIGH도 즉시 도착 보증이 아니다(공식 문서) | P12 device acceptance (S10) |
+| 발송 성공과 delivery record append 사이의 크래시 창은 중복 발송을 만들 수 있다 | `_attempt_unit`은 `send_message` 반환 뒤에만 `record_all`을 호출한다(send → record). 그 사이에 프로세스가 죽으면 재시작 후 같은 그룹이 다시 발송되어 소리가 2회 날 수 있다. 누락보다 중복을 택한 의도된 트레이드오프이며 exactly-once를 주장하지 않는다 | dispatcher crash semantics |
+| 세션 개장이 UNKNOWN이면 피크 특권이 없다 | 달력 레코드 부재·휴장(`open: null`)·비정규 타임스탬프에서 `session_open=None`이면 API는 `core`, dispatcher는 P28 60분 예산을 쓴다. 09:00을 추측하지 않는다 — 실패 방향은 "피크에 조용해짐"이고 오발송이 아니다 | P30 fail-closed |
+| 2026-11-19 시각의 1차 출처 본문은 확보되지 않았다 | KRX 공지(`noti_no=261115880`, `noti_dd=20261105`)는 "대학수학능력시험일(11.19) 증시장 등 거래시간 임시 변경" 제목과 함께 첨부 참조만 제공하고 첨부 본문이 0바이트로 차단됐다. 10:00/16:30은 2차 보도 3곳 일치로 기록했고 운영 달력은 `CAL-2026Q4-KRX-4150e8a04230`(open 10:00, close 16:30)으로 개정했다. `tools/check_calendar_source.py`는 특별 개·폐장시간 변경을 증명하지 못하므로 이 개정은 운영자 승인(P25) 근거다 | P25 operator approval |
 
 ## Explicit non-goals
 

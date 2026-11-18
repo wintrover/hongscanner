@@ -21,10 +21,9 @@ import 'test_kit.dart';
 /// switch — in store-only tests no navigator exists, so a routed id is
 /// observable as store.pendingEventId / store.pendingEventIds until
 /// the shell's first-frame flush. The market-alert group drives the
-/// real shell so the OS-notification posting (MethodChannel
-/// "hongscanner/market_alert", mocked via
-/// TestDefaultBinaryMessengerBinding) and its fallbacks are observable
-/// end-to-end.
+/// real shell so the in-app foreground banner and the no-OS-post policy
+/// (MethodChannel "hongscanner/market_alert", mocked via
+/// TestDefaultBinaryMessengerBinding) are observable end-to-end.
 void main() {
   /// The cover list every digest test below uses, and the rows it must
   /// render: one per covered event, each row the fact's own
@@ -131,9 +130,9 @@ void main() {
     expect(store.selectedEventId, evDownEnterId);
 
     // Foreground delivery: forwarded to the shell's display callback
-    // (which posts market alerts to the OS channel or shows the banner
-    // fallback — driven by the shell-level tests below) — never routed:
-    // no selection change, no fetch, no pending route.
+    // (which shows the silent in-app banner — driven by the shell-level
+    // tests below) — never routed: no selection change, no fetch, no
+    // pending route.
     push.foregroundController.add(PushMessage.fromData({
       'event_id': evUpEnterId,
       'event_type': 'CANDIDATE_ENTERED',
@@ -301,7 +300,7 @@ void main() {
         }, notificationTitle: title, notificationBody: body);
 
     testWidgets(
-      'foreground TOP10 alerts post to the OS channel verbatim; no banner, no routing hijack',
+      'foreground TOP10 alerts are in-app only: no OS post, one banner per unit, no routing hijack',
       (tester) async {
         final mock = mockMarketAlert();
         final push = FakeMessagePushService();
@@ -310,73 +309,77 @@ void main() {
         await tester.pumpWidget(HongScannerApp(store: store));
         await tester.pumpAndSettle();
 
-        // A TOP10 state change with the dispatcher's own text: re-posted
-        // to the OS channel with the server-assembled strings, verbatim.
+        // A TOP10 state change with the dispatcher's own text: the
+        // foreground path shows the silent in-app banner and never asks
+        // the platform to post — no system alert, no sound.
         push.foregroundController.add(marketMessage(evUpEnterId,
             'TOP10_ENTERED',
             title: 'TOP10 진입: 삼성전자', body: '순위 11 → 7'));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(1));
-        expect(mock.posts.single['eventId'], evUpEnterId);
-        expect(mock.posts.single['title'], 'TOP10 진입: 삼성전자');
-        expect(mock.posts.single['body'], '순위 11 → 7');
-        // The OS notification owns the display: no in-app banner on top.
-        expect(find.byType(SnackBar), findsNothing);
+        expect(mock.posts, isEmpty);
+        expect(find.byType(SnackBar), findsOneWidget);
+        expect(find.text('포그라운드 알림 수신: TOP10_ENTERED'), findsOneWidget);
         // Foreground policy unchanged: no route, no selection hijack,
         // no detail fetch.
         expect(store.selectedEventId, isNull);
         expect(store.pendingEventId, isNull);
         expect(store.eventDetail.phase, LoadPhase.idle);
 
-        // A re-delivery of the same event dedups (bounded history): no
-        // second post, no banner.
+        // A re-delivery of the same event is one unit: no second banner
+        // and still no post. Let the first banner expire so the absence
+        // is observable.
+        await tester.pump(const Duration(seconds: 4));
+        await tester.pumpAndSettle();
+        expect(find.byType(SnackBar), findsNothing);
         push.foregroundController.add(marketMessage(evUpEnterId,
             'TOP10_ENTERED',
             title: 'TOP10 진입: 삼성전자', body: '순위 11 → 7'));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(1));
+        expect(mock.posts, isEmpty);
+        expect(find.byType(SnackBar), findsNothing);
 
-        // A different market event posts again.
+        // A different market event is a new unit: banner again, no post.
         push.foregroundController.add(marketMessage(evUpUpdateId,
             'RANK_CHANGED',
             title: '순위 변화: 삼성전자', body: '순위 7 → 2'));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(2));
+        expect(mock.posts, isEmpty);
+        expect(find.byType(SnackBar), findsOneWidget);
+        expect(find.text('포그라운드 알림 수신: RANK_CHANGED'), findsOneWidget);
 
-        // A market type WITHOUT the server text is not postable — the
-        // app never re-assembles text the server did not send. The
-        // banner is the fallback.
+        // A market type WITHOUT the server text surfaces the same way:
+        // the banner is the only foreground display path.
         push.foregroundController
             .add(marketMessage(evDownEnterId, 'TOP10_EXITED'));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(2));
+        expect(mock.posts, isEmpty);
         expect(find.byType(SnackBar), findsOneWidget);
         expect(find.text('포그라운드 알림 수신: TOP10_EXITED'), findsOneWidget);
         // Still no routing through any of the foreground deliveries.
         expect(store.selectedEventId, isNull);
 
-        // Let the fallback banner expire before the next delivery.
+        // Let the banner expire before the next delivery.
         await tester.pump(const Duration(seconds: 4));
         await tester.pumpAndSettle();
 
-        // Non-market types: banner only, no OS post.
+        // Non-market types: the same in-app-only surface.
         push.foregroundController.add(PushMessage.fromData({
           'event_id': evDownExitId,
           'event_type': 'CANDIDATE_EXITED',
         }));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(2));
+        expect(mock.posts, isEmpty);
         expect(find.byType(SnackBar), findsOneWidget);
         expect(find.text('포그라운드 알림 수신: CANDIDATE_EXITED'), findsOneWidget);
       },
     );
 
-    testWidgets('a refused OS post falls back to the in-app banner',
+    testWidgets(
+        'foreground delivery never calls the platform post; the banner is the only surface',
         (tester) async {
-      // postResult false = the platform refused (notification permission
-      // off / disabled): nothing is displayed by the OS, so the banner
-      // takes over instead of the alert being lost.
-      final mock = mockMarketAlert(postResult: false);
+      // The mock would accept a post, yet no attempt may happen: the
+      // foreground policy is in-app only regardless of platform state.
+      final mock = mockMarketAlert();
       final push = FakeMessagePushService();
       final store = makeStore(
           transport: fixtureTransport(), push: push, kv: MemoryKeyValueStore());
@@ -387,7 +390,8 @@ void main() {
           'TOP10_ENTERED',
           title: 'TOP10 진입: 삼성전자', body: '순위 11 → 7'));
       await tester.pumpAndSettle();
-      expect(mock.posts, hasLength(1));
+      expect(mock.posts, isEmpty,
+          reason: 'no OS notification is posted while the app is foreground');
       expect(find.byType(SnackBar), findsOneWidget);
       expect(find.text('포그라운드 알림 수신: TOP10_ENTERED'), findsOneWidget);
       expect(store.selectedEventId, isNull);
@@ -480,7 +484,7 @@ void main() {
     );
 
     testWidgets(
-      'foreground digest posts to the silent digest channel with its cover list',
+      'foreground digest stays in-app: no OS post, one banner per digest unit',
       (tester) async {
         final mock = mockMarketAlert();
         final push = FakeMessagePushService();
@@ -495,45 +499,45 @@ void main() {
           'count': '3',
         }, notificationTitle: '홍스캐너 TOP10 순위 요약', notificationBody: '관측 그룹 요약'));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(1));
-        // The post carries the server's text verbatim plus the message
-        // unit: the representative (first covered) id, the kind, the
-        // comma-joined cover list, and the silent channel.
-        expect(mock.posts.single['eventId'], evTopEnterId);
-        expect(mock.posts.single['title'], '홍스캐너 TOP10 순위 요약');
-        expect(mock.posts.single['body'], '관측 그룹 요약');
-        expect(mock.posts.single['kind'], 'digest');
-        expect(mock.posts.single['eventIds'], digestCoverJoined);
-        expect(mock.posts.single['channelId'], 'market_rank_digest');
-        // The OS notification owns the display: no in-app banner on top.
-        expect(find.byType(SnackBar), findsNothing);
+        // The server text is present, but foreground delivery never
+        // reaches the OS notification path (silent channel included).
+        expect(mock.posts, isEmpty);
+        expect(find.byType(SnackBar), findsOneWidget);
+        expect(find.text('포그라운드 알림 수신: digest'), findsOneWidget);
         // Foreground policy unchanged: no route, no selection hijack.
         expect(store.selectedEventId, isNull);
         expect(store.pendingEventIds, isNull);
         expect(store.digestEvents.phase, LoadPhase.idle);
 
-        // A re-delivery of the same digest is one unit: no second post.
+        // A re-delivery of the same digest is one unit: no second
+        // banner, no post. Expire the first banner to observe absence.
+        await tester.pump(const Duration(seconds: 4));
+        await tester.pumpAndSettle();
+        expect(find.byType(SnackBar), findsNothing);
         push.foregroundController.add(PushMessage({
           'kind': 'digest',
           'event_ids': digestCoverJoined,
           'count': '3',
         }, notificationTitle: '홍스캐너 TOP10 순위 요약', notificationBody: '관측 그룹 요약'));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(1));
+        expect(mock.posts, isEmpty);
+        expect(find.byType(SnackBar), findsNothing);
 
         // The single event covered by the digest is a different unit:
-        // it still surfaces — on the sound channel (no channelId arg).
+        // it surfaces on its own in-app banner.
         push.foregroundController.add(marketMessage(evTopEnterId,
             'TOP10_ENTERED',
             title: 'TOP10 진입: 삼성전자', body: '순위 11 → 7'));
         await tester.pumpAndSettle();
-        expect(mock.posts, hasLength(2));
-        expect(mock.posts.last['channelId'], isNull,
-            reason: 'the default sound channel — the pre-digest contract');
+        expect(mock.posts, isEmpty);
+        expect(find.byType(SnackBar), findsOneWidget);
+        expect(find.text('포그라운드 알림 수신: TOP10_ENTERED'), findsOneWidget);
       },
     );
 
-    testWidgets('foreground summary posts on the sound channel', (tester) async {
+    testWidgets(
+        'foreground summary stays in-app: no OS post, banner shows the kind',
+        (tester) async {
       final mock = mockMarketAlert();
       final push = FakeMessagePushService();
       final store = makeStore(
@@ -541,21 +545,17 @@ void main() {
       await tester.pumpWidget(HongScannerApp(store: store));
       await tester.pumpAndSettle();
 
-      // An immediate ≥2-event summary: sound channel, kind and cover
-      // list carried like the digest's.
+      // An immediate ≥2-event summary with server text: still an in-app
+      // banner only, never a post.
       push.foregroundController.add(PushMessage({
         'kind': 'summary',
         'event_ids': digestCoverJoined,
         'count': '3',
       }, notificationTitle: '홍스캐너 TOP10 변화', notificationBody: '순위 변화 요약'));
       await tester.pumpAndSettle();
-      expect(mock.posts, hasLength(1));
-      expect(mock.posts.single['eventId'], evTopEnterId);
-      expect(mock.posts.single['kind'], 'summary');
-      expect(mock.posts.single['eventIds'], digestCoverJoined);
-      expect(mock.posts.single['channelId'], isNull,
-          reason: 'a summary is a sound notification — the default channel');
-      expect(find.byType(SnackBar), findsNothing);
+      expect(mock.posts, isEmpty);
+      expect(find.byType(SnackBar), findsOneWidget);
+      expect(find.text('포그라운드 알림 수신: summary'), findsOneWidget);
     });
   });
 }

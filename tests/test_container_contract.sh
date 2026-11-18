@@ -21,7 +21,7 @@
 ## PR-5 image contents (tools/container/README.md §8): besides the
 ## hongscanner binary the staged context carries the collector binary,
 ## sidecar.py (colocated with it: collector.nim resolves the sidecar
-## script next to its own binary), requirements.txt and the four notify
+## script next to its own binary), requirements.txt and the five notify
 ## modules; the in-image asserts cover the collector (exec bit, byte
 ## identity), the sidecar/notify layout, $HSCOLLECTOR_PYTHON=python3 and
 ## the one pinned sidecar dependency (websockets==17.3 importable).
@@ -150,6 +150,7 @@ mkdir -p "$CTX/bin" "$CTX/tools/api" "$CTX/tools/collector" \
 cp "$REPO_ROOT/Dockerfile" "$CTX/Dockerfile"
 cp "$REPO_ROOT/.dockerignore" "$CTX/.dockerignore"
 cp "$REPO_ROOT/tools/api/serve.py" "$CTX/tools/api/serve.py"
+cp "$REPO_ROOT/tools/market_time.py" "$CTX/tools/market_time.py"
 cp "$REPO_ROOT/tools/container/cloud_supervisor.py" \
    "$CTX/tools/container/cloud_supervisor.py"
 cp "$REPO_ROOT/calendars/CALENDAR_INDEX.sha256" \
@@ -159,8 +160,8 @@ cp "$CBIN" "$CTX/bin/collector"
 cp "$REPO_ROOT/tools/collector/sidecar.py" "$CTX/tools/collector/sidecar.py"
 cp "$REPO_ROOT/tools/collector/requirements.txt" \
    "$CTX/tools/collector/requirements.txt"
-for f in notify_dispatcher.py notify_config.py notify_fcm.py \
-         notify_ledger.py; do
+for f in notify_dispatcher.py notify_clock.py notify_config.py \
+         notify_fcm.py notify_ledger.py; do
   cp "$REPO_ROOT/tools/notify/$f" "$CTX/tools/notify/$f"
 done
 assert_file_in_context() { # desc path
@@ -173,6 +174,7 @@ assert_file_in_context() { # desc path
 assert_file_in_context "staged Dockerfile" "$CTX/Dockerfile"
 assert_file_in_context "staged .dockerignore" "$CTX/.dockerignore"
 assert_file_in_context "staged serve.py" "$CTX/tools/api/serve.py"
+assert_file_in_context "staged market_time.py" "$CTX/tools/market_time.py"
 assert_file_in_context "staged cloud_supervisor.py" \
   "$CTX/tools/container/cloud_supervisor.py"
 assert_file_in_context "staged CALENDAR_INDEX.sha256" \
@@ -182,10 +184,62 @@ assert_file_in_context "staged test collector" "$CTX/bin/collector"
 assert_file_in_context "staged sidecar.py" "$CTX/tools/collector/sidecar.py"
 assert_file_in_context "staged requirements.txt" \
   "$CTX/tools/collector/requirements.txt"
-for f in notify_dispatcher.py notify_config.py notify_fcm.py \
-         notify_ledger.py; do
+for f in notify_dispatcher.py notify_clock.py notify_config.py \
+         notify_fcm.py notify_ledger.py; do
   assert_file_in_context "staged tools/notify/$f" "$CTX/tools/notify/$f"
 done
+# The staged copy set is DERIVED from the imports, not from the list
+# above (the market_time/notify_clock failure class: a module-level
+# import missing from the image surfaces only as an ImportError inside
+# the running container, after every suite was green). Every local module
+# reachable from the two entry points — serve.py and notify_dispatcher.py
+# — must be in the staged context.
+IMPORTED_MODULES="$("$PY" - "$REPO_ROOT" <<'PY'
+import ast, os, sys
+repo = sys.argv[1]
+roots = [os.path.join(repo, "tools"),
+         os.path.join(repo, "tools", "notify"),
+         os.path.join(repo, "tools", "api"),
+         os.path.join(repo, "tools", "collector")]
+def resolve(name):
+    for root in roots:
+        path = os.path.join(root, name + ".py")
+        if os.path.isfile(path):
+            return path
+    return None
+staged = {}
+def walk(path):
+    base = os.path.basename(path)[:-3]
+    if base in staged:
+        return
+    staged[base] = path
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename=path)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names = [node.module]
+        else:
+            continue
+        for name in names:
+            target = resolve(name.split(".")[0])
+            if target:
+                walk(target)
+for entry in ("serve.py", "notify_dispatcher.py"):
+    for root in roots:
+        candidate = os.path.join(root, entry)
+        if os.path.isfile(candidate):
+            walk(candidate)
+            break
+for base in sorted(staged):
+    print(os.path.relpath(staged[base], repo))
+PY
+)"
+while IFS= read -r rel; do
+  [ -n "$rel" ] || continue
+  assert_file_in_context "import-derived staged module $rel" "$CTX/$rel"
+done <<< "$IMPORTED_MODULES"
 assert_eq "no calendar json in the staged context" 0 \
   "$(find "$CTX/calendars" "$CTX" -maxdepth 1 -name '*.json' | wc -l)"
 
@@ -326,12 +380,14 @@ RC=0
 docker run --rm --entrypoint /bin/sh "$IMAGE_TAG" -c '
 set -e
 test -f /opt/hongscanner/serve.py
+test -f /opt/hongscanner/tools/market_time.py
 test -f /opt/hongscanner/cloud_supervisor.py
 test -x /opt/hongscanner/bin/hongscanner
 test -x /opt/hongscanner/bin/collector
 test -f /opt/hongscanner/bin/sidecar.py
 test -f /opt/hongscanner/tools/collector/requirements.txt
 test -f /opt/hongscanner/tools/notify/notify_dispatcher.py
+test -f /opt/hongscanner/tools/notify/notify_clock.py
 test -f /opt/hongscanner/tools/notify/notify_config.py
 test -f /opt/hongscanner/tools/notify/notify_fcm.py
 test -f /opt/hongscanner/tools/notify/notify_ledger.py
@@ -341,7 +397,7 @@ test ! -e /var/lib/hongscanner/notify/ledger.hcj.jsonl
 [ "$(id -u)" -ne 0 ]
 [ "$(printenv HSCOLLECTOR_PYTHON)" = "python3" ]
 ' || RC=$?
-assert_eq "in-image layout: serve.py + supervisor + executable binaries + collector-sidecar-notify files + baked INDEX, no baked ledger, no calendar json, non-root uid, HSCOLLECTOR_PYTHON=python3" \
+assert_eq "in-image layout: serve.py + market_time authority + supervisor + executable binaries + collector-sidecar-notify files + baked INDEX, no baked ledger, no calendar json, non-root uid, HSCOLLECTOR_PYTHON=python3" \
   0 "$RC"
 HOST_INDEX_SHA="$(sha256sum "$REPO_ROOT/calendars/CALENDAR_INDEX.sha256" \
   | cut -d' ' -f1)"

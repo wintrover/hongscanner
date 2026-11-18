@@ -18,10 +18,11 @@ One-shot sweep (default; the backward-compatible form):
      (notify_config.admission_mode, plan B by default):
      TOP10_ENTERED / TOP10_EXITED -> "immediate" (sound channel),
      RANK_CHANGED -> "digest" (silent channel), every other event
-     type (faults, replay, session lifecycle included) -> "suppress"
-     — recorded in the ledgers and never pushed (the old type_skipped
-     meaning, same counter). Severity is a fact field, never a send
-     decision;
+     type (faults, replay, AGGREGATION_STARTED, session lifecycle
+     included) -> "suppress" — recorded in the event ledger and
+     counted type_skipped, never pushed and never given a delivery
+     record (the old type_skipped meaning, same counter). Severity is
+     a fact field, never a send decision;
   3. suppress duplicates: an ACCEPTED (event_id, device_id) pair is
      never sent again; a FAILED pair is terminal (UNREGISTERED token,
      SENDER_ID_MISMATCH config error, unknown permanent codes);
@@ -38,7 +39,14 @@ One-shot sweep (default; the backward-compatible form):
      sound high-water mark (ACCEPTED or PENDING records, all devices,
      monotonic); inside the window a group's immediate events fold
      into its silent digest, and a PENDING sound unit keeps the
-     reservation it already made (a retry never bypasses the window);
+     reservation it already made (a retry never bypasses the window).
+     The opening peak window (peak_window config; --run-dir supplies
+     the run whose input.hcj.jsonl records the session calendar) lifts
+     the CROSS-GROUP budget for a fresh observation inside
+     [open, open+30m) KST: every such group rings once (still at most
+     one sound per group). No --run-dir, no recorded opening, a
+     holiday/date mismatch or a future observation grants no
+     privilege and P28 alone decides (fail-closed);
   5. append one delivery record per covered event and outcome
      (PENDING on retryable failures, ACCEPTED / FAILED otherwise;
      every record carries message_kind, digest members share the
@@ -90,16 +98,27 @@ artifact of another run). A stale market fact is not actionable, so
 the cross-session grace window is 0 by default; widening it is a user
 policy decision, not a dispatcher default. The one-shot sweep and
 --admission-report stay unscoped (backward compatibility; the report
-replays exactly the file it is given).
+replays exactly the file it is given). The opening-peak decision needs
+the run's recorded calendar, which only an explicit --run-dir supplies:
+without it the session opening is UNKNOWN and the peak privilege is
+disabled (fail-closed, never an inferred 09:00). The session date is
+each fact's own session_id; the watched file is one session.
 
-Admission report (--admission-report <abs events file>): the replay
-tool (README §9) — no send, no ledger write. The first line states the
-policy source (the config admission section or the default plan B —
-an absent section is never conflated with a configured one) and the
-full mapping; then every fact of the file judged with THE SAME
-admission code the dispatch path uses, one verdict line per event, the
-per-observation-group send plan and the totals. The same file + policy
-always print the same bytes.
+Admission report (--admission-report <abs events file> --as-of <ts>):
+the replay tool (README §9) — no send, no ledger write. --as-of is
+mandatory (the replay's dispatch moment: peak freshness is judged
+there, and the P28 budget is itself a time judgment, so every replay
+states its clock) and must carry a numeric offset. The first line
+states the policy source (the config admission section or the default
+plan B — an absent section is never conflated with a configured one)
+and the full mapping; the second states the peak basis (as-of, the
+resolved session opening, enable, freshness). --session-open HH:MM:SS
+is the virtual-scenario override (report only); without it the opening
+is read from --run-dir's recorded calendar, and an unknown opening
+means no peak privilege. Then every fact of the file is judged with
+THE SAME admission code the dispatch path uses, one verdict line per
+event, the per-observation-group send plan and the totals. The same
+file + policy + as-of + session-open always print the same bytes.
 
 SIGTERM/SIGINT request a clean stop: the current tick finishes, the
 single-writer locks are released and the process exits 0. All stdout
@@ -134,11 +153,21 @@ import signal
 import socket
 import sys
 import time
+from datetime import datetime
 
-import notify_clock
-import notify_config
-import notify_fcm
-import notify_ledger
+# tools/market_time.py is the single session-time authority (P30): the
+# notify tools live in tools/notify, so its parent directory joins the
+# import path. The window arithmetic is never copied here.
+_TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+import market_time  # noqa: E402
+
+import notify_clock  # noqa: E402
+import notify_config  # noqa: E402
+import notify_fcm  # noqa: E402
+import notify_ledger  # noqa: E402
 
 # The delivery policy's event-type universe (README §0/§6): only the
 # market TOP10 rank transitions can be admitted (immediate/digest);
@@ -147,7 +176,61 @@ import notify_ledger
 # notify_config's admission validation share one truth: a fourth
 # notifiable type changes all of them together or neither.
 NOTIFIABLE_EVENT_TYPES = notify_fcm.TOP10_EVENT_TYPES
-AGGREGATION_STARTED = "AGGREGATION_STARTED"
+
+
+def _parse_observed_at(value):
+    """An event's canonical observed_at as an aware datetime, or None.
+    The ledger validates the canonical shape before an event is ever
+    stored; a deviation here still yields None (fail-closed), never a
+    guessed clock."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def session_open_for(run_dir, session_date, override=None):
+    """The session opening that judges the peak window for a run.
+
+    An explicit override (the --session-open virtual-replay argument)
+    wins; otherwise the opening is the run's recorded calendar via
+    market_time.read_session_open. No run_dir or an unreadable /
+    absent / holiday record means UNKNOWN (None) and no peak privilege
+    — the market_time contract: UNKNOWN is not 09:00.
+    """
+    if override is not None:
+        return override
+    if run_dir is None:
+        return None
+    return market_time.read_session_open(run_dir, session_date)
+
+
+def peak_audible(cfg, session_date, observed_at, now_epoch, open_time):
+    """True iff the opening-peak sound privilege applies to one
+    observation: peak enabled, the session opening KNOWN, observed_at
+    inside [open, open+30m) KST on session_date (market_time owns the
+    arithmetic), and the observation fresh —
+    0 <= now - observed_at <= peak_window.freshness_seconds.
+
+    Every UNKNOWN is fail-closed: no clock (now_epoch None), a naive or
+    unparseable observed_at, a mismatched date, an unknown opening and
+    a future observation (negative age) all return False, so the
+    caller keeps the P28 budget. Inside the window the group-level
+    sound cap (one sound per observation group) still holds; only the
+    cross-group global budget is lifted.
+    """
+    peak = notify_config.peak_window_settings(cfg)
+    if not peak["enable"] or now_epoch is None:
+        return False
+    moment = _parse_observed_at(observed_at)
+    if moment is None:
+        return False
+    if not market_time.in_window(moment, session_date, open_time):
+        return False
+    age = int(now_epoch) - int(moment.timestamp())
+    return 0 <= age <= peak["freshness_seconds"]
 
 
 def compose_admission_units(events, cfg, allow_audible=True):
@@ -168,24 +251,15 @@ def compose_admission_units(events, cfg, allow_audible=True):
     immediate = []
     digest = []
     for event in events:
-        if event["event_type"] == AGGREGATION_STARTED:
-            if allow_audible:
-                immediate.append(event)
-            continue
         mode = notify_config.admission_mode(cfg, event["event_type"])
         if mode == "immediate" and allow_audible:
             immediate.append(event)
         elif mode in ("immediate", "digest"):
             digest.append(event)
     units = []
-    for event in immediate:
-        if event["event_type"] == AGGREGATION_STARTED:
-            units.append(("aggregation_started", [event]))
-    immediate_top10 = [event for event in immediate
-                       if event["event_type"] != AGGREGATION_STARTED]
-    if immediate_top10:
-        units.append(("single" if len(immediate_top10) == 1 else "summary",
-                      immediate_top10))
+    if immediate:
+        units.append(("single" if len(immediate) == 1 else "summary",
+                      immediate))
     if digest:
         units.append(("digest", digest))
     return units
@@ -223,11 +297,17 @@ class Dispatcher:
     one-shot sweep stays a read-only consumer of the event ledger."""
 
     def __init__(self, cfg, opener=None, clock=time.time,
-                 sleeper=time.sleep, resident=False):
+                 sleeper=time.sleep, resident=False, run_dir=None):
         self.cfg = cfg
         self._clock = clock
         self._sleep = sleeper
         self._resident = resident
+        # The run scope's directory (the run whose input.hcj.jsonl
+        # carries the recorded session calendar). Only an explicitly
+        # supplied directory enables the opening-peak privilege; without
+        # it the recorded opening is UNKNOWN and the P28 budget alone
+        # decides (fail-closed, never an inferred 09:00).
+        self._run_dir = run_dir
         self.delivery = notify_ledger.DeliveryLedger(cfg["delivery_path"],
                                                      lock=True)
         self.registry = notify_ledger.Registry(cfg["registry_path"],
@@ -303,9 +383,8 @@ class Dispatcher:
         notifyable = 0
         pairs = []
         for event in in_scope:
-            if event["event_type"] != AGGREGATION_STARTED and \
-                    notify_config.admission_mode(self.cfg,
-                                                 event["event_type"]) == \
+            if notify_config.admission_mode(self.cfg,
+                                            event["event_type"]) == \
                     "suppress":
                 continue
             notifyable += 1
@@ -386,10 +465,7 @@ class Dispatcher:
                     message_kind=msg_kind)
 
         try:
-            if msg_kind == "aggregation_started":
-                message = notify_fcm.build_aggregation_started_message(
-                    events[0], token)
-            elif msg_kind == "single":
+            if msg_kind == "single":
                 message = notify_fcm.build_message(events[0], token)
             elif msg_kind == "summary":
                 message = notify_fcm.build_summary_message(events, token)
@@ -607,13 +683,28 @@ class Dispatcher:
         the same observed_at as an already-admitted group in this pass
         sound too (one observation batch rings on every device). A
         PENDING sound unit is a reservation already made: it retries
-        as sound regardless of the window."""
+        as sound regardless of the window.
+
+        The opening peak window (configured peak_window; market_time
+        owns the arithmetic): a group whose observed_at lies in
+        [open, open+30m) KST on its session date AND is fresh
+        (0 <= now - observed_at <= freshness_seconds) is admitted as
+        sound WITHOUT consulting the P28 marks — group-level only,
+        one sound per group, no cross-group cap. The group still
+        yields at most one sound + one silent unit. Every UNKNOWN
+        (no --run-dir, no recorded calendar opening, holiday, date
+        mismatch, future observation) grants no privilege and falls
+        through to P28 unchanged; a sound admitted in the window still
+        moves the marks forward, so the budget restored after a
+        restart and the budget after the window agree."""
         cooldown = self.cfg.get("audible_cooldown_seconds",
                                 notify_config.AUDIBLE_COOLDOWN_DEFAULT)
         if not isinstance(cooldown, int) or isinstance(cooldown, bool) or \
            cooldown < 1:
             raise notify_config.ConfigError(
                 "audible_cooldown_seconds must be a positive integer")
+        peak = notify_config.peak_window_settings(self.cfg)
+        open_by_session = {}
         last_obs_epoch, last_disp_epoch = self._audible_watermarks(
             events or [], state or {})
         now_sec = int(self._clock() if now_epoch is None else now_epoch) \
@@ -649,7 +740,22 @@ class Dispatcher:
             if not fresh:
                 continue
             obs_epoch = notify_ledger.iso_to_epoch(obs_ts)
-            if admitted_obs_in_pass == obs_ts:
+            peak_ok = False
+            if peak["enable"] and now_sec is not None:
+                session_dates = {event["session_id"]
+                                 for event in groups[key]}
+                session_date = session_dates.pop() \
+                    if len(session_dates) == 1 else None
+                if session_date is not None:
+                    if session_date not in open_by_session:
+                        open_by_session[session_date] = \
+                            session_open_for(self._run_dir, session_date)
+                    peak_ok = peak_audible(
+                        self.cfg, session_date, obs_ts, now_sec,
+                        open_by_session[session_date])
+            if peak_ok:
+                allow_audible = True
+            elif admitted_obs_in_pass == obs_ts:
                 allow_audible = True
             else:
                 obs_ok = last_obs_epoch is None or \
@@ -945,25 +1051,51 @@ def _install_signal_handlers(dispatcher):
 # ----------------------------------------------------- admission report
 
 
-def admission_report(cfg, events_path):
+def admission_report(cfg, events_path, as_of=None, session_open=None,
+                     run_dir=None):
     """The admission replay tool (README §9; docs/ASSUMPTIONS.md P28):
     read an events file, judge EVERY fact with the same admission code
     the dispatch path uses (notify_config.admission_mode,
-    compose_admission_units), and print — the policy source FIRST (the
-    config admission section or the default plan B, stated as such: an
-    absent section is never conflated with a configured one), one
-    verdict line per fact (file order), then per observation group the
-    send summary and the composed message plan (title/body/event_ids —
-    the exact composition the dispatcher would send), then the totals.
-    The Global Attention Budget v1 is replayed from the file alone (the
-    observed_at high-water mark; there is no clock): an immediate event
-    folded into its group's digest is reported DIGEST/digest, matching
-    the plan and the silent total.
-    No send, no ledger write, no clock: the same file + policy always
-    prints the same bytes. A plan whose composed payload would exceed
-    the vendor limit is printed as refused (the same
-    HS_PAYLOAD_OVER_LIMIT refusal the dispatcher records) — never a
-    silently truncated composition. Returns 0."""
+    compose_admission_units, peak_audible), and print — the policy
+    source FIRST (the config admission section or the default plan B,
+    stated as such: an absent section is never conflated with a
+    configured one), the peak basis (as-of, the resolved session
+    opening), one verdict line per fact (file order), then per
+    observation group the send summary and the composed message plan
+    (title/body/event_ids — the exact composition the dispatcher would
+    send), then the totals.
+
+    `as_of` is REQUIRED even when the peak is disabled: it is the
+    replay's dispatch moment (peak freshness is judged there, and the
+    P28 budget is a time judgment, so a replay always states its
+    clock). A missing or naive as_of is a ConfigError. The P28 replay
+    keeps its established rule — the file's observed_at high-water
+    mark — exactly as before; the peak privilege is judged by the SAME
+    peak_audible function production uses, with the session opening
+    taken from `session_open` (the --session-open virtual-replay
+    override) or from the run's recorded calendar (`run_dir`); an
+    unknown opening grants no peak.
+
+    No send, no ledger write, no wall clock: the same file + policy +
+    as_of + session_open always prints the same bytes. A plan whose
+    composed payload would exceed the vendor limit is printed as
+    refused (the same HS_PAYLOAD_OVER_LIMIT refusal the dispatcher
+    records) — never a silently truncated composition. Returns 0."""
+    # The CLI parses both values strictly; a direct caller may pass
+    # the same textual forms, judged by the same parsers (no second
+    # grammar, no lenient fallback).
+    if isinstance(as_of, str):
+        as_of = _parse_as_of_arg(as_of)
+    if isinstance(session_open, str):
+        session_open = _parse_session_open_arg(session_open)
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or \
+       as_of.utcoffset() is None:
+        raise notify_config.ConfigError(
+            "admission report needs --as-of <ISO-8601 timestamp with "
+            "an offset> (the replay clock)")
+    as_of_epoch = int(as_of.timestamp())
+    peak = notify_config.peak_window_settings(cfg)
+
     ledger = notify_ledger.EventLedger(events_path, lock=False)
     try:
         events = ledger.events(strict=True)
@@ -979,12 +1111,27 @@ def admission_report(cfg, events_path):
             order.append(key)
         groups[key].append(event)
 
+    open_by_session = {}
+
+    def open_for(session_date):
+        if session_date not in open_by_session:
+            open_by_session[session_date] = session_open_for(
+                run_dir, session_date, override=session_open)
+        return open_by_session[session_date]
+
+    def group_session_date(group):
+        session_dates = {event["session_id"] for event in group}
+        return session_dates.pop() if len(session_dates) == 1 else None
+
     # The Global Attention Budget v1 replay (README §0): the same dual
     # clock rule the dispatcher applies, derived from the file alone
     # (the report has no clock and writes nothing) — a group's sound is
     # admitted only after the observed_at high-water mark advanced by
     # audible_cooldown_seconds. A folded immediate event is reported
     # DIGEST/digest, matching the plan's silent unit and the totals.
+    # Inside the opening peak and fresh the group rings regardless of
+    # the mark (the same peak_audible decision production makes); a
+    # peak sound still moves the mark forward.
     cooldown = cfg.get("audible_cooldown_seconds",
                        notify_config.AUDIBLE_COOLDOWN_DEFAULT)
     if not isinstance(cooldown, int) or isinstance(cooldown, bool) or \
@@ -996,8 +1143,17 @@ def admission_report(cfg, events_path):
     last_obs_epoch = None
     for key in order:
         obs_epoch = notify_ledger.iso_to_epoch(key)
-        allow_audible = last_obs_epoch is None or \
-            (obs_epoch - last_obs_epoch) >= cooldown
+        peak_ok = False
+        if peak["enable"]:
+            session_date = group_session_date(groups[key])
+            peak_ok = peak_audible(
+                cfg, session_date, key, as_of_epoch,
+                open_for(session_date))
+        if peak_ok:
+            allow_audible = True
+        else:
+            allow_audible = last_obs_epoch is None or \
+                (obs_epoch - last_obs_epoch) >= cooldown
         group_plans = []
         for msg_kind, unit_events in compose_admission_units(
                 groups[key], cfg, allow_audible=allow_audible):
@@ -1010,10 +1166,7 @@ def admission_report(cfg, events_path):
                 last_obs_epoch = obs_epoch if last_obs_epoch is None \
                     else max(last_obs_epoch, obs_epoch)
             try:
-                if msg_kind == "aggregation_started":
-                    message = notify_fcm.build_aggregation_started_message(
-                        unit_events[0], "")
-                elif msg_kind == "single":
+                if msg_kind == "single":
                     message = notify_fcm.build_message(unit_events[0], "")
                 elif msg_kind == "summary":
                     message = notify_fcm.build_summary_message(
@@ -1035,8 +1188,7 @@ def admission_report(cfg, events_path):
     lines = []
     for event in events:
         event_type = event["event_type"]
-        mode = ("immediate" if event_type == AGGREGATION_STARTED
-                else notify_config.admission_mode(cfg, event_type))
+        mode = notify_config.admission_mode(cfg, event_type)
         if mode == "suppress":
             verdict = "SUPPRESS"
             form = "not_in_admission" if event_type not in \
@@ -1061,8 +1213,7 @@ def admission_report(cfg, events_path):
     refused_total = 0
     for key, group_plans in plans:
         sound = sum(1 for plan in group_plans
-                    if plan["kind"] in ("single", "summary",
-                                        "aggregation_started")
+                    if plan["kind"] in ("single", "summary")
                     and "refused" not in plan)
         silent = sum(1 for plan in group_plans
                      if plan["kind"] == "digest"
@@ -1098,9 +1249,79 @@ def admission_report(cfg, events_path):
     mapping = notify_config.effective_admission(cfg)
     lines.insert(0, "admission policy source=%s %s" % (source, " ".join(
         "%s=%s" % (et, mapping[et]) for et in sorted(mapping))))
+    # The peak basis is part of the replay record: the same file,
+    # policy, as_of and session opening print the same bytes; no wall
+    # clock, random or pid enters the output.
+    session_dates = {event["session_id"] for event in events}
+    resolved = {open_for(session_date) for session_date in session_dates}
+    if not resolved:
+        open_text = "unknown"
+    elif len(resolved) == 1:
+        value = next(iter(resolved))
+        open_text = "unknown" if value is None else \
+            value.strftime("%H:%M:%S")
+    else:
+        open_text = "multiple"
+    lines.insert(1, "admission peak as_of=%s session_open=%s enabled=%s "
+                 "freshness_seconds=%d" % (
+                     as_of.astimezone(market_time.KST).replace(
+                         microsecond=0).isoformat(),
+                     open_text, str(peak["enable"]).lower(),
+                     peak["freshness_seconds"]))
     for line in lines:
         print(line, flush=True)
     return 0
+
+
+def _parse_as_of_arg(value):
+    """The --admission-report replay clock: an ISO-8601 timestamp with
+    a numeric offset. A missing, unparseable or naive value is a
+    ConfigError (exit 2) — the replay's freshness and P28 judgment must
+    not fall back to the host clock."""
+    if not isinstance(value, str) or not value:
+        raise notify_config.ConfigError(
+            "--admission-report requires --as-of <ISO-8601 timestamp "
+            "with an offset> (the replay clock)")
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        raise notify_config.ConfigError(
+            "--as-of is not an ISO-8601 timestamp (got %r)" % value)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise notify_config.ConfigError(
+            "--as-of must carry a numeric UTC offset; a naive "
+            "timestamp is UNKNOWN (fail-closed)")
+    return moment
+
+
+def _parse_session_open_arg(value):
+    """--session-open HH:MM:SS (KST) for virtual scenario replays; the
+    same strict shape as the recorded calendar's open, through the
+    market_time parser (no second clock grammar)."""
+    if value is None:
+        return None
+    parsed = market_time.parse_open_time(value + "+09:00") \
+        if isinstance(value, str) else None
+    if parsed is None:
+        raise notify_config.ConfigError(
+            "--session-open must be HH:MM:SS in KST (got %r)" % value)
+    return parsed
+
+
+def _run_dir_arg(value):
+    """An explicit run directory: absolute and existing. Absence is
+    allowed (peak stays disabled, fail-closed), but a supplied path
+    that cannot be the run's directory is a usage error rather than a
+    silent loss of the peak privilege."""
+    if value is None:
+        return None
+    if not os.path.isabs(value):
+        raise notify_config.ConfigError(
+            "--run-dir must be an absolute path (got %r)" % value)
+    if not os.path.isdir(value):
+        raise notify_config.ConfigError(
+            "--run-dir is not a directory: %s" % value)
+    return value
 
 
 def _main(argv):
@@ -1126,7 +1347,32 @@ def _main(argv):
                              "print the verdicts, the per-observation-"
                              "group send plan and the totals — no send, "
                              "no ledger write; byte-identical for the "
-                             "same file + policy (README §0/§9)")
+                             "same file + policy + --as-of + "
+                             "--session-open (README §0/§9)")
+    parser.add_argument("--run-dir", dest="run_dir", metavar="RUN_DIR",
+                        default=None,
+                        help="run directory (absolute path) holding the "
+                             "run's input.hcj.jsonl; enables the opening "
+                             "peak window only when its recorded session "
+                             "opening is KNOWN — without this argument "
+                             "the P28 budget alone decides (fail-closed). "
+                             "For --admission-report the opening is read "
+                             "from here unless --session-open overrides "
+                             "it")
+    parser.add_argument("--as-of", dest="as_of", metavar="ISO8601",
+                        default=None,
+                        help="REQUIRED with --admission-report: the "
+                             "replay clock as an ISO-8601 timestamp with "
+                             "a numeric UTC offset; peak freshness is "
+                             "judged at this moment (never the host "
+                             "clock), and the time-dependent P28 budget "
+                             "is always anchored to a stated moment")
+    parser.add_argument("--session-open", dest="session_open",
+                        metavar="HH:MM:SS", default=None,
+                        help="--admission-report ONLY, virtual scenario "
+                             "replay: override the session opening "
+                             "instead of reading the run's recorded "
+                             "calendar; never used by dispatch/watch")
     args = parser.parse_args(argv)
 
     if args.watch and not os.path.isabs(args.watch):
@@ -1142,6 +1388,27 @@ def _main(argv):
             print("dispatcher: --admission-report needs an absolute "
                   "path (got %r)" % args.admission_report, file=sys.stderr)
             return 2
+    else:
+        if args.as_of is not None:
+            print("dispatcher: --as-of is the --admission-report replay "
+                  "clock; dispatch/watch use the dispatcher clock",
+                  file=sys.stderr)
+            return 2
+        if args.session_open is not None:
+            print("dispatcher: --session-open is a --admission-report "
+                  "virtual-replay override; it cannot be used with "
+                  "dispatch/watch", file=sys.stderr)
+            return 2
+
+    try:
+        run_dir = _run_dir_arg(args.run_dir)
+        as_of = _parse_as_of_arg(args.as_of) \
+            if args.admission_report else None
+        session_open = _parse_session_open_arg(args.session_open) \
+            if args.admission_report else None
+    except notify_config.ConfigError as exc:
+        print("dispatcher: %s" % exc, file=sys.stderr)
+        return 2
 
     try:
         cfg = notify_config.load_config(args.config, "dispatch")
@@ -1157,7 +1424,12 @@ def _main(argv):
                   % args.admission_report, file=sys.stderr)
             return 2
         try:
-            return admission_report(cfg, args.admission_report)
+            return admission_report(
+                cfg, args.admission_report, as_of,
+                session_open=session_open, run_dir=run_dir)
+        except notify_config.ConfigError as exc:
+            print("dispatcher: config refused: %s" % exc, file=sys.stderr)
+            return 2
         except (notify_ledger.LedgerBusy, notify_ledger.LedgerFault,
                 notify_ledger.LedgerError) as exc:
             print("dispatcher: %s" % exc, file=sys.stderr)
@@ -1165,7 +1437,8 @@ def _main(argv):
 
     dispatcher = None
     try:
-        dispatcher = Dispatcher(cfg, resident=bool(args.watch))
+        dispatcher = Dispatcher(cfg, resident=bool(args.watch),
+                                run_dir=run_dir)
         if args.watch:
             _install_signal_handlers(dispatcher)
             code = dispatcher.watch(args.watch)

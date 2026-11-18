@@ -31,9 +31,13 @@ import tempfile
 import time
 import unittest
 import urllib.request
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                ".."))
 
+import market_time  # noqa: E402
 import notify_config  # noqa: E402
 import notify_dispatcher  # noqa: E402
 import notify_fcm  # noqa: E402
@@ -283,11 +287,13 @@ class Base(unittest.TestCase):
         finally:
             registry.close()
 
-    def dispatcher(self, cfg, transport, resident=False):
+    def dispatcher(self, cfg, transport, resident=False, run_dir=None):
         """A Dispatcher with a controllable clock: the sleep call
         advances the fake clock so backoffs are instant and exact.
         resident=True builds the watch worker (the event ledger is
-        opened with its writer lock)."""
+        opened with its writer lock). run_dir supplies the recorded
+        session calendar the peak window reads; None keeps the peak
+        privilege disabled (fail-closed)."""
         clock = {"now": 1_000_000.0}
 
         class Ctx(notify_dispatcher.Dispatcher):
@@ -298,9 +304,21 @@ class Base(unittest.TestCase):
             clock=lambda: clock["now"],
             sleeper=lambda seconds: clock.__setitem__(
                 "now", clock["now"] + seconds),
-            resident=resident)
+            resident=resident, run_dir=run_dir)
         dispatcher._clock_state = clock
         return dispatcher
+
+    def write_calendar(self, run_dir, session_date, open_value):
+        """A run directory whose input.hcj.jsonl first line is the
+        recorded calendar snapshot (market_time's single input), the
+        shape REPLAY_CONTRACT fixes."""
+        os.makedirs(run_dir, exist_ok=True)
+        record = {"kind": "calendar",
+                  "raw": {"days": {session_date: {"open": open_value}}}}
+        with open(os.path.join(run_dir, "input.hcj.jsonl"), "w",
+                  encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        return run_dir
 
     def ledger_lines(self, cfg):
         path = cfg["ledger_path"]
@@ -2286,6 +2304,441 @@ class TestGlobalAttentionBudget(Base):
                           self.records_of(cfg, second)], ["digest"])
 
 
+class TestPeakWindow(Base):
+    """The opening-peak sound privilege: [open, open + 30m) KST on the
+    run's session date, one sound per observation group, no global
+    budget between groups, fresh observations only
+    (0 <= now - observed_at <= freshness_seconds). UNKNOWN opening,
+    holiday/date mismatch and a future observation grant nothing and
+    fall back to P28 unchanged (market_time owns the arithmetic)."""
+
+    DATE = "2026-11-01"
+
+    def at(self, clock):
+        return datetime.fromisoformat("%sT%s+09:00" % (self.DATE, clock))
+
+    def ts(self, clock):
+        return "%sT%s+09:00" % (self.DATE, clock)
+
+    def open_time(self, clock="09:00:00"):
+        return market_time.parse_open_time(clock + "+09:00")
+
+    def peak(self, observed_clock, open_clock="09:00:00",
+             now_clock=None):
+        _, cfg = self.config()
+        moment = self.at(now_clock if now_clock is not None
+                         else observed_clock)
+        return notify_dispatcher.peak_audible(
+            cfg, self.DATE, self.ts(observed_clock),
+            int(moment.timestamp()), self.open_time(open_clock))
+
+    def sends_of(self, transport):
+        return [json.loads(r["data"])["message"]
+                for r in transport.requests
+                if r["url"] == FakeTransport.SEND_URL]
+
+    def report_for(self, events, as_of, session_open=None, run_dir=None):
+        path, cfg = self.config()
+        events_path = os.path.join(self.tmp, "peak-report-events.hcj.jsonl")
+        write_jsonl(events_path, events)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = notify_dispatcher.admission_report(
+                cfg, events_path, as_of, session_open=session_open,
+                run_dir=run_dir)
+        return code, out.getvalue(), path, cfg
+
+    # ------------------------------------------------------- config
+
+    def test_config_defaults_and_strict_validation(self):
+        path, _ = self.config()
+        loaded = notify_config.load_config(path, "dispatch")
+        self.assertEqual(loaded["peak_window"], {
+            "enable": True,
+            "freshness_seconds": 900,
+            "audible": "unlimited_per_group",
+        })
+        for bad in ([], "on",
+                    {"enable": "yes"},
+                    {"enable": 1},
+                    {"freshness_seconds": 0},
+                    {"freshness_seconds": -1},
+                    {"freshness_seconds": 1.5},
+                    {"freshness_seconds": True},
+                    {"freshness_seconds": "900"},
+                    {"audible": "unlimited"},
+                    {"audible": None},
+                    {"audible": "immediate"},
+                    {"unknown": 1}):
+            path, _ = self.config(peak_window=bad)
+            with self.assertRaises(notify_config.ConfigError):
+                notify_config.load_config(path, "dispatch")
+        # A partial section keeps the documented defaults.
+        path, _ = self.config(peak_window={"enable": False})
+        loaded = notify_config.load_config(path, "dispatch")
+        self.assertEqual(loaded["peak_window"]["enable"], False)
+        self.assertEqual(loaded["peak_window"]["freshness_seconds"], 900)
+        self.assertEqual(loaded["peak_window"]["audible"],
+                         "unlimited_per_group")
+
+    # --------------------------------------------------- boundaries
+
+    def test_session_open_0900_boundaries(self):
+        # start inclusive, end exclusive, in KST.
+        self.assertFalse(self.peak("08:59:59"))
+        self.assertTrue(self.peak("09:00:00"))
+        self.assertTrue(self.peak("09:29:59"))
+        self.assertFalse(self.peak("09:30:00"))
+
+    def test_session_open_1000_boundaries(self):
+        # The window follows the RECORDED opening, never a 09:00
+        # constant: 09:10 is outside a 10:00 open.
+        self.assertFalse(self.peak("09:10:00", open_clock="10:00:00"))
+        self.assertTrue(self.peak("10:00:00", open_clock="10:00:00"))
+        self.assertTrue(self.peak("10:29:59", open_clock="10:00:00"))
+        self.assertFalse(self.peak("10:30:00", open_clock="10:00:00"))
+
+    def test_freshness_boundaries(self):
+        # Δ=0 and Δ=900 are fresh; Δ=901 and a future observation
+        # (Δ<0) are fail-closed.
+        self.assertTrue(self.peak("09:00:00", now_clock="09:00:00"))
+        self.assertTrue(self.peak("09:00:00", now_clock="09:15:00"))
+        self.assertFalse(self.peak("09:00:00", now_clock="09:15:01"))
+        self.assertFalse(self.peak("09:00:00", now_clock="08:59:59"))
+
+    def test_unknown_opening_disabled_or_date_mismatch_grants_nothing(self):
+        _, cfg = self.config()
+        now = int(self.at("09:00:00").timestamp())
+        # No recorded opening (no --run-dir) is UNKNOWN, not 09:00.
+        self.assertFalse(notify_dispatcher.peak_audible(
+            cfg, self.DATE, self.ts("09:00:00"), now, None))
+        # enable=false disables the privilege even with a known open.
+        self.assertFalse(notify_dispatcher.peak_audible(
+            dict(cfg, peak_window={"enable": False}), self.DATE,
+            self.ts("09:00:00"), now, self.open_time()))
+        # The window is bound to the run's session date: the same clock
+        # on another date is outside.
+        self.assertFalse(notify_dispatcher.peak_audible(
+            cfg, "2026-11-02", self.ts("09:00:00"), now,
+            self.open_time()))
+        # A naive observed_at is UNKNOWN.
+        self.assertFalse(notify_dispatcher.peak_audible(
+            cfg, self.DATE, "2026-11-01T09:00:00", now,
+            self.open_time()))
+
+    # ------------------------------------------------- dispatcher
+
+    def test_peak_sounds_once_per_group_with_no_cross_group_cap(self):
+        # Two observation groups inside the window, five minutes
+        # apart: P28 alone would silence the second (5 < 60 minutes);
+        # the peak grants each group its ONE sound. The first group's
+        # two immediate events compose ONE summary — not two pushes.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        run_dir = self.write_calendar(
+            os.path.join(self.tmp, "run-peak"), self.DATE,
+            "09:00:00+09:00")
+        events = [
+            make_event(seq=1, symbol="005930",
+                       observed_at=self.ts("09:00:00")),
+            make_event(seq=2, symbol="000660",
+                       observed_at=self.ts("09:00:00")),
+            make_event(seq=3, symbol="035420",
+                       observed_at=self.ts("09:05:00")),
+        ]
+        self.seed_ledger(cfg, events)
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport, run_dir=run_dir)
+        try:
+            dispatcher._clock_state["now"] = \
+                int(self.at("09:05:00").timestamp())
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 2)
+        sends = self.sends_of(transport)
+        self.assertEqual(sends[0]["data"]["kind"], "summary")
+        self.assertEqual(sends[0]["data"]["count"], "2")
+        self.assertEqual(sends[0]["data"]["event_ids"],
+                         "%s,%s" % (events[0]["event_id"],
+                                    events[1]["event_id"]))
+        self.assertNotIn("kind", sends[1]["data"])
+        self.assertEqual(sends[1]["data"]["event_id"],
+                         events[2]["event_id"])
+        self.assertEqual([r["message_kind"] for r in
+                          self.delivery_records(cfg)],
+                         ["summary", "summary", "single"])
+
+    def test_outside_peak_keeps_the_p28_budget(self):
+        # 09:30/09:35 with a 09:00 open: outside the exclusive end.
+        # Group 1 rings (P28 first sound), group 2 is five minutes
+        # later -> silent digest, exactly the pre-peak behavior.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        run_dir = self.write_calendar(
+            os.path.join(self.tmp, "run-outside"), self.DATE,
+            "09:00:00+09:00")
+        events = [
+            make_event(seq=1, symbol="005930",
+                       observed_at=self.ts("09:30:00")),
+            make_event(seq=2, symbol="000660",
+                       observed_at=self.ts("09:35:00")),
+        ]
+        self.seed_ledger(cfg, events)
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport, run_dir=run_dir)
+        try:
+            dispatcher._clock_state["now"] = \
+                int(self.at("09:35:00").timestamp())
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        sends = self.sends_of(transport)
+        self.assertEqual(len(sends), 2)
+        self.assertNotIn("kind", sends[0]["data"])  # single, sound
+        self.assertEqual(sends[0]["data"]["event_id"],
+                         events[0]["event_id"])
+        self.assertEqual(sends[1]["data"]["kind"], "digest")
+        self.assertEqual(sends[1]["data"]["event_ids"],
+                         events[1]["event_id"])
+        self.assertEqual([r["message_kind"] for r in
+                          self.delivery_records(cfg)],
+                         ["single", "digest"])
+
+    def test_stale_peak_observation_falls_back_to_p28(self):
+        # The 09:00 observation is inside the window but 20 minutes
+        # old at dispatch: no peak privilege, and P28's 60-minute
+        # budget is still spent by the 08:50 sound -> silent digest.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        run_dir = self.write_calendar(
+            os.path.join(self.tmp, "run-stale"), self.DATE,
+            "09:00:00+09:00")
+        events = [
+            make_event(seq=1, symbol="005930",
+                       observed_at=self.ts("08:50:00")),
+            make_event(seq=2, symbol="000660",
+                       observed_at=self.ts("09:00:00")),
+        ]
+        self.seed_ledger(cfg, events)
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport, run_dir=run_dir)
+        try:
+            dispatcher._clock_state["now"] = \
+                int(self.at("09:20:00").timestamp())
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        sends = self.sends_of(transport)
+        self.assertEqual(len(sends), 2)
+        self.assertNotIn("kind", sends[0]["data"])
+        self.assertEqual(sends[1]["data"]["kind"], "digest")
+        self.assertEqual(sends[1]["data"]["event_ids"],
+                         events[1]["event_id"])
+
+    def test_missing_run_dir_disables_the_peak_privilege(self):
+        # No --run-dir means the recorded opening is UNKNOWN: the P28
+        # budget alone decides (fail-closed, no inferred 09:00).
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        events = [
+            make_event(seq=1, symbol="005930",
+                       observed_at=self.ts("09:00:00")),
+            make_event(seq=2, symbol="000660",
+                       observed_at=self.ts("09:05:00")),
+        ]
+        self.seed_ledger(cfg, events)
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport)  # no run_dir
+        try:
+            dispatcher._clock_state["now"] = \
+                int(self.at("09:05:00").timestamp())
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        kinds = [r["message_kind"] for r in self.delivery_records(cfg)]
+        self.assertEqual(kinds, ["single", "digest"])
+
+    # ------------------------------------- faults and aggregation
+
+    def test_faults_and_aggregation_started_never_push_or_record(self):
+        # Faults (severity is a fact field, not a send decision) and
+        # AGGREGATION_STARTED are outside the admission universe: they
+        # stay in the EVENT ledger and in type_skipped, with zero push
+        # and zero delivery records — even inside the opening peak.
+        _, cfg = self.config()
+        self.write_service_account(cfg)
+        self.register("dev-1")
+        run_dir = self.write_calendar(
+            os.path.join(self.tmp, "run-faults"), self.DATE,
+            "09:00:00+09:00")
+        observed_at = self.ts("09:01:00")
+        blocked = [
+            make_event(event_type="DATA_GAP_SUSPECTED",
+                       rule_id="data-gap", seq=31, symbol=None,
+                       rank=None, direction=None, severity="CRITICAL",
+                       observed_at=observed_at),
+            make_event(event_type="SUBSCRIPTION_TRUNCATED",
+                       rule_id="subscription-truncated", seq=32,
+                       symbol=None, rank=None, direction=None,
+                       severity="CRITICAL", observed_at=observed_at),
+            make_event(event_type="MARKET_STATE_UNKNOWN",
+                       rule_id="market-state-unknown", seq=33,
+                       symbol=None, rank=None, direction=None,
+                       severity="CRITICAL", observed_at=observed_at),
+            make_event(event_type="REST_TRUNCATED",
+                       rule_id="rest-truncated", seq=35,
+                       symbol=None, rank=None, direction=None,
+                       severity="CRITICAL", observed_at=observed_at),
+            make_event(event_type="FEED_DISCONNECTED",
+                       rule_id="feed-disconnected", seq=34,
+                       symbol=None, rank=None, direction=None,
+                       severity="CRITICAL", observed_at=observed_at),
+            make_event(event_type="AGGREGATION_STARTED",
+                       rule_id="aggregation-started-v1", seq=1,
+                       severity="INFO", symbol=None, name=None,
+                       previous_rank=None, rank=None, direction=None,
+                       observed_at=observed_at),
+        ]
+        notifyable = make_event(seq=17, observed_at=observed_at)
+        self.seed_ledger(cfg, blocked + [notifyable])
+        transport = FakeTransport()
+        dispatcher = self.dispatcher(cfg, transport, run_dir=run_dir)
+        try:
+            dispatcher._clock_state["now"] = \
+                int(self.at("09:01:00").timestamp())
+            code = dispatcher.sweep()
+        finally:
+            dispatcher.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(transport.send_count(), 1)
+        records = self.delivery_records(cfg)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["event_id"],
+                         notifyable["event_id"])
+        sent_ids = {record["event_id"] for record in records}
+        for event in blocked:
+            self.assertNotIn(event["event_id"], sent_ids)
+        # Ledger-only artifacts: every fact is still in the event
+        # ledger, and the suppress counter counts all six (five fault
+        # types + AGGREGATION_STARTED).
+        self.assertEqual(dispatcher.counts.get("events_total"), 7)
+        self.assertEqual(dispatcher.counts.get("type_skipped"), 6)
+        ledger = notify_ledger.EventLedger(cfg["ledger_path"],
+                                           lock=False)
+        try:
+            self.assertEqual(len(ledger.events(strict=False)), 7)
+        finally:
+            ledger.close()
+
+    # ------------------------------------------------------ report
+
+    def report_probe(self, open_clock, observed_clock):
+        """One P28-spent group 15 minutes before the open, then the
+        probe group: the probe rings only if the peak grants it."""
+        prior = (self.at(open_clock) - timedelta(minutes=15)
+                 ).strftime("%H:%M:%S")
+        events = [
+            make_event(seq=1, symbol="005930",
+                       observed_at=self.ts(prior)),
+            make_event(seq=2, symbol="000660",
+                       observed_at=self.ts(observed_clock)),
+        ]
+        code, out, _path, _cfg = self.report_for(
+            events, as_of=self.at(observed_clock),
+            session_open=self.open_time(open_clock))
+        self.assertEqual(code, 0)
+        return out
+
+    def group_sound(self, out, observed_at):
+        prefix = "admission group observed_at=%s " % observed_at
+        for line in out.splitlines():
+            if line.startswith(prefix):
+                match = re.search(r" sound=(\d+) ", line)
+                self.assertIsNotNone(match, line)
+                return int(match.group(1))
+        self.fail("no group line for %s in %r" % (observed_at, out))
+
+    def test_report_boundaries_session_open_0900(self):
+        for clock, expected in (("08:59:59", 0), ("09:00:00", 1),
+                                ("09:29:59", 1), ("09:30:00", 0)):
+            out = self.report_probe("09:00:00", clock)
+            self.assertEqual(self.group_sound(out, self.ts(clock)),
+                             expected, clock)
+
+    def test_report_boundaries_session_open_1000(self):
+        for clock, expected in (("09:10:00", 0), ("10:00:00", 1),
+                                ("10:29:59", 1), ("10:30:00", 0)):
+            out = self.report_probe("10:00:00", clock)
+            self.assertEqual(self.group_sound(out, self.ts(clock)),
+                             expected, clock)
+
+    def test_report_peak_lifts_cross_group_budget_only_when_fresh(self):
+        events = [
+            make_event(seq=1, observed_at=self.ts("09:00:00")),
+            make_event(seq=2, observed_at=self.ts("09:05:00")),
+        ]
+        code, out, _path, _cfg = self.report_for(
+            events, as_of=self.at("09:05:00"),
+            session_open=self.open_time("09:00:00"))
+        self.assertEqual(code, 0)
+        self.assertIn("admission peak as_of=2026-11-01T09:05:00+09:00 "
+                      "session_open=09:00:00 enabled=true "
+                      "freshness_seconds=900", out.splitlines())
+        self.assertIn("admission total events=2 groups=2 sound=2 "
+                      "silent=0", out)
+        # Same file/opening at a stale as_of: no peak, P28 folds the
+        # second immediate into its digest.
+        code, out, _path, _cfg = self.report_for(
+            events, as_of=self.at("10:00:00"),
+            session_open=self.open_time("09:00:00"))
+        self.assertEqual(code, 0)
+        self.assertIn("admission total events=2 groups=2 sound=1 "
+                      "silent=1", out)
+
+    def test_report_reads_the_recorded_calendar_and_fails_closed(self):
+        run_dir = self.write_calendar(
+            os.path.join(self.tmp, "run-report"), self.DATE,
+            "09:00:00+09:00")
+        events = [
+            make_event(seq=1, observed_at=self.ts("09:00:00")),
+            make_event(seq=2, observed_at=self.ts("09:05:00")),
+        ]
+        code, out, _path, _cfg = self.report_for(
+            events, as_of=self.at("09:05:00"), run_dir=run_dir)
+        self.assertEqual(code, 0)
+        self.assertIn("session_open=09:00:00", out)
+        self.assertIn("admission total events=2 groups=2 sound=2 "
+                      "silent=0", out)
+        # No --run-dir and no --session-open: the opening is UNKNOWN,
+        # so the peak grants nothing (P28: one sound, one digest).
+        code, out, _path, _cfg = self.report_for(
+            events, as_of=self.at("09:05:00"))
+        self.assertEqual(code, 0)
+        self.assertIn("session_open=unknown", out)
+        self.assertIn("admission total events=2 groups=2 sound=1 "
+                      "silent=1", out)
+        # A calendar without this date (a holiday/absent day) is the
+        # same UNKNOWN, never a substituted 09:00.
+        empty = self.write_calendar(
+            os.path.join(self.tmp, "run-other-day"), "2026-11-02",
+            "09:00:00+09:00")
+        code, out, _path, _cfg = self.report_for(
+            events, as_of=self.at("09:05:00"), run_dir=empty)
+        self.assertEqual(code, 0)
+        self.assertIn("session_open=unknown", out)
+        self.assertIn("admission total events=2 groups=2 sound=1 "
+                      "silent=1", out)
+
+
 # ----------------------------------------------------------- register
 
 
@@ -2876,13 +3329,19 @@ class TestAdmissionReport(Base):
     plan and the totals — no send, no ledger write, byte-identical for
     the same file + policy."""
 
-    def report_for(self, events, cfg_overrides=None):
+    def report_for(self, events, cfg_overrides=None, as_of=None,
+                   session_open=None, run_dir=None):
         path, cfg = self.config(**(cfg_overrides or {}))
         events_path = os.path.join(self.tmp, "report-events.hcj.jsonl")
         write_jsonl(events_path, events)
+        if as_of is None:
+            as_of = datetime.fromisoformat(
+                "2026-11-01T10:00:00+09:00")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = notify_dispatcher.admission_report(cfg, events_path)
+            code = notify_dispatcher.admission_report(
+                cfg, events_path, as_of, session_open=session_open,
+                run_dir=run_dir)
         return code, out.getvalue(), path, cfg
 
     def test_every_event_gets_exactly_one_verdict(self):
@@ -3036,13 +3495,16 @@ class TestAdmissionReport(Base):
         self.write_service_account(cfg)
         events_path = os.path.join(self.tmp, "report-events.hcj.jsonl")
         write_jsonl(events_path, [make_event(seq=17, rank=7)])
+        as_of = "2026-11-01T10:00:00+09:00"
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = notify_dispatcher._main(
-                ["--config", path, "--admission-report", events_path])
+                ["--config", path, "--admission-report", events_path,
+                 "--as-of", as_of])
         self.assertEqual(code, 0)
         self.assertIn("admission policy source=default", out.getvalue())
         self.assertIn("verdict=ADMIT", out.getvalue())
+        self.assertIn("admission peak as_of=%s" % as_of, out.getvalue())
         # No send, no ledger write: neither the delivery file nor the
         # event ledger copy was ever born.
         self.assertFalse(os.path.exists(cfg["delivery_path"]))
@@ -3054,15 +3516,16 @@ class TestAdmissionReport(Base):
             self.assertEqual(
                 notify_dispatcher._main(
                     ["--config", path, "--admission-report",
-                     "relative.jsonl"]), 2)
+                     "relative.jsonl", "--as-of", as_of]), 2)
             self.assertEqual(
                 notify_dispatcher._main(
                     ["--config", path, "--admission-report",
-                     "/absent/events.jsonl"]), 2)
+                     "/absent/events.jsonl", "--as-of", as_of]), 2)
             self.assertEqual(
                 notify_dispatcher._main(
                     ["--config", path, "--watch", events_path,
-                     "--admission-report", events_path]), 2)
+                     "--admission-report", events_path,
+                     "--as-of", as_of]), 2)
         # A torn file (no LF) is a ledger fault: fail-closed exit 4.
         torn = os.path.join(self.tmp, "torn.hcj.jsonl")
         with open(torn, "w", encoding="utf-8") as f:
@@ -3072,8 +3535,59 @@ class TestAdmissionReport(Base):
              contextlib.redirect_stderr(err):
             self.assertEqual(
                 notify_dispatcher._main(
-                    ["--config", path, "--admission-report", torn]), 4)
+                    ["--config", path, "--admission-report", torn,
+                     "--as-of", as_of]), 4)
         self.assertIn("partial line", err.getvalue())
+
+    def test_cli_report_requires_as_of(self):
+        # --as-of is mandatory whether or not the peak window is
+        # enabled: the P28 60-minute budget is time-dependent too, so a
+        # replay without a clock is refused fail-closed (exit 2).
+        path, _ = self.config()
+        events_path = os.path.join(self.tmp, "report-events.hcj.jsonl")
+        write_jsonl(events_path, [make_event(seq=17, rank=7)])
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(err):
+            code = notify_dispatcher._main(
+                ["--config", path, "--admission-report", events_path])
+        self.assertEqual(code, 2)
+        self.assertIn("--as-of", err.getvalue())
+        # The same holds for the direct replay function (the contract,
+        # not only the CLI wrapper).
+        _path, cfg = self.config()
+        with self.assertRaises(notify_config.ConfigError):
+            notify_dispatcher.admission_report(cfg, events_path, None)
+        # A naive timestamp is UNKNOWN: fail-closed, no host-clock
+        # substitution.
+        with self.assertRaises(notify_config.ConfigError):
+            notify_dispatcher.admission_report(
+                cfg, events_path,
+                datetime.fromisoformat("2026-11-01T10:00:00"))
+
+    def test_cli_report_is_byte_identical_for_the_same_inputs(self):
+        path, _ = self.config()
+        events_path = os.path.join(self.tmp, "report-events.hcj.jsonl")
+        write_jsonl(events_path, [
+            make_event(seq=1, observed_at="2026-11-01T09:00:00+09:00"),
+            make_event(seq=2, observed_at="2026-11-01T09:05:00+09:00"),
+        ])
+        argv = ["--config", path, "--admission-report", events_path,
+                "--as-of", "2026-11-01T09:05:00+09:00",
+                "--session-open", "09:00:00"]
+
+        def run():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(notify_dispatcher._main(argv), 0)
+            return out.getvalue()
+
+        first = run()
+        second = run()
+        self.assertEqual(first, second)  # the same bytes
+        self.assertIn("session_open=09:00:00", first)
+        self.assertIn("admission total events=2 groups=2 sound=2 "
+                      "silent=0", first)
 
 
 class TestResidentProcess(Base):

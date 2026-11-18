@@ -293,8 +293,11 @@ behavior).
 The dispatcher (tools/notify) sends **notification+data** messages with
 data `{event_id, event_type, severity}` and a server-assembled
 notification title/body. The app treats that text as opaque display
-copy: re-posted verbatim or shown as the banner fallback — never
-re-assembled, re-computed or re-judged (the server's projection
+copy and never re-assembles, re-computes or re-judges it. In the
+foreground the app posts nothing to the OS — no system notification and
+no sound; the in-app banner is the only foreground signal. In the
+background, terminated and Doze states Android displays the
+notification payload itself (the official FCM path). (the server's projection
 authority extends to the notification copy). Data-only payloads plus
 local notification re-synthesis (the app inventing title/body the
 server never sent) remain forbidden by design.
@@ -469,10 +472,12 @@ APK artifacts are gitignored (`/build/`) and never committed.
   logcat instead of rendered), stub-message tap routing (cold start
   pending→flush, background tap, foreground banner, bad payloads), the
   market-alert channel (notification title/body passthrough, fail-closed
-  posting without a platform end, OS-channel posting of TOP10 alerts
-  with the banner fallback on refusal or missing text, dedup, no
-  routing hijack, cold-start pending-tap consumption, warm-tap delivery
-  — the method channel mocked through TestDefaultBinaryMessengerBinding),
+  posting without a platform end, foreground posting of TOP10 alerts
+  removed — zero platform posts from `_handleForegroundAlert`, banner
+  only — background/terminated display left to Android's FCM path,
+  dedup, no routing hijack, cold-start pending-tap consumption,
+  warm-tap delivery — the method channel mocked through
+  TestDefaultBinaryMessengerBinding),
   and resync (single-fetch backoff, 503 warming auto-retry, recovery,
   lifecycle resume, pull-to-refresh).
 - `flutter analyze` — clean. NOTE: in this repo's non-ASCII checkout path
