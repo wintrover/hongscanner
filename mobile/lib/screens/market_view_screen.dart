@@ -77,12 +77,46 @@ class _Top10sBody extends StatelessWidget {
     // not the day's change rate, so only that mode gets the
     // disambiguating headers. core mode keeps the pre-mode headerless
     // cards verbatim — mode switches labels, never the row order or
-    // the classification.
+    // the classification. The banner above both cards names the mode
+    // the server decided and its mode_as_of clock.
     final ma20Mode = marketView.mode == 'opening_ma20';
     final coverage = marketView.coverage;
+    // The mode banner names what the server projected and when it decided
+    // it (mode_as_of) — and, separately, the last recorded observation
+    // the rows were built from (data_as_of). No clock-derived mode guess
+    // happens in the app — a missing timestamp shows '—', never a
+    // fabricated one.
+    final modeAsOf = marketView.modeAsOf;
+    final modeClock = modeAsOf != null && modeAsOf.length >= 19
+        ? modeAsOf.substring(11, 19)
+        : '—';
+    final dataAsOf = marketView.dataAsOf;
+    final dataClock = dataAsOf != null && dataAsOf.length >= 19
+        ? dataAsOf.substring(11, 19)
+        : '—';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        Card(
+          margin: const EdgeInsets.only(bottom: 8),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  ma20Mode ? '개장 MA20 순위' : '일반 TOP10',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '판정 $modeClock · 데이터 $dataClock',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+        ),
         if (ma20Mode && coverage != null) ...[
           Card(
             margin: const EdgeInsets.only(bottom: 8),

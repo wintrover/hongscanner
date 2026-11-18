@@ -280,9 +280,11 @@ class MarketViewResponse {
   const MarketViewResponse({
     required this.asOf,
     this.coverage,
+    this.dataAsOf,
     required this.history,
     required this.latest,
     required this.mode,
+    this.modeAsOf,
     required this.run,
     required this.risingTop10,
     required this.fallingTop10,
@@ -300,12 +302,14 @@ class MarketViewResponse {
       coverage: coverage is Map<String, Object?>
           ? MarketViewCoverage.fromMap(coverage)
           : null,
+      dataAsOf: _asString(raw['data_as_of']),
       history:
           _asMapList(raw['history']).map(MarketViewItem.fromMap).toList(),
       latest: latest is Map<String, Object?>
           ? MarketViewLatest.fromMap(latest)
           : null,
       mode: _asString(raw['mode']) ?? 'core',
+      modeAsOf: _asString(raw['mode_as_of']),
       run: run is Map<String, Object?> ? MarketViewRun.fromMap(run) : null,
       risingTop10:
           _asMapList(raw['rising_top10']).map(MarketViewItem.fromMap).toList(),
@@ -323,6 +327,10 @@ class MarketViewResponse {
   /// Opening-mode coverage; null in core mode or when no run exists.
   final MarketViewCoverage? coverage;
 
+  /// Data timestamp: the observation time the server's projection was
+  /// computed from; null when the server recorded none.
+  final String? dataAsOf;
+
   /// Retained TOP10 state-change records in server order
   /// (oldest→newest), ≤100.
   final List<MarketViewItem> history;
@@ -335,8 +343,15 @@ class MarketViewResponse {
   /// always send it; a missing or unrecognized value keeps 'core' — the
   /// pre-mode display — never a fabricated opening_ma20 reading. Display
   /// only: the app switches its labels on it, never the row order or
-  /// the classification.
+  /// the classification. The server is the only mode authority — the app
+  /// re-asks it every poll while foregrounded instead of deriving the
+  /// mode from the clock.
   final String mode;
+
+  /// Server timestamp of the mode decision (ISO 8601 recorded verbatim);
+  /// null when the server recorded none — the banner then shows no clock
+  /// rather than a fabricated one.
+  final String? modeAsOf;
 
   /// Eligible run context; null = no eligible run recorded.
   final MarketViewRun? run;

@@ -209,6 +209,8 @@ Map<String, Object?> fixtureHistoryChangeItem(
 /// (symbol-fallback coverage).
 final Map<String, Object?> fixtureMarketView = {
   'as_of': '2026-11-02T15:30:58+09:00',
+  'data_as_of': '2026-11-02T15:30:58+09:00',
+  'mode_as_of': '2026-11-02T15:30:58+09:00',
   'falling_top10': [
     fixtureMarketItem(evDownEnterId,
         eventType: 'CANDIDATE_ENTERED',
@@ -298,6 +300,8 @@ final Map<String, Object?> fixtureMarketView = {
 /// history tab.
 final Map<String, Object?> fixtureMarketViewOpeningMa20 = {
   ...fixtureMarketView,
+  'mode_as_of': '2026-11-10T09:10:00+09:00',
+  'data_as_of': '2026-11-10T09:10:00+09:00',
   'falling_top10': [
     fixtureMarketItem(evDownEnterId,
         eventType: 'CANDIDATE_ENTERED',
