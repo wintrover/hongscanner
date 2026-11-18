@@ -535,6 +535,17 @@ assert_matches "COLLECTOR_FAILED line carries t0_observed and stamps" \
 assert_matches "OPS_ALERT line carries the T2 stamps (no t0_observed)" \
   "$(grep -F "OPS_ALERT title=" "$VSA/out/sess-fail.launcher.log")" \
   "OPS_ALERT title=.+ body=.+ mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+assert_matches "OPS_ALERT_SUPPRESSED records no consumer push, same T2 stamps" \
+  "$(grep -F "OPS_ALERT_SUPPRESSED reason=consumer_push_removed" "$VSA/out/sess-fail.launcher.log")" \
+  "OPS_ALERT_SUPPRESSED reason=consumer_push_removed mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+FAIL_COUNTER="$(wc -l < "$VSA/notify.log")"
+if [ "$FAIL_COUNTER" -ge 1 ]; then
+  echo "ok   HS_NOTIFY_CMD override ran on sess-fail (counter=$FAIL_COUNTER >= 1)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL HS_NOTIFY_CMD override did not run on sess-fail (counter=$FAIL_COUNTER)"
+  FAILED=$((FAILED + 1))
+fi
 
 # (b) worker systemd unit failed -> WORKER_UNIT_FAILED + notify
 : > "$VSA/notify.log"
@@ -581,6 +592,77 @@ assert_contains "notify observed stall" \
 assert_matches "SESSION_STALL_DETECTED line carries t0_observed and stamps" \
   "$(grep -F "SESSION_STALL_DETECTED" "$VSA/out/sess-stall.launcher.log")" \
   "SESSION_STALL_DETECTED idle_seconds=[0-9]+ threshold=[0-9]+ t0_observed=1 mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+
+# (d) the record-only alert path: HS_NOTIFY_CMD set = the ONLY command
+# that runs (counted); unset = no ops_alert.py invocation at all (the
+# removed fallback). The Python spy logs every interpreter call, so its
+# own mono-stamp calls prove the probe was live when ops_alert.py was
+# absent from the log.
+cat > "$VSA/bin/alert-counter" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$COUNTER_LOG"
+exit 0
+EOF
+chmod +x "$VSA/bin/alert-counter"
+
+: > "$VSA/counter.log"
+RC=0
+PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
+  COUNTER_LOG="$VSA/counter.log" \
+  HSNOTIFY_CONFIG="$VSA/notify-config.json" \
+  HSCOLLECTOR_BIN="$VSA/collector-fail" \
+  HSCOLLECTOR_PYTHON="$VSA/py-stamp" \
+  HS_NOTIFY_CMD="$VSA/bin/alert-counter" \
+  HS_WATCHDOG_INTERVAL=0 \
+  bash "$RUN_SESSION" --out="$VSA/out/sess-counter" >/dev/null 2>&1 || RC=$?
+assert_eq "counter run: session exits 4" 4 "$RC"
+COUNTER_CALLS="$(wc -l < "$VSA/counter.log")"
+if [ "$COUNTER_CALLS" -ge 1 ]; then
+  echo "ok   HS_NOTIFY_CMD counter ran (calls=$COUNTER_CALLS >= 1)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL HS_NOTIFY_CMD counter did not run (calls=$COUNTER_CALLS)"
+  FAILED=$((FAILED + 1))
+fi
+assert_contains "counter run: suppression still recorded" \
+  "$(cat "$VSA/out/sess-counter.launcher.log")" \
+  "OPS_ALERT_SUPPRESSED reason=consumer_push_removed"
+
+cat > "$VSA/py-spy" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PY_CALLS_LOG"
+if [ "$1" = "-c" ]; then exec python3 "$@"; fi
+exit 0
+EOF
+chmod +x "$VSA/py-spy"
+
+: > "$VSA/py-calls.log"
+: > "$VSA/counter.log"
+RC=0
+PATH="$VSA/bin:$PATH" DF_AVAIL_STUB=32212254720 \
+  COUNTER_LOG="$VSA/counter.log" \
+  PY_CALLS_LOG="$VSA/py-calls.log" \
+  HSNOTIFY_CONFIG="$VSA/notify-config.json" \
+  HSCOLLECTOR_BIN="$VSA/collector-fail" \
+  HSCOLLECTOR_PYTHON="$VSA/py-spy" \
+  HS_WATCHDOG_INTERVAL=0 \
+  env -u HS_NOTIFY_CMD bash "$RUN_SESSION" \
+    --out="$VSA/out/sess-nofallback" >/dev/null 2>&1 || RC=$?
+assert_eq "no override: session exits 4" 4 "$RC"
+assert_contains "no override: OPS_ALERT stamp still recorded" \
+  "$(cat "$VSA/out/sess-nofallback.launcher.log")" "OPS_ALERT title="
+assert_matches "no override: suppression carries the T2 stamps" \
+  "$(grep -F "OPS_ALERT_SUPPRESSED reason=consumer_push_removed" "$VSA/out/sess-nofallback.launcher.log")" \
+  "OPS_ALERT_SUPPRESSED reason=consumer_push_removed mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
+assert_contains "no override: python spy was live (mono stamp ran)" \
+  "$(cat "$VSA/py-calls.log")" "-c"
+if grep -qF "ops_alert.py" "$VSA/py-calls.log"; then
+  echo "FAIL no override: ops_alert.py was invoked"; FAILED=$((FAILED + 1))
+else
+  echo "ok   no override: ops_alert.py never invoked"; PASS=$((PASS + 1))
+fi
+assert_eq "no override: HS_NOTIFY_CMD counter stayed at 0" 0 \
+  "$(wc -l < "$VSA/counter.log")"
 
 # ---------------------------------------------------------------- summary
 echo ""

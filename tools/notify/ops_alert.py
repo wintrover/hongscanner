@@ -5,7 +5,10 @@ Design intent: this tool sends an ops alert WITHOUT leaving any notify
 event or delivery ledger record. The attempt and its outcome are
 recorded by the CALLER (runs-retention/retention-log.jsonl, the session
 launcher log); this tool's whole report is one stdout result line per
-device plus its exit code. When an alert ever needs persistent
+device plus its exit code. The session launcher
+(tools/run_session.sh) no longer invokes this tool: its ops-alert path
+is record-only (OPS_ALERT_SUPPRESSED reason=consumer_push_removed).
+When an alert ever needs persistent
 notification (retry, delivery records), the path is an event-contract
 extension following the AGGREGATION_STARTED precedent — never growing
 this tool into that role.
