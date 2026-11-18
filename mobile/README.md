@@ -118,36 +118,60 @@ flutter run --dart-define=HS_API_BASE=http://10.0.2.2:8080   # Android emulator
     tailnet-only with Funnel disabled), and the Tailscale Personal plan
     is for non-commercial personal use.
 
-## Tailnet ACL (operating path)
+## Tailnet ACL (operating and development paths)
 
-On the operating front the phone reaches
+On the operating front the phones reach
 `https://hongscanner-srv.tail10d26b.ts.net` (port 443) through
 `tailscale serve`, which proxies to the loopback API. Authorization is
 per device in the tailnet policy — there is no app-level credential on
-this path. Measured policy (2026-11-17, console, owner tailnet):
+this path, and the API itself has no authentication, so the tailnet ACL
+is the only authorization boundary. Measured policy (2026-11-18, owner
+tailnet, applied as a tailnet policy file):
 
 ```json
 "tagOwners": { "tag:hongscanner-srv": ["autogroup:owner"] },
 "hosts": {
+  "sm-g977n": "100.101.144.92/32",
   "sm-s938n": "100.80.46.69/32",
-  "sm-g977n": "100.101.144.92/32"
+  "dev-laptop": "100.69.132.70/32"
 },
 "acls": [],
 "grants": [
-  { "src": ["sm-s938n", "sm-g977n"], "dst": ["tag:hongscanner-srv"], "ip": ["tcp:443"] }
+  { "src": ["sm-s938n", "sm-g977n"], "dst": ["tag:hongscanner-srv"], "ip": ["tcp:443"] },
+  { "src": ["dev-laptop"], "dst": ["tag:hongscanner-srv"], "ip": ["*"] },
+  { "src": ["dev-laptop"], "dst": ["sm-g977n"], "ip": ["*"] }
 ]
 ```
 
-- **Two device aliases** — `sm-s938n` and `sm-g977n` (the operating
-  phone: Samsung SM-G977N, Android 12, tailnet node `s10`,
-  `100.101.144.92`). The grant's `src` must list every phone that needs
-  access. Measured failure: with only `sm-s938n` listed, the phone was
-  absent from the server's netmap — `tailscale whois 100.101.144.92`
-  answered `peer not found` and the app stayed offline. After adding
-  `sm-g977n` to `hosts` and to the grant `src`, the server's `tailscale
-  status` shows `s10` and `tailscale ping` measured 6 ms, direct.
-- **`ip` stays `tcp:443` only** — no `tcp:8080`, no SSH. The API itself
-  binds `127.0.0.1:8080`, so the proxy is the single ingress.
+The policy file carries 6 `tests` (4 accept + 2 reject); the tailnet API
+(`POST /api/v2/tailnet/-/acl`) answered **200**, and a policy is applied
+only when those tests pass. `acls: []` is deny-by-default: nothing is
+allowed except what `grants` list.
+
+- **Two phone aliases** — `sm-s938n` (SM-S938N, the `s25-ultra`
+  production client) and `sm-g977n` (SM-G977N, Android 12, tailnet node
+  `s10`; the test client). The grant's `src` must list every phone that
+  needs access. Measured failure (2026-11-17): with only `sm-s938n`
+  listed, the test phone was absent from the server's netmap —
+  `tailscale whois 100.101.144.92` answered `peer not found` and the app
+  stayed offline. After adding `sm-g977n` to `hosts` and to the grant
+  `src`, the server's `tailscale status` shows `s10` and `tailscale ping`
+  measured 6 ms, direct.
+- **Development node `dev-laptop`** — the development laptop
+  (`hs-dev`, `100.69.132.70`). It is granted `*` (all ports/protocols)
+  to the operating host and to the test phone — deliberately broader
+  than the phones, because development installs, `curl` checks and
+  `adb` run over the tailnet. Measured before/after (2026-11-18): from
+  the laptop `tailscale ping 100.125.164.8` answered `no matching peer`
+  before the grant and `pong … 5ms` after it, and `curl
+  https://hongscanner-srv.tail10d26b.ts.net/status` → `http=200`. This
+  node is a development/control path only, never a production client
+  (ASSUMPTIONS P29).
+- **`ip` stays `tcp:443` for phones** — no `tcp:8080`, no SSH. The API
+  itself binds `127.0.0.1:8080`, so the proxy is the single ingress.
+  Because the API has no authentication, any device the policy admits
+  is authorized: keep the grant list, not an app credential, as the
+  boundary.
 - **Symptom when the grant is missing**: the device disappears from the
   server's peer list — `tailscale whois 100.101.144.92` answered `peer
   not found` — and the app renders "오프라인 / 서버에 연결할 수 없음
@@ -200,6 +224,35 @@ Serve's access log records `127.0.0.1` for every tailnet request (the
 proxy connects over loopback), so client identity cannot be
 distinguished server-side — device attribution needs device-side
 evidence.
+
+## Wireless adb (test client, fixed port)
+
+The test phone's debug bridge is reached over the tailnet on the fixed
+port 5555 (measured 2026-11-18, SM-G977N at `100.101.144.92`):
+
+```sh
+adb tcpip 5555                                 # once, with USB attached
+adb connect 100.101.144.92:5555
+adb -s 100.101.144.92:5555 shell echo          # ALIVE
+adb -s 100.101.144.92:5555 shell getprop ro.product.model   # SM-G977N
+```
+
+- **The port is fixed at 5555** — `adb tcpip 5555` arms a listener on
+  that port; it is not a per-connection random port. With the USB cable
+  removed, `adb -s 100.101.144.92:5555 shell echo` still answered
+  `ALIVE` and the model read `SM-G977N`, so installs and screenshots
+  run cable-free.
+- **A reboot needs USB once** — the wireless listener does not survive
+  a reboot: reconnect USB and repeat `adb tcpip 5555` before
+  `adb connect`. There is no unattended re-arm path, so a rebooted test
+  phone must be re-attached by hand.
+- **Wireless-debugging pairing is not the automation path** — Android's
+  "Wireless debugging" pairing uses a random port per pairing, which is
+  unsuitable for scripted use; the fixed 5555 listener above is the
+  reproducible route.
+- The tailnet grant `dev-laptop → sm-g977n` admits the development
+  laptop to the device's tailnet address; no USB tunnel and no
+  `adb reverse` is involved in this path.
 
 ## Basic Auth & HTTPS (Northflank / Private Home Server VS-1 fronts)
 
