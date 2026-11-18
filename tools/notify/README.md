@@ -415,7 +415,8 @@ Python register 프로세스 (notify_register.py)
   "service_account_path": "/abs/outside-repo/sa.json",  // 또는 아래
   "token_command": ["gcloud", "auth", "application-default",
                     "print-access-token"],
-  "admission": {"RANK_CHANGED": "digest"}     // 선택: 안B 위 오버라이드
+  "admission": {"RANK_CHANGED": "digest"},    // 선택: 안B 위 오버라이드
+  "disabled_devices": ["wuyoni-sm-s938n"]     // 선택: 발송 제외(정확한 id)
 }
 ```
 
@@ -452,6 +453,20 @@ Python register 프로세스 (notify_register.py)
   적용된다(fail-closed). 창 산술은 `tools/market_time.py` 하나가
   소유한다(P30) — 이 파일도 dispatcher도 09:00 상수를 갖지 않는다.
   음수 나이(미래 관측)는 fail-closed로 창 특권을 받지 못한다.
+
+- **`disabled_devices`(선택)**: 발송만 끄는 **거부 목록**이다. 키가
+  없으면 `[]` — 모든 active 기기가 발송 대상이다(키 부재가 어떤
+  기기도 침묵시킬 수 없다). 있으면 **정확한 device_id 문자열
+  배열**이어야 하고, 각 원소는 레지스트리의 `DEVICE_ID_RE`
+  (`^[A-Za-z0-9_.:-]{1,128}$`) fullmatch를 만족해야 한다. 글롭·정규식
+  패턴(`"wuyoni-*"`)·빈 문자열·비문자열·JSON null은 ConfigError
+  (exit 2)다 — 오타 하나가 다른 기기를 끄지 않도록 정확 일치만
+  허용한다. 제외는 발송 정책일 뿐 토큰 사실이 아니다: 레지스트리에는
+  아무것도 쓰지 않고(`token_invalid` 금지), 기기는 등록 상태로
+  남는다. dispatcher는 **후보 생성 전에** 대상을 걸러 제외 기기의
+  pair·재시도 스케줄·delivery 기록을 만들지 않고, 매 패스
+  `dispatch devices_active=N` 로그로 실제 대상 수를 남긴다.
+  `ops_alert`도 같은 목록을 적용한다.
 
 - **`min_severity`는 제거됐다** — 발송 정책은 §0의 어드미션 게이트로
   옮겨갔다. 설정 파일에 키가 남아 있으면 **무시된다**

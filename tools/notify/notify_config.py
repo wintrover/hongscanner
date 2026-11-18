@@ -85,6 +85,16 @@ PEAK_WINDOW_DEFAULT = {
     "audible": "unlimited_per_group",
 }
 
+# The per-installation send deny-list (README §7): exact device_ids
+# that stay registered in the registry but are never a send target.
+# Absent -> [] (every active device is dispatched): the key has
+# DENY-list polarity, so a missing key can never silence a device.
+# Present -> a strict array of exact ids matching the registry's
+# DEVICE_ID_RE; glob/regex patterns are refused (one typo must not
+# turn a different device off). The registry itself is never written:
+# exclusion is a dispatch policy, not a token fact.
+DISABLED_DEVICES_KEY = "disabled_devices"
+
 
 class ConfigError(Exception):
     """The config is missing, unreadable or non-conforming."""
@@ -210,14 +220,48 @@ def _validate_peak_window(cfg):
     cfg["peak_window"] = peak_window_settings(cfg)
 
 
+def _validate_disabled_devices(cfg):
+    """Validate and normalize the send deny-list (README §7).
+
+    An ABSENT key means every active device is a send target: the key
+    is a deny-list, and its default may never silence a device. A
+    PRESENT key must be an array of exact device_ids matching the
+    registry's DEVICE_ID_RE (fullmatch: no glob/regex patterns, no
+    surrounding whitespace, no trailing newline); anything else is a
+    ConfigError (fail-closed), including an explicit JSON null. The
+    ids are matched EXACTLY against active device ids, so a typo
+    disables nothing instead of disabling the wrong phone."""
+    if DISABLED_DEVICES_KEY not in cfg:
+        cfg[DISABLED_DEVICES_KEY] = []
+        return
+    disabled = cfg[DISABLED_DEVICES_KEY]
+    if not isinstance(disabled, list):
+        raise ConfigError("%s must be an array of exact device_id "
+                          "strings (got %r)"
+                          % (DISABLED_DEVICES_KEY, disabled))
+    # notify_ledger imports this module at import time; importing it
+    # here (call time) keeps the registry's device-id grammar the one
+    # definition without a circular module-level import.
+    import notify_ledger
+    for device_id in disabled:
+        if not isinstance(device_id, str) or \
+           notify_ledger.DEVICE_ID_RE.fullmatch(device_id) is None:
+            raise ConfigError(
+                "%s entries must be exact device_ids matching the "
+                "registry pattern (got %r); glob/regex patterns are "
+                "refused" % (DISABLED_DEVICES_KEY, device_id))
+    cfg[DISABLED_DEVICES_KEY] = list(disabled)
+
+
 def load_config(path, for_command):
     """Load and validate the config JSON for one command. Raises
     ConfigError on any deviation; there are no silent defaults except
-    the documented INT/POSITIVE_INT/FLOAT/ADMISSION/PEAK defaults.
-    Unknown top-level keys (a stale min_severity among them — the key
-    is removed from the contract, README §7) pass through unvalidated:
-    the policy no longer reads them. The admission and peak_window
-    sections are the validated exceptions."""
+    the documented INT/POSITIVE_INT/FLOAT/ADMISSION/PEAK/DISABLED
+    defaults. Unknown top-level keys (a stale min_severity among them
+    — the key is removed from the contract, README §7) pass through
+    unvalidated: the policy no longer reads them. The admission,
+    peak_window and disabled_devices keys are the validated
+    exceptions."""
     if not isinstance(path, str) or not path:
         raise ConfigError("no config path (--config or $HSNOTIFY_CONFIG)")
     try:
@@ -285,4 +329,5 @@ def load_config(path, for_command):
 
     _validate_admission(cfg)
     _validate_peak_window(cfg)
+    _validate_disabled_devices(cfg)
     return cfg
