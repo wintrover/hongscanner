@@ -1221,3 +1221,37 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 **경계**: 이 절은 준비와 계약의 증거다. 11/20 09:00 피크의 게시·소리 수용은 아직 미실시이며, 두 기기의 **실제 소리**는 사람 확인 증거다. S25는 19:40 현재 PIN 잠금으로 음량·ringer 설정을 원격 조작할 수 없다(아래 한계).
 
 **범위 정정 (사용자 지시, 2026-11-19 밤)**: **음량·실제 소리 발생의 기기 간 동등성은 수용 조건이 아니다.** 수용 조건은 (1) 기기별 게시 관측 완전성, (2) 두 기기의 논리 그룹 집합 동일성, (3) 서버가 주장한 집합과의 일치다. 두 기기의 ringer·음량 실측치는 참고 기록으로만 남긴다. 19:58 실측: S10 `ringer=2·Muted=false·9/15`, S25 `ringer=2·Muted=false·8/15`, 두 기기 `market_rank_changes` importance=4·시스템 사운드, 트레이 0건.
+
+### Evidence log (2026-11-19, 밤 2차) — 11/20 수용 준비 확정
+
+**CI·attest 실측** (체크 표시가 아니라 런 로그 마커로 판정)
+
+| 대상 | 명령 | 관측 |
+|---|---|---|
+| PR #139 ci | `gh run view 44511530533 --log \| grep -c "ALL CONTRACT SUITES PASSED"` | `1`, conclusion `success` |
+| PR #140 merge | `gh pr merge 140 --merge` | `7bc461274744a8376c3c98ac9df1bf070e1ce566` |
+| main ci (7bc4612) | `gh run view 44512330480 --log \| grep -c "ALL CONTRACT SUITES PASSED"` | `1`, conclusion `success` |
+| main attest (ad891c9) | `gh run view 44510110774 --log \| grep -E "CI GATE PASS\|ALL CONTRACT"` | `CI GATE PASS` 1 + 마커 `1`, success |
+| main attest (7bc4612) | `gh run view 44512330532 --log \| grep -c "ALL CONTRACT SUITES PASSED"` | `1`, success |
+
+**운영 런타임 고정값 (11/20 08:50 실행 대상)**
+
+| 항목 | 값 |
+|---|---|
+| 서버 HEAD | `66d9ffb90d2233853e59e11f06203cfe73955fb8`, `git status --porcelain` 0줄 |
+| `tools/run_session.sh` sha256 | `e615b3e99cb12b195d98cc85905066940c05cf40b8c44bf3eb6655376840d770` — `git show 66d9ffb:tools/run_session.sh \| sha256sum`과 동일 |
+| 운영 달력 | `~/.local/share/hongscanner/calendars/krx-2026q4.json`: 2026-11-20 `open 09:00+09:00, close 15:30+09:00` |
+| 발송 대상 | `registry.devices()` = 2: `wuyoni-sm-g977n`(토큰 sha256 앞16 `bd9ff33fcba92ade`)·`wuyoni-sm-s938n`(`78b869c8c90b04c0`), `disabled_devices` 없음. `devices()`는 기기별 최신 레코드만 쓰고 `token_invalid`가 해제한다(레지스트리 4,443행이어도 대상은 2) |
+| 관측·사전점검 | 로컬 `hs-preflight-1120.timer` NEXT 08:45, `hongscanner-notify-observe{,-s25}.timer` NEXT 08:58, 창 `08:58–09:45`, 각 유닛은 serial을 명시(S10 `R3CM60B9AQJ`, S25 `192.168.0.16:5555`) |
+| 절전 차단 | `hs-awake-1120.service` active, logind 락 `sleep:idle:handle-lid-switch` block — `systemd-inhibit --list` 실측 |
+| 서버 세션 관측자 | `hongscanner-observe.timer` OnCalendar 08:45·08:55·09..15:00/5, 세션 프로세스 밖에서 실행 |
+
+**이번에 잡은 결함 (실측 → 수정 → 재실측)**
+
+1. `hs-awake-1120.service`가 `--why=2026-11-20 acceptance window`의 공백 때문에 systemd 인자 분리로 `acceptance`를 실행해 즉시 `failed`가 됐다(journal: `systemd-inhibit: acceptance failed with exit status 1`). ExecStart에서 `"--why=2026-11-20 acceptance window"`로 인용한 뒤 재시작 → `active` + inhibitor 락 확인.
+2. 사전점검 타이머가 transient 유닛이라 user manager 재시작(로그아웃·재부팅) 시 조용히 사라졌다 → `hs-preflight-1120.{service,timer}` 영속 유닛(`enabled`, NEXT 08:45)으로 교체. 서비스 직접 실행으로 end-to-end 검증: `{"ok":true}` — 두 기기 `adb_state=device`·`stopped=false`·`tray_hongscanner=0`, 타이머 08:58 2건, `awake_inhibitor=active`.
+3. S10 트레이에서 hongscanner 알림 "37건"처럼 보인 값은 `dumpsys` 내 **언급 횟수**였고, 활성 `NotificationRecord(`는 두 기기 모두 0건이었다(S10 0/2, S25 0/231 전체 레코드 중 hongscanner 0). 트레이 오염 없음.
+
+**계약 테스트**: `bash tests/test_observe_notifications.sh` → `OBSERVE NOTIFICATIONS TESTS PASSED (54 checks)`.
+
+**경계**: `hs-g|<observed_at>|<device_id>` 태그가 기기에 그대로 게시된다는 사실은 **11/20 첫 실측**이다(종전 기기 관측은 태그 기능 도입 전의 `FCM-Notification:<id>`). 태그가 다르면 attest는 `foreign`/`unparsed`로 fail-closed 기록하고, 그 실패가 곧 이 절이 주장하지 않는 사실의 증거다. 11/20의 09:00–09:30 게시·게시 완전성·교차 기기 동일성은 아직 미실시다.
