@@ -1146,3 +1146,41 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 **달력 무결성 사전점검**: `calendars/CALENDAR_INDEX.sha256`만 커밋되고 JSON은 gitignore다. 노트북 사본은 11/19 개장을 09:00으로 적은 오래된 파일이었고, 11/20 값(09:00)은 우연히 같아 판정은 바뀌지 않았지만 입력 해시가 승인 인덱스와 달라 증거 사슬이 끊길 수 있었다. 교체 후 서버·노트북 모두 `db895b09…`다.
 
 **경계**: 11/19 P0는 여전히 **FAILED**다. 11/20 09:00 피크 판정은 아직 없다 — 관측 창과 판정기가 준비됐을 뿐, 수용은 실측 뒤에만 기록한다.
+
+### Evidence log (2026-11-19, 저녁 3) — 수용 관측기의 침묵 실패 제거 (PR [#137](https://github.com/wintrover/hongscanner/pull/137), merge `8144836`)
+
+11/20 08:58 수용 관측이 도구 자신의 결함으로 거짓 실패하거나, 늦게 깨어난 런이 green으로 보일 수 있는 경로 3건을 공식 문서 대조로 확정하고 고쳤다.
+
+**발견**
+
+| 결함 | 근거 |
+|---|---|
+| adb가 멈추면 폴 루프가 영원히 멈춘다 | `adb devices`·`adb shell dumpsys`에 timeout이 없었다. 기록이 끊기면 heartbeat 공백 > 90초 → 장치가 아니라 도구 때문에 `OBSERVATION_INCOMPLETE` |
+| 09:10 resume이 green을 만든다 | systemd.timer: "When a calendar timer elapses while the system is sleeping … once the system is later resumed it will catch up". 09:10은 08:58–09:45 창 안이라 기존 가드를 통과해 `observer_end exit=ok`로 끝났다. `Persistent=false`는 타이머 유닛 비활성 기간만 다룬다 |
+| 유닛이 실패를 숨긴다 | `Type=simple`은 exec 전에 started로 보고된다. `RuntimeMaxSec` 미설정(infinity)이라 멈춘 루프가 무한 running. logind `LidSwitchIgnoreInhibited=yes` 기본값 때문에 `sleep` 락만으로는 덮개 절전을 막지 못한다(`handle-lid-switch` 필요) |
+
+**변경**
+
+- adb 두 호출을 `timeout --kill-after=5 ${ADB_TIMEOUT_SEC:-20}`로 감쌌다. timeout(rc=124)은 기존 adb 실패와 같은 경로로 error 1줄 + 루프 계속. 스키마·append-only/fsync 불변.
+- loop 모드 늦은 시작 가드: `START + START_TOLERANCE_SEC(90초)` 이후 시작은 `exit 2` + `observer started late:` 레코드. `--once` 경로 무영향.
+- 유닛: `Type=exec`, `RuntimeMaxSec=50min`, inhibit `sleep:idle:handle-lid-switch`. 타이머 주석을 `Persistent=false`의 실제 의미로 수정.
+
+**공식 문서 대조 (FCM·Android·systemd)**
+
+- FCM `message.android.notification.tag`는 REST v1의 shade 슬롯 식별자이며 같은 tag는 기존 알림을 교체한다. HTTP 200은 "accepted for delivery"일 뿐 기기 게시가 아니다. 알림 메시지는 항상 collapsible이다.
+- Android의 정체성은 `(tag, id)` 쌍이다. `dumpsys` `NotificationRecord` 헤더에 `id=`가 있으나 관측기는 tag만 기록한다 — 백그라운드 FCM은 id=0이라 tag 단독 조인이 성립한다.
+- 포그라운드 재게시 경로는 `notify(null, id, …)`라 tag를 잃는다(`MainActivity.kt:232,267`). 수용 창 동안 앱은 백그라운드여야 한다.
+- 테스트 픽스처의 `id=6446973662`는 Java int 범위를 넘어 실기기에서 나올 수 없는 값이다(FCM은 id=0). P1에서 실덤프 픽스처로 교체.
+
+**검증**
+
+| 항목 | 관측 |
+|---|---|
+| 로컬 게이트 | `bash tools/run_tests.sh` exit 0, `ALL CONTRACT SUITES PASSED` 1회 |
+| 관측 테스트 | `bash tests/test_observe_notifications.sh` → 54 checks PASSED (timeout 1줄·루프 지속, 늦은 시작 exit 2) |
+| 유닛 | `systemd-analyze verify` exit 0, `RuntimeMaxUSec=50min`, `Type=exec`, timer NEXT 2026-11-20 08:58 유지 |
+| PR CI | 런 [44485366662](https://github.com/wintrover/hongscanner/actions/runs/44485366662) success, 마커 1회 |
+| main CI | 런 [44486088151](https://github.com/wintrover/hongscanner/actions/runs/44486088151) success, 마커 1회 |
+| main attest | 런 [44486088307](https://github.com/wintrover/hongscanner/actions/runs/44486088307) success |
+
+**경계**: 11/20 09:00 피크 수용은 아직 미실시다. 관측기는 이제 늦은 시작을 스스로 거부하고 adb 정지에 멈추지 않지만, 이것은 도구의 준비이지 수용 판정이 아니다. 소리 발생은 사람 확인 증거다.

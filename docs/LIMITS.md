@@ -158,6 +158,24 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
 `OBSERVED_ACTIVE`는 "그 시각에 트레이에 있었다"는 뜻이지 "게시된 모든 순간을
 놓치지 않았다"가 아니다. 소리 발생은 별도의 사람 확인 증거다.
 
+조인과 수용의 경계:
+
+- **포그라운드 재게시는 tag를 잃는다.** 앱이 화면에 떠 있을 때 FCM 메시지는
+  콜백으로 전달되고, Dart가 MethodChannel로 다시 게시하는 경로는
+  `notify(null, id, …)`를 쓴다(`mobile/android/.../MainActivity.kt:232,267`).
+  그래서 수용 창 동안 앱은 백그라운드여야 한다 — 화면 꺼짐/잠금이 그 조건이다.
+  포그라운드 게시는 tag가 없어 어떤 그룹과도 조인되지 않고 `missing`으로 남는다.
+- **FCM HTTP 200은 기기 도달이 아니다.** 문서상 "accepted for delivery"이고,
+  알림 메시지는 항상 collapsible이라 기기가 오프라인인 동안의 미전달분은 더
+  새로운 메시지로 대체될 수 있다. 이것이 관측 결과에 나타나면 `missing`이며,
+  기기 오프라인이 원인이면 그대로 수용 실패다.
+- **관측 기록은 `id`를 남기지 않는다.** Android의 정체성은 `(tag, id)`지만
+  백그라운드 FCM은 id=0으로 게시하므로 tag 단독 조인이 성립한다. 같은 tag의
+  서로 다른 id를 구분해야 하는 경로(포그라운드·다른 게시자)는 이 계약 밖이다.
+- **늦게 시작한 관측은 수용되지 않는다.** 관측기는 창 시작 + 90초 이후 시작을
+  `exit 2`로 거부한다. 절전에서 09:10에 깨어난 런은 09:10–09:45만 표본이므로
+  전 구간 관측의 증거가 될 수 없다.
+
 ## Explicit non-goals
 
 - No order execution, no shorting, no position sizing.
