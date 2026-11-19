@@ -982,3 +982,72 @@ ka10080)는 각각 판정되며 하나의 판정으로 통합하지 않는다(�
 | 소리 | 채널에 소리 URI가 설정되고 DND가 아님을 확인했을 뿐, 실제 스피커 출력은 **증명하지 않는다** |
 
 **판정**: 2026-11-19 오전 피크(10:00~10:30) 운영 수용은 **실패**다. 피크 경계·발송 대상·그룹당 1통은 실측으로 통과했으나, 개장 전 이벤트가 TOP10/FCM에 섞였고(10:05 FAIL), 순위표 유니버스가 8종목으로 동결됐으며, 워커는 문서가 정의한 운영 모드(systemd 감독)가 아니다. 실제 소리 발생·기기 게시·전체 거래일(16:30 종가) 수용은 **주장하지 않는다**(`FCM accepted ≠ delivered ≠ posted ≠ audible`).
+
+### Evidence log (2026-11-19, 오전 2) — 런처 기동 순서·게시 증거 수집기·모바일 조회 안정성 (PR #130·#131)
+
+오전 판정(위 절)에서 "도구가 판정하지 않는 추가 결함"으로 남긴 두 항목 중 재현 가능한 것을 코드로 고쳤다. 계약 변경이 필요한 항목(유니버스 확정 규칙·원장 보존)은 이 PR들에 넣지 않았다.
+
+**PR #130 — merge `f625a87` (러너 순서·관측 도구)**
+
+| 항목 | 내용 |
+|---|---|
+| 결함 | 런처가 워커를 수집기보다 먼저 기동 → 워커 유닛이 런 디렉터리 부재로 시작 실패 → 폴백 + 유닛 `Restart=on-failure` 재시작 루프. `stop_worker()`는 `WORKER_MODE=systemd`일 때만 유닛을 멈춰 폴백 런의 유닛이 남고 `runs_retention.sh`가 그 런을 ACTIVE로 계속 판정 |
+| 수정 | 수집기 먼저 → `wait_for_run_dir`(기본 60s, 0.1s 폴링, `HS_WORKER_RUN_DIR_WAIT_SECONDS`) → 워커. 타임아웃·수집기 사망 시 `WORKER_SKIPPED run_dir_missing`만 남기고 세션 지속. 시작 실패 유닛은 폴백 전에 `stop`+`reset-failed`, `stop_worker()`도 시도했던 유닛이 살아 있으면 `WORKER_UNIT_STOPPED`로 정리 |
+| 이벤트 무손실 근거 | dispatcher watch 루프가 `offset = 0`에서 시작해 첫 tick에 파일의 모든 완성 줄을 catch-up(`tools/notify/notify_dispatcher.py`) |
+| 신규 도구 | `tools/observe_notifications.sh` — 현재 트레이(`Notification List:`)만 파싱, `mArchive`/`Enqueued` 제외, `(tag, when_ms)` 중복 제거, append-only JSON. 실패도 증거 한 줄(`error`)로 남기고 exit 0 |
+| 계약 테스트 | `tests/test_launcher_worker_order.sh` 31, `tests/test_launcher_ops_alert.sh` 39, `tests/test_observe_notifications.sh` 27 — 3종 모두 `tools/run_tests.sh`에 배선. 수정 전 런처에 같은 워커 순서 테스트를 적용하면 21 passed / 10 failed(음성 대조) |
+
+기존 픽스처 2곳(`test_launcher_ops_alert.sh`, `test_retention_contract.sh`)은 가짜 수집기가 런 디렉터리를 만들지 않아 새 순서에서 워커가 skip됐다(게이트 `80 passed, 6 failed`). 실제 수집기처럼 `--out=` 디렉터리를 만들도록 고친 뒤 `86 passed, 0 failed`. 이는 제품 회귀가 아니라 픽스처가 원래 전제하던 "워커가 기동된다"를 복원한 것이다.
+
+**판정 명령과 관측**
+
+```
+$ bash tools/run_tests.sh            # merge된 main f625a87, 로컬 독립 실행
+GATE_EXIT=0 / ALL CONTRACT SUITES PASSED x1
+
+$ gh run view 44446126541 --log | grep -c "ALL CONTRACT SUITES PASSED"
+1                                    # PR head CI, 세 스위트 실행 줄 확인
+
+$ gh run view 44446718041 --log | grep -c "ALL CONTRACT SUITES PASSED"
+1                                    # PR #131 head CI
+```
+
+**실기기 검증(읽기 전용, 출력 /tmp)**
+
+```
+$ bash tools/observe_notifications.sh --once --serial R3CM60B9AQJ --out-dir /tmp/hs-observe-smoke
+EXIT=0, 2줄:
+  market_rank_changes importance=4 when=11:30:56  "포메탈 진입·에스제이그룹 진입 외 6건"
+  market_rank_digest  importance=2 when=11:40:52  "동양2우B 16위→6위 외 13건"
+$ (재실행) → 신규 0줄, 파일 sha256 불변
+sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
+```
+
+증명 범위는 **게시된 NotificationRecord의 존재**까지다. 실제 소리 발생은 증명하지 않는다.
+
+**PR #131 — merge `df530f3` (모바일 조회 안정성)**
+
+| 항목 | 내용 |
+|---|---|
+| 결함 | 30초 폴링마다 `.loading()`으로 교체(스켈레톤 깜빡임), 실패한 폴링이 마지막 성공 투영을 삭제, 지연·데이터 날짜 미표시, `(rank N)`이 벤더 전체 순위를 목록 내 위치로 오독하게 함 |
+| 수정 | `loading`은 최초 시도(`phase == idle`)에만. 로드된 데이터 위 폴링은 같은 `MarketViewResponse` 객체 유지 + `isRefreshing`. 실패는 `refreshErrorMessage`/`refreshOffline`로 보존 데이터 옆에 기록. 배너의 `· N분 지연`·`MM-DD`는 payload의 `mode_as_of`/`data_as_of`만으로 계산(기기 시계 미사용). 라벨 `(전체 N위)` |
+| 검증 | `mobile.yml`: `No issues found`(analyze) → `🎉 105 tests passed`(`refresh_stability_test.dart` 3건 포함) → `MOBILE SUITE PASSED` |
+
+**운영 실측(11:30·11:50 KST, 읽기 전용)**
+
+| 항목 | 관측 |
+|---|---|
+| 워커 재시작 루프 | `hsnotify-session-2026-11-19` `NRestarts` 2738(10:33) → **4281**(11:30) → **4800**(11:50), `activating/auto-restart`. 런처 로그 락 충돌 줄 수 = `NRestarts`(동일 원인) |
+| 폴백 워커 | PID 60309 생존, `delivery.hcj.jsonl` 최신 `11:40:50 ACCEPTED`, 대상 `wuyoni-sm-g977n` 단독 |
+| 수집·서빙 | `events.hcj.jsonl` 11:40:21 갱신, 11:50 API `data_as_of=11:45:24`(≈5분 지연, 기존 그룹 지연과 일치) |
+| 독립 관측자 | `hongscanner-observe.timer`(세션 외부 user timer) 마지막 10:31, 다음 15:45 — 세션 내부 cron이 아님 |
+| 보존 규모 | `runs/` **12G**, `~/.local/share/hongscanner/notify/` **305M**, 디스크 201G 여유(9% 사용) |
+| 보존 집행 이력 | `runs-retention/retention-log.jsonl` **부재** — 아카이브 등급 집행이 한 번도 실행된 적이 없다 |
+| required check | main ruleset required status check = **`ci` 단독**. `mobile.yml`·`attest`는 required가 아니다 |
+
+**이번에 하지 않은 것(정직한 한계)**
+
+- 운영 서버 `git pull`은 **15:40 세션 종료 후**로 미뤘다. `run_session.sh`가 실행 중이고 bash는 스크립트를 바이트 오프셋으로 읽으므로, 실행 중 덮어쓰기는 다음 명령을 깨뜨릴 수 있다. 따라서 `f625a87`/`df530f3`은 **아직 운영에 배포되지 않았다**.
+- `observe_notifications.sh`에 systemd 유닛·타이머를 추가하지 않았다 — 도구만 존재하고 스케줄되지 않는다.
+- 위 재시작 루프는 15:40까지 지속된다. 오늘 세션의 발송은 폴백 워커가 수행했고 유실 증거는 없다.
+- 모바일은 `mobile.yml`(Flutter 3.47.9)로만 검증했다. 로컬 Flutter SDK는 없고, 이 게이트는 required check가 아니다.
