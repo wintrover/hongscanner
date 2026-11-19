@@ -1051,3 +1051,54 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 - `observe_notifications.sh`에 systemd 유닛·타이머를 추가하지 않았다 — 도구만 존재하고 스케줄되지 않는다.
 - 위 재시작 루프는 15:40까지 지속된다. 오늘 세션의 발송은 폴백 워커가 수행했고 유실 증거는 없다.
 - 모바일은 `mobile.yml`(Flutter 3.47.9)로만 검증했다. 로컬 Flutter SDK는 없고, 이 게이트는 required check가 아니다.
+
+### Evidence log (2026-11-19, 오후) — 배포·증거 봉인 (PR [#133](https://github.com/wintrover/hongscanner/pull/133), merge `66d9ffb`)
+
+**코드·CI**
+
+| 항목 | 관측 |
+|---|---|
+| PR CI | 런 [44464293701](https://github.com/wintrover/hongscanner/actions/runs/44464293701) `success`, 로그 `ALL CONTRACT SUITES PASSED` **1회**(3054줄 중 1줄) |
+| merge 후 main CI | 런 [44464947885](https://github.com/wintrover/hongscanner/actions/runs/44464947885) `success`, 마커 **1회** |
+| merge 후 main attest | 런 [44464947634](https://github.com/wintrover/hongscanner/actions/runs/44464947634) attempt 1 **실패** — `actions/attest` 단계 `InternalError: error fetching tlog entry - (404) Not Found`(외부 tlog). 실패 런은 보존, `--failed` 재실행 attempt 2 **success** |
+| 로컬 게이트 | `bash tools/run_tests.sh` → exit **0**, `ALL CONTRACT SUITES PASSED` 1회 |
+| 승인 런처 | `git show 66d9ffb:tools/run_session.sh` sha256 = `e615b3e99cb12b195d98cc85905066940c05cf40b8c44bf3eb6655376840d770` |
+
+**배포 전 확인 (15:41 KST)**
+
+| 항목 | 관측 |
+|---|---|
+| 세션 종료 | `hongscanner-session.service` `ExecMainStatus=4`, 종료 15:40:04. 런처 로그: `COLLECTOR INCOMPLETE: watchdog 15:40:00+09:00 reached without close evidence (FID 215 in {4,8})` → `COLLECTOR_EXIT=4` → `WORKER_BACKGROUND_EXIT=0` → `=== run_session end 2026-11-19T15:40:04+09:00 exit=4` |
+| S1 기록 전용 | 같은 로그에 `OPS_ALERT title=홍스캐너 세션 장애 …` 1줄 + `OPS_ALERT_SUPPRESSED reason=consumer_push_removed` 1줄 — 장애 사실은 내부에 남고 외부 발송 명령은 호출되지 않았다 |
+| 잔여 writer | transient `hsnotify-session-2026-11-19.service` `NRestarts=10935`, PID 96019가 세션 종료 후 15:40:05–15:41:30 `dispatch devices_active=1` 지속 → 15:43 `stop` 후 `notify_dispatcher`·collector 프로세스 **0** |
+
+**증거 봉인 (writer 중지 후, 원본 불변)**
+
+| 파일 | sha256 |
+|---|---|
+| `runs/session-2026-11-19/input.hcj.jsonl` | `c4cd1646532041c7e77099b56c68a691d77bba1174f0a1030eeb3919f4259efd` |
+| `runs/session-2026-11-19/events.hcj.jsonl` | `086b0467d929e3328a2f28ef1d7de3543d533f55d07ed9041ae82f0a9ccaddd3` |
+| `~/.local/share/hongscanner/notify/delivery.hcj.jsonl` | `a5b1e52d1df01ab25efb1dca64de82f9441fd69d105b8d484c9c8d9a6b45bb6d` |
+| `runs/session-2026-11-19.launcher.log` | `7f5c18c803e9d972c9dc98eba0ca64f35c681a1b8facdf770d3adb2367e54448` |
+| `runs/session-2026-11-19.accept.txt` | `4ed1c4906258bfc0914d10c10f2b8ccbc6f7da20ea614f012c31b6190cde20dc` |
+| `~/.local/share/hongscanner/tools/accept_1119.py` | `190ceb89e33a3cad45e94fda801bcd0f158c6df7d30b0bc34f94ddc1a8fe7505` |
+
+`accept_1119.py --date 2026-11-19` 재실행 → `33 checks, 2 failed, 0 unproven` / `P0 acceptance FAILED` / exit 1 — 오전 판정이 같은 입력에서 재현됐다.
+
+**배포**
+
+| 항목 | 관측 |
+|---|---|
+| 서버 HEAD | `b164ce0a88…` → **`66d9ffb90d2233853e59e11f06203cfe73955fb8`** (`git pull --ff-only`) |
+| 작업 트리 | pull 전후 `git status --porcelain` **0줄** — 11/20 `RUN_PROVENANCE git_dirty=0`의 전제 |
+| 관측 유닛 | 체크아웃의 `tools/systemd/hongscanner-observe.{service,timer}`를 `~/.config/systemd/user/`에 설치 → `daemon-reload` → `restart`. 설치본 OnCalendar = `08:45`, `08:55`, `09..15:00/5` |
+| 새 스케줄 실측 | 15:42:36(타이머 재시작이 유발한 off-grid 실행)은 ±3분 허용으로 `checkpoint=15:45`로 기록됐고, 15:45:00 정규 체크포인트는 `calendar_open=10:00:00+09:00`, `devices_active=1`, `top10_observed_max=15:35:20`로 기록됐다. 타이머 NEXT 15:50 |
+| 세션 타이머 | NEXT **2026-11-20 08:50:00 KST** |
+
+**서버 스위트(배포된 11/20 실행 코드)**
+
+`test_launcher_worker_order.sh` 91 passed · `test_launcher_ops_alert.sh` 39 passed · `test_retention_contract.sh` 86 passed · `test_observe_notifications.sh` 41 checks PASSED · `tools/notify/test_notify.sh`는 시스템 Python 3.12에서 3.13 부재로 rc=1 → `HSCOLLECTOR_PYTHON=tools/collector/.venv/bin/python`(3.13.18)로 rc=0.
+
+**직전 절의 미완 항목 해소**: "이번에 하지 않은 것"의 1(배포 미룸)·2(관측 유닛 미스케줄)·3(15:40까지 재시작 루프)은 이 배포로 해소됐다.
+
+**경계**: 11/19의 P0 판정은 여전히 **FAILED**다 — 오전 피크는 미수용이고, 15:40 watchdog 종료로 전체 거래일(16:30 폐장)의 관측·봉인은 없다. 11/20 09:00 피크의 수용은 `tools/attest_notifications.py` 결과로 별도 기록한다.
