@@ -25,12 +25,13 @@
 ##
 ## WINDOW COVERAGE: with --window START/END the observer has to prove that the
 ## whole acceptance window was sampled, not merely that some notifications were
-## seen. It refuses to start outside the window (exit 2, one error line), emits
-## a heartbeat for every 60 s of loop time, and closes with one observer_end
-## when it reaches END. A laptop that wakes at 09:10 therefore cannot produce a
-## clean-looking 09:10-09:45 run: the missing heartbeats and observer_end make
-## the gap visible. Heartbeats and observer_end are coverage metadata, never
-## notification evidence.
+## seen. It refuses to start outside the window, or later than
+## START + START_TOLERANCE_SEC (default 90 s), with exit 2 and one error line:
+## a laptop that wakes at 09:10 has already missed the open, so it must not
+## record a clean-looking 09:10-09:45 run. It emits a heartbeat for every 60 s
+## of loop time and closes with one observer_end when it reaches END.
+## Heartbeats and observer_end are coverage metadata, never notification
+## evidence.
 ##
 ## FAILURE POLICY: adb absence, a missing device or an unrecognized dump
 ## records one line with an `error` field and the script still exits 0 — an
@@ -47,6 +48,13 @@ OUT_DIR="${HOME}/.local/share/hongscanner/observe"
 INTERVAL=0
 SERIAL=""
 ADB="${ADB:-adb}"
+# A hung adb (USB glitch, stuck server) must not stall the loop past the
+# contract's 90 s heartbeat gap, so every adb call is bounded.
+ADB_TIMEOUT_SEC="${ADB_TIMEOUT_SEC:-20}"
+# How late after the window start a loop-mode observer may still claim the
+# whole window. A suspended laptop that wakes at 09:10 has already missed the
+# open, so its run must be refused, not recorded as a green 09:10-09:45 sample.
+START_TOLERANCE_SEC="${START_TOLERANCE_SEC:-90}"
 WINDOW=""
 PACKAGE="com.hongscanner.hongscanner"
 
@@ -187,9 +195,10 @@ mkdir -p "$OUT_DIR" 2>/dev/null || true
 
 # Resolve the serial once so every evidence line names the device. Without
 # --serial, `adb devices` is the only read-only probe; if it yields nothing
-# the dumpsys call below fails and that failure is recorded honestly.
+# (including a timeout) the dumpsys call below runs without -s and its
+# failure is recorded honestly.
 if [ -z "$SERIAL" ]; then
-  DEVICES_OUT="$("$ADB" devices 2>/dev/null)" || DEVICES_OUT=""
+  DEVICES_OUT="$(timeout --kill-after=5 "$ADB_TIMEOUT_SEC" "$ADB" devices 2>/dev/null)" || DEVICES_OUT=""
   SERIAL="$(printf '%s\n' "$DEVICES_OUT" |
     awk 'NR > 1 && $2 == "device" { print $1; exit }')"
 fi
@@ -207,15 +216,18 @@ capture_once() {
   fi
 
   if [ -n "$SERIAL" ]; then
-    "$ADB" -s "$SERIAL" shell dumpsys notification --noredact \
+    timeout --kill-after=5 "$ADB_TIMEOUT_SEC" \
+      "$ADB" -s "$SERIAL" shell dumpsys notification --noredact \
       > "$DUMP_FILE" 2> "$ERR_FILE"
   else
-    "$ADB" shell dumpsys notification --noredact \
+    timeout --kill-after=5 "$ADB_TIMEOUT_SEC" \
+      "$ADB" shell dumpsys notification --noredact \
       > "$DUMP_FILE" 2> "$ERR_FILE"
   fi
   ADB_RC=$?
 
   python3 - "$OUT_FILE" "$NOW_ISO" "$NOW_KST" "$SERIAL" "$ADB_RC" \
+    "$ADB_TIMEOUT_SEC" \
     "$DUMP_FILE" "$ERR_FILE" "$OBSERVER_GIT_COMMIT" "$OBSERVER_SHA256" <<'PY'
 import datetime as dt
 import json
@@ -226,8 +238,8 @@ import sys
 PACKAGE = "com.hongscanner.hongscanner"
 KST = dt.timezone(dt.timedelta(hours=9))
 
-(out_file, at, kst, serial, adb_rc, dump_path, err_path,
- git_commit, script_sha256) = sys.argv[1:10]
+(out_file, at, kst, serial, adb_rc, adb_timeout_sec, dump_path, err_path,
+ git_commit, script_sha256) = sys.argv[1:11]
 adb_rc = int(adb_rc)
 
 
@@ -264,6 +276,11 @@ def error_line(message):
         "package": PACKAGE,
     })
 
+
+if adb_rc == 124:
+    error_line("adb shell dumpsys notification timed out after %ss"
+               % adb_timeout_sec)
+    sys.exit(0)
 
 if adb_rc != 0:
     with open(err_path, "r", encoding="utf-8", errors="replace") as handle:
@@ -462,6 +479,11 @@ NOW_ISO="$(date +%Y-%m-%dT%H:%M:%S%:z)"
 NOW_KST="$(date '+%Y-%m-%d %H:%M:%S KST')"
 if [ "$NOW_EPOCH" -lt "$START_EPOCH" ] || [ "$NOW_EPOCH" -gt "$END_EPOCH" ]; then
   WINDOW_ERROR="observer started outside window: ${NOW_ISO}"
+  append_line "{\"captured_at\":\"${NOW_ISO}\",\"device_serial\":$(json_string_or_null "$SERIAL"),\"error\":\"${WINDOW_ERROR}\",\"errors\":{\"window\":\"${WINDOW_ERROR}\"},\"kst\":\"${NOW_KST}\",\"observer_git_commit\":\"${OBSERVER_GIT_COMMIT}\",\"observer_sha256\":\"${OBSERVER_SHA256}\",\"package\":\"${PACKAGE}\"}"
+  exit 2
+fi
+if [ "$NOW_EPOCH" -gt $((START_EPOCH + START_TOLERANCE_SEC)) ]; then
+  WINDOW_ERROR="observer started late: ${NOW_ISO} (start tolerance ${START_TOLERANCE_SEC}s from ${WINDOW_START})"
   append_line "{\"captured_at\":\"${NOW_ISO}\",\"device_serial\":$(json_string_or_null "$SERIAL"),\"error\":\"${WINDOW_ERROR}\",\"errors\":{\"window\":\"${WINDOW_ERROR}\"},\"kst\":\"${NOW_KST}\",\"observer_git_commit\":\"${OBSERVER_GIT_COMMIT}\",\"observer_sha256\":\"${OBSERVER_SHA256}\",\"package\":\"${PACKAGE}\"}"
   exit 2
 fi

@@ -1,6 +1,7 @@
 ## 2026-11-20 승인 창 시작(08:58)에 관측자를 한 번 띄운다.
-## Persistent=false: 놓친 시작을 소급 실행하지 않는다. 뒤늦게 뜬 관측자는
-## 창 밖 시작으로 거부되므로 창 중간부터의 green이 생길 수 없다.
+## Persistent=false: 유저 매니저가 비활성인 동안의 시작을 소급 실행하지 않는다.
+## 절전 중 도달한 캘린더 타이머는 resume 후 발화하므로, 늦게 뜬 관측자를 막는
+## 것은 Persistent가 아니라 관측기의 시작 가드(창 시작 + 90초)다.
 [Unit]
 Description=Hong Scanner Notification Observer Timer (one-day acceptance window 2026-11-20)
 
