@@ -130,6 +130,34 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
   이유를 적는다. 08:45에는 당일 런 디렉터리가 아직 없으므로 `run_dir`과
   `calendar_open`은 정직한 null이다.
 
+## Post attestation (`tools/attest_notifications.py`)
+
+서버가 "보냈다"고 기록한 알림과 S10 트레이에서 관측된 알림을 같은 tag
+(`hs-g|<observed_at>|<device_id>`)로 조인한다. 판정 축은 서로 다른 네 가지다.
+
+- `expected` — 피크(`[open, open+30m)`) 이벤트이면서 **관측 창 안에서** 발송된
+  가청(`single`/`summary`) 그룹. coverage의 분모이며 전부 관측되어야 한다.
+- `accounted` — 세션 원장이 주장하는 모든 가청 그룹. 기기에만 보이는 tag를
+  가려내는 기준이다. 피크 밖 그룹이 여기 속하는 것은 실패가 아니다.
+  `unaccounted = observed − accounted`만 `COVERAGE_INCOMPLETE`다.
+- `late` — 피크 그룹인데 ACCEPTED 발송이 관측 창 밖인 tag. 관측자가 증명할
+  수 없는 구간이므로 분모에서 조용히 빼지 않고 실패로 남긴다.
+- `undelivered` — 피크 그룹인데 ACCEPTED 발송이 하나도 없는 tag(FCM 실패·미완료).
+  이 집합이 없으면 실패한 그룹이 분모에서 빠져 0/0 통과가 된다.
+- `preopen_delivered` — 개장 전 관측 이벤트가 피크 중에 발송된 증거.
+  `PREOPEN_CONTAMINATION`이다.
+
+관측 창 종료는 피크 종료가 아니라 전달 지연의 실측 상한을 덮는다. 2026-11-19
+피크 이벤트 114건의 관측→전달 지연은 최소 5.6 / 중앙 5.7 / 최대 5.8분이었고,
+09:29:59 이벤트는 09:35:45에 도착했다. 그래서 2026-11-20 창은 `08:58~09:45`다.
+
+피크 그룹이 0건이면 `vacuous: true` + `coverage: null`로 수용한다 — 시장이
+그룹을 만들지 않은 날 소리가 0번 나는 것은 정상이다. 다만 조용한 통과를
+숨기지 않도록 리포트에 남긴다.
+
+`OBSERVED_ACTIVE`는 "그 시각에 트레이에 있었다"는 뜻이지 "게시된 모든 순간을
+놓치지 않았다"가 아니다. 소리 발생은 별도의 사람 확인 증거다.
+
 ## Explicit non-goals
 
 - No order execution, no shorting, no position sizing.
