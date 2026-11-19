@@ -334,11 +334,14 @@ still requires G2 credentials.
   once after 1 s, then reports the final response). Re-measured 2026-11-19
   with `tools/collector/pace_probe.py` (demo): 0.2 s → 5/10 429, 0.5 s →
   3/10, 1.0 s → 1/10, **1.5 s → 0/12**, 2.0 s → 0/12; a mixed
-  ka10027/ka10081 loop at 1.0 s saw 0/12 — whether an account-global limit
-  exists remains UNKNOWN. At the operational 1.5 s pacing a full
-  ~2,500-symbol sweep takes ≈ 62.5 min; at 1 TR/s it is ≈ 41.7 min. The
-  official portal's ka10081 rate figure (reported as 초당 5회) is NOT
-  reproduced by the mock and is UNVERIFIED for the real domain.
+  ka10027/ka10081 loop at 1.0 s saw 0/12 — whether the undocumented
+  group/total caps (error codes 1701/1702) exist remains UNKNOWN. At the
+  operational 1.5 s pacing a full ~2,500-symbol sweep takes ≈ 62.5 min; at
+  1 TR/s it is ≈ 41.7 min. The official policy (portal `/intro`, notice
+  #49) is per account(token) per TR: real 조회 TR = 초당 5회, mock =
+  TR 1개당 1초 1회. The mock measurement therefore matches the documented
+  **mock** policy; the real 5/s figure is documented but UNMEASURED here
+  (no real credentials), so no real-domain pacing change is licensed.
   Production-environment behavior: UNVERIFIED (G2/G4).
 - FCM / Android notification behavior (official Firebase + FlutterFire
   docs and plugin source, collected 2026-11-11 — the basis of the market
