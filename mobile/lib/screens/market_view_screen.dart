@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../api/api_models.dart';
+import '../state/app_store.dart';
 import 'app_scope.dart';
 import 'widgets.dart';
 
@@ -24,8 +25,16 @@ class MarketViewScreen extends StatelessWidget {
             sectionBody<MarketViewResponse>(
               context,
               store.marketView,
-              loaded: (context, marketView) =>
-                  _Top10sBody(marketView: marketView),
+              loaded: (context, marketView) => Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _refreshFailureCard(store),
+                  _Top10sBody(
+                    marketView: marketView,
+                    refreshing: store.isRefreshing,
+                  ),
+                ],
+              ),
               onRetry: store.resync,
             ),
           ],
@@ -54,8 +63,13 @@ class HistoryScreen extends StatelessWidget {
             sectionBody<MarketViewResponse>(
               context,
               store.marketView,
-              loaded: (context, marketView) =>
+              loaded: (context, marketView) => Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _refreshFailureCard(store),
                   _HistoryBody(marketView: marketView),
+                ],
+              ),
               onRetry: store.resync,
             ),
           ],
@@ -65,10 +79,82 @@ class HistoryScreen extends StatelessWidget {
   }
 }
 
+/// A refresh failure shown beside retained content: the same offline/error
+/// card the initial-load failure uses, with the last-projection note in
+/// its message. Returns nothing while the last refresh succeeded.
+Widget _refreshFailureCard(AppStore store) {
+  final message = store.refreshErrorMessage;
+  if (message == null) return const SizedBox.shrink();
+  return SectionErrorCard(
+    message: '마지막 데이터를 표시 중 · $message',
+    offline: store.refreshOffline,
+    onRetry: store.resync,
+  );
+}
+
+/// `HH:MM:SS` from a full, parseable ISO 8601 payload timestamp; '—' when
+/// the timestamp is missing or unparseable. Never a substring guess.
+String _clockLabel(String? isoTimestamp) {
+  if (isoTimestamp == null || isoTimestamp.length < 19) return '—';
+  if (DateTime.tryParse(isoTimestamp) == null) return '—';
+  return isoTimestamp.substring(11, 19);
+}
+
+/// `data_as_of` banner clock: `HH:MM:SS`, prefixed with `MM-DD ` when the
+/// payload's data timestamp falls on a different date than its decision
+/// timestamp (a stale previous-session projection must not read as today's
+/// data). Only the two payload timestamps are compared — never the device
+/// clock. A missing or unparseable timestamp yields '—' / no date prefix
+/// rather than a guess.
+String _dataClockLabel(String? modeAsOf, String? dataAsOf) {
+  final clock = _clockLabel(dataAsOf);
+  if (clock == '—') return '—';
+  final dataDate = _isoDate(dataAsOf);
+  final modeDate = _isoDate(modeAsOf);
+  if (dataDate == null || modeDate == null || dataDate == modeDate) {
+    return clock;
+  }
+  return '${dataDate.substring(5)} $clock';
+}
+
+/// The `YYYY-MM-DD` text of a parseable full ISO 8601 payload timestamp.
+/// Kept as text so the recorded calendar date is compared without
+/// converting through the device timezone.
+String? _isoDate(String? timestamp) {
+  if (timestamp == null || timestamp.length < 19) return null;
+  if (DateTime.tryParse(timestamp) == null) return null;
+  return timestamp.substring(0, 10);
+}
+
+/// Lateness suffix from the payload's own two timestamps: ` · N분 지연`
+/// when the data timestamp trails the decision timestamp by 60s or more
+/// (truncating toward whole minutes — `1038s` reads `17분`). The instants
+/// are parsed with their recorded UTC offsets, so the comparison is
+/// offset-independent. Anything missing or unparseable yields '' — no
+/// guess.
+String _delaySuffix(String? modeAsOf, String? dataAsOf) {
+  if (modeAsOf == null || modeAsOf.length < 19 ||
+      dataAsOf == null || dataAsOf.length < 19) {
+    return '';
+  }
+  final modeAt = DateTime.tryParse(modeAsOf);
+  final dataAt = DateTime.tryParse(dataAsOf);
+  if (modeAt == null || dataAt == null) return '';
+  final lag = modeAt.difference(dataAt);
+  if (lag.inSeconds < 60) return '';
+  return ' · ${lag.inMinutes}분 지연';
+}
+
 class _Top10sBody extends StatelessWidget {
-  const _Top10sBody({required this.marketView});
+  const _Top10sBody({
+    required this.marketView,
+    required this.refreshing,
+  });
 
   final MarketViewResponse marketView;
+
+  /// True while a poll is refreshing this already-visible projection.
+  final bool refreshing;
 
   @override
   Widget build(BuildContext context) {
@@ -83,17 +169,16 @@ class _Top10sBody extends StatelessWidget {
     final coverage = marketView.coverage;
     // The mode banner names what the server projected and when it decided
     // it (mode_as_of) — and, separately, the last recorded observation
-    // the rows were built from (data_as_of). No clock-derived mode guess
-    // happens in the app — a missing timestamp shows '—', never a
-    // fabricated one.
+    // the rows were built from (data_as_of). The delay/date annotation is
+    // derived only from those two payload timestamps (never the device
+    // clock); a missing or unparseable timestamp shows '—' or nothing,
+    // never a fabricated one.
     final modeAsOf = marketView.modeAsOf;
-    final modeClock = modeAsOf != null && modeAsOf.length >= 19
-        ? modeAsOf.substring(11, 19)
-        : '—';
+    final modeClock = _clockLabel(modeAsOf);
     final dataAsOf = marketView.dataAsOf;
-    final dataClock = dataAsOf != null && dataAsOf.length >= 19
-        ? dataAsOf.substring(11, 19)
-        : '—';
+    final dataClock = _dataClockLabel(modeAsOf, dataAsOf);
+    final delaySuffix = _delaySuffix(modeAsOf, dataAsOf);
+    final refreshSuffix = refreshing ? ' · 갱신 중' : '';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -110,7 +195,7 @@ class _Top10sBody extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  '판정 $modeClock · 데이터 $dataClock',
+                  '판정 $modeClock · 데이터 $dataClock$delaySuffix$refreshSuffix',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],
@@ -276,7 +361,9 @@ class _Top10List extends StatelessWidget {
               direction == 'UP' ? Icons.trending_up : Icons.trending_down,
               color: direction == 'UP' ? Colors.red : Colors.blue,
             ),
-            title: Text('${_itemTitle(item)} (rank ${item.rank ?? '—'})'),
+            // The vendor's full-market rank, not the row's position in
+            // this MA20 projection — the label says so.
+            title: Text('${_itemTitle(item)} (전체 ${item.rank ?? '—'}위)'),
             subtitle: Text(_qualityAwareSubtitle(item)),
             trailing: _top10Trailing(context, item),
             onTap: item.eventId == null

@@ -172,6 +172,25 @@ class AppStore extends ChangeNotifier {
 
   Section<MarketViewResponse> marketView = const Section();
 
+  /// True while a sync pass is refreshing an already-loaded projection.
+  /// The loaded [marketView] stays visible throughout: the UI shows a
+  /// refresh hint instead of replacing the list with the initial-load
+  /// skeleton.
+  bool get isRefreshing => _syncing && marketView.phase == LoadPhase.loaded;
+
+  /// The last refresh failure that kept an already-loaded projection on
+  /// screen; null once an attempt succeeds. Kept outside [marketView] so
+  /// a failed poll never replaces visible data with an error section.
+  String? _refreshErrorMessage;
+
+  /// True when [_refreshErrorMessage] came from a connectivity problem —
+  /// the UI's offline badge.
+  bool _refreshOffline = false;
+
+  String? get refreshErrorMessage => _refreshErrorMessage;
+
+  bool get refreshOffline => _refreshOffline;
+
   String? selectedEventId;
   Section<EventDetailResponse> eventDetail = const Section();
 
@@ -586,17 +605,34 @@ class AppStore extends ChangeNotifier {
 
   /// One pass: the single `/mobile/market-view` projection fetch. Returns
   /// true when nothing failed.
+  ///
+  /// A refresh over already-loaded content keeps that content visible:
+  /// the skeleton is only the very first attempt (`idle`), never a poll
+  /// and never a retry that already has an answer or an error to show.
+  /// A failed refresh records its reason beside the last successful
+  /// projection instead of erasing it.
   Future<bool> _fetchOnce() async {
-    marketView = const Section<MarketViewResponse>.loading();
+    final keepsLoadedData =
+        marketView.phase == LoadPhase.loaded && marketView.value != null;
+    if (marketView.phase == LoadPhase.idle) {
+      marketView = const Section<MarketViewResponse>.loading();
+    }
     try {
       marketView = Section.loaded(await _api.fetchMarketView());
+      _refreshErrorMessage = null;
+      _refreshOffline = false;
     } on ApiClientException catch (e) {
       if (e.statusCode == 401) _sawUnauthorized = true;
       if (e.statusCode == 503 && e.serverCode == 'warming') {
         _sawWarming = true;
       }
-      marketView =
-          Section.error(_describe(e), offline: e.isConnectivityProblem);
+      if (keepsLoadedData) {
+        _refreshErrorMessage = _describe(e);
+        _refreshOffline = e.isConnectivityProblem;
+      } else {
+        marketView =
+            Section.error(_describe(e), offline: e.isConnectivityProblem);
+      }
       notifyListeners();
       return false;
     }

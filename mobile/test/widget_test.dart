@@ -28,11 +28,12 @@ void main() {
 
       // 후보 is the initial tab: the two top-10 cards from the single
       // /mobile/market-view projection — server-ranked rows, ascending
-      // rank, the recorded stock name as the title (rank in the existing
-      // '(rank N)' style).
-      expect(find.text('삼성전자 (rank 1)'), findsOneWidget);
-      expect(find.text('삼성전자 (rank 2)'), findsOneWidget);
-      expect(find.text('SK하이닉스 (rank 1)'), findsOneWidget);
+      // rank, the recorded stock name as the title. The label names the
+      // rank's source (the vendor's full-market rank), never this
+      // projection's list position.
+      expect(find.text('삼성전자 (전체 1위)'), findsOneWidget);
+      expect(find.text('삼성전자 (전체 2위)'), findsOneWidget);
+      expect(find.text('SK하이닉스 (전체 1위)'), findsOneWidget);
       // Normal-quality rows (the OK/COMPLETE/OBSERVING set) show no
       // quality suffix…
       expect(find.textContaining('· OBSERVING'), findsNothing);
@@ -61,7 +62,7 @@ void main() {
       // on CANDIDATE_EXITED — honest absence, never a fake 0.
       expect(find.text('CANDIDATE_EXITED · 000660 · DOWN'), findsOneWidget);
       expect(find.textContaining('#0'), findsNothing);
-      expect(find.textContaining('(rank 0'), findsNothing);
+      expect(find.textContaining('(전체 0위'), findsNothing);
       // Conditional quality: INCOMPLETE stays explicit per item, never
       // flattened to normal.
       expect(find.text('2026-11-02T09:03:30+09:00 · INCOMPLETE'),
@@ -70,7 +71,7 @@ void main() {
       // Tab switches read the single store — no refetch.
       await tester.tap(find.text('후보'));
       await tester.pumpAndSettle();
-      expect(find.text('삼성전자 (rank 1)'), findsOneWidget);
+      expect(find.text('삼성전자 (전체 1위)'), findsOneWidget);
       expect(store.syncCount, 1);
     },
   );
@@ -165,7 +166,7 @@ void main() {
     // UNKNOWN is abnormal: the explicit quality suffix stays, and a
     // missing name record falls back to the symbol.
     expect(find.text('2026-11-02T09:02:41+09:00 · UNKNOWN'), findsOneWidget);
-    expect(find.text('000660 (rank 2)'), findsOneWidget);
+    expect(find.text('000660 (전체 2위)'), findsOneWidget);
   });
 
   testWidgets(
@@ -183,9 +184,9 @@ void main() {
       // server's, unchanged by the mode.
       expect(find.text('상승 TOP 10 (MA20 위)'), findsOneWidget);
       expect(find.text('하락 TOP 10 (MA20 아래)'), findsOneWidget);
-      expect(find.text('삼성전자 (rank 1)'), findsOneWidget);
-      expect(find.text('삼성전자 (rank 2)'), findsOneWidget);
-      expect(find.text('SK하이닉스 (rank 1)'), findsOneWidget);
+      expect(find.text('삼성전자 (전체 1위)'), findsOneWidget);
+      expect(find.text('삼성전자 (전체 2위)'), findsOneWidget);
+      expect(find.text('SK하이닉스 (전체 1위)'), findsOneWidget);
 
       // The projection's tag rides as a badge: ABOVE → 'MA20 위',
       // BELOW → 'MA20 아래' — verbatim, never derived in the app.
@@ -196,7 +197,7 @@ void main() {
       // A null ma20_tag (an out-of-window row) renders no badge: the
       // rank-2 row's trailing is the bare chevron, not a badge row.
       final rank2Tile = tester.widget<ListTile>(
-          find.widgetWithText(ListTile, '삼성전자 (rank 2)'));
+          find.widgetWithText(ListTile, '삼성전자 (전체 2위)'));
       expect(rank2Tile.trailing, isA<Icon>());
 
       // The mode reaches only the top-10 lists: the history tab shows
@@ -235,7 +236,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('변화 기록 없음'), findsOneWidget);
     // Nothing recorded, so no ranked rows anywhere.
-    expect(find.text('삼성전자 (rank 1)'), findsNothing);
+    expect(find.text('삼성전자 (전체 1위)'), findsNothing);
     expect(find.text('TOP10_ENTERED · 삼성전자 · UP #11→7'), findsNothing);
     expect(find.textContaining('#0'), findsNothing);
   });
@@ -254,5 +255,49 @@ void main() {
     expect(find.text('다시 시도'), findsWidgets);
     expect(find.textContaining('기록을 읽는 중'), findsNothing,
         reason: 'offline is an error state, not an eternal spinner');
+  });
+
+  testWidgets('banner derives staleness and the data date from the payload',
+      (WidgetTester tester) async {
+    final store = makeStore(transport: fixtureTransport(extra: {
+      '/mobile/market-view': okJson({
+        ...fixtureMarketView,
+        'mode_as_of': '2026-11-19T09:05:00+09:00',
+        'data_as_of': '2026-11-18T15:30:00+09:00',
+      }),
+    }));
+    await store.bootstrap();
+    await pumpTallApp(tester, store);
+
+    // 17h35m behind the decision clock, and the recorded data is from the
+    // previous calendar day: the banner must say both, from the payload's
+    // two timestamps only.
+    expect(
+        find.text('판정 09:05:00 · 데이터 11-18 15:30:00 · 1055분 지연'),
+        findsOneWidget);
+  });
+
+  testWidgets('a failed poll keeps the rows and shows the retained-data badge',
+      (WidgetTester tester) async {
+    var down = false;
+    final healthy = fixtureTransport();
+    final store = makeStore(transport: FakeTransport((uri) async {
+      if (down) throw Exception('connection refused');
+      return healthy.get(uri);
+    }));
+    await store.bootstrap();
+    await pumpTallApp(tester, store);
+    expect(find.text('삼성전자 (전체 1위)'), findsOneWidget);
+
+    down = true;
+    await store.resync();
+    await tester.pump();
+
+    // The last successful projection stays on screen; the failure rides
+    // beside it as the existing offline card, not as a blank list.
+    expect(find.text('삼성전자 (전체 1위)'), findsOneWidget);
+    expect(find.text('오프라인'), findsWidgets);
+    expect(find.textContaining('마지막 데이터를 표시 중'), findsWidgets);
+    expect(find.textContaining('기록을 읽는 중'), findsNothing);
   });
 }
