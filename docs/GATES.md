@@ -1279,3 +1279,21 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 (b) 2,400종목 스윕은 mock에서 **≈60분**이며 30분 창 안 완료를 주장하지 않는다. (c) 실전
 5/s는 문서값일 뿐 이 환경에서 **미측정**이므로 real 도메인 pacing을 낮추는 근거가 될 수 없다.
 증거 파일: `tools/collector/pace_probe.py` (커밋 대상), 원 출력은 위 표.
+### Evidence log (2026-11-19 야간) — MA20 이력 준비 슬라이스 merge·production 배포
+
+**범위**: 첫 후보 페어 동결 제거(accumulate-v2), coverage 6버킷, `input_snapshot`, 1MiB config 헤드. PR [#142](https://github.com/wintrover/hongscanner/pull/142) merge `03f1950c`.
+
+| gate | observed |
+|---|---|
+| P3(03f1950c) | 로컬 `bash tools/run_tests.sh` exit 0 + `ALL CONTRACT SUITES PASSED` 1회. PR #142: ci 런 [44540957969](https://github.com/wintrover/hongscanner/actions/runs/44540957969) success — `gh run view --log \| grep -c "ALL CONTRACT SUITES PASSED"` = **1**(로그 실측), job `ci: success`. merge commit `03f1950cb16126cea62445d171afbbd4050fcc0d` |
+| P13(03f1950c) | attest 런 [44541975780](https://github.com/wintrover/hongscanner/actions/runs/44541975780) success. 아티팩트 sha256: hongscanner `dc6559c6aa6abf5d0ff17dd9f8db5ff817250e10a9603b56e7050c4b7049265c`, collector `d96d692851f9a1a685d468a39a3f83864c126593e8c43b0926de6766bd4608b2`(`sha256sum -c` OK). `gh attestation verify` 두 바이너리 각각 exit 0(`--repo wintrover/hongscanner --signer-workflow …/attest.yml --source-ref refs/heads/main --source-digest 03f1950c… --deny-self-hosted-runners`). 서버에서 `GH_TOKEN`(ssh stdin 일시 주입, argv·파일 비기록)으로 `tools/install-attested.sh` → `INSTALL VERIFY OK … source_digest=03f1950cb16126cea62445d171afbbd4050fcc0d runner=github-hosted-only` → `INSTALL OK version=03f1950`, `sha256sum -c SHA256` OK, `current→versions/03f1950` |
+| 서버 체크아웃 | `66d9ffb → 03f1950c` `git merge --ff-only origin/main`, dirty 0 |
+| 래퍼 게이트 | 신규 `runs/smoke-2026-11-19-03f1950`: `replay` → `REPLAY OK bars=22 signals=4 events=1 frames=24`, `verify` → `VERDICT MATCH provenance=OK` + `COMMIT=ABSENT` + `EVENTS=6a51940f…` exit 0. `~/.local/bin/hongscanner-serve-start.sh` `SMOKE_RUN` 1줄 교체(백업 `.bak-20261119`, 나머지 diff 0) |
+| production 재시작 | `systemctl --user restart hongscanner-serve.service` → 게이트 `VERDICT MATCH provenance=OK`, `SERVE_PROVENANCE provenance=OK git=03f1950cb16126cea62445d171afbbd4050fcc0d branch=main blob=4a727897… disk_blob=4a727897… sha256=894fab2e…`, `readiness.state=READY`, `active`·`NRestarts=0` |
+| 세션 런처 | `~/.local/bin/hongscanner-session-start.sh`에 `--daily-scope=accumulate-v2` 1줄 추가(백업 `.bak-20261119`; pre sha256 `6858979b…`, post `0ef19c29…`, `bash -n` OK). `tools/run_session.sh:437`이 `"$COLLECTOR" "$@"`로 인자를 그대로 전달함을 확인 — 프로브 `--daily-scope=bogus` → `COLLECTOR CONFIG: daily_scope must be "", single-page-initial-pair or accumulate-v2: bogus` exit 2(네트워크 없음, 임시 out 디렉터리 정리 완료). 설치 collector `--help`에 `--daily-scope=single-page-initial-pair\|accumulate-v2` 표시, 바이너리 sha256 = attest 아티팩트와 동일. `hongscanner-session.timer` NEXT `Fri 2026-11-20 08:50:00 KST` |
+| 배포 API 실측 | `GET /mobile/market-view` 웜 0.56s: `input_snapshot={"size":2262363133,"sha256":"c4cd1646…"}`(커밋 접두 해시). `?as_of=2026-11-19T10:10:00+09:00` → `mode=opening_ma20`(선택 런의 기록 개장 10:00), coverage `{candidate 2433, computable 7, rising 1, falling 6, flat 0, history_short 0, no_price 0, no_record 2426, capture_failed 0, PARTIAL}` — **6버킷 합 2433 == candidate_count**(실데이터 분할 불변식). `no_record 2426`은 오늘 런이 **레거시 스코프 collector**로 수집돼 초기 페어 밖 종목의 ka10081 레코드가 없기 때문 |
+
+**경계**
+- 오늘(11/19) 런의 `no_record 2426`은 버그가 아니라 레거시 스코프의 정직한 표시다. accumulate-v2의 첫 실전 적용은 **11/20 08:50 세션**이며, 그 런의 coverage에서 `no_record`가 실제 수집 결과로 대체되는지가 수용 판정이다.
+- real 키움 유량은 여전히 UNKNOWN(문서값 5/s, mock 1/s 실측). 2,400종목 mock 스윕 ≈60분으로 30분 창 완료를 주장하지 않는다.
+- watchdog 15:40과 달력 close(11/19 16:30) 불일치는 이번 슬라이스에서 변경하지 않았다 — "관측한 후보 전체"만 보장한다.
