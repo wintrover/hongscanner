@@ -161,7 +161,7 @@ cp "$REPO_ROOT/tools/collector/sidecar.py" "$CTX/tools/collector/sidecar.py"
 cp "$REPO_ROOT/tools/collector/requirements.txt" \
    "$CTX/tools/collector/requirements.txt"
 for f in notify_dispatcher.py notify_clock.py notify_config.py \
-         notify_fcm.py notify_ledger.py; do
+         notify_fcm.py notify_ledger.py group_tag.py; do
   cp "$REPO_ROOT/tools/notify/$f" "$CTX/tools/notify/$f"
 done
 assert_file_in_context() { # desc path
@@ -185,7 +185,7 @@ assert_file_in_context "staged sidecar.py" "$CTX/tools/collector/sidecar.py"
 assert_file_in_context "staged requirements.txt" \
   "$CTX/tools/collector/requirements.txt"
 for f in notify_dispatcher.py notify_clock.py notify_config.py \
-         notify_fcm.py notify_ledger.py; do
+         notify_fcm.py notify_ledger.py group_tag.py; do
   assert_file_in_context "staged tools/notify/$f" "$CTX/tools/notify/$f"
 done
 # The staged copy set is DERIVED from the imports, not from the list

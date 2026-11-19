@@ -389,7 +389,7 @@ class TokenSource:
 
 # ------------------------------------------------------------ sending
 
-def build_message(event, fcm_token):
+def build_message(event, fcm_token, tag=None):
     """The notification+data message for one event -> one device
     (README §6). The dispatcher's allowlist means the events reaching
     this in production are the TOP10 rank transitions: they get the
@@ -401,13 +401,15 @@ def build_message(event, fcm_token):
     point; the transport stays general, not a second policy gate.
     android.priority is always explicit because the vendor's own pages
     disagree on the unset default (README §6 records the conflict
-    verbatim); an explicit value is the only sure path. The FCM
+    verbatim); an explicit value is the only sure path. The optional
+    `tag` names the Android shade slot (the sound unit's group tag,
+    README §6); None leaves the payload bytes unchanged. The FCM
     registration token is inside the request body only."""
     if event["event_type"] in TOP10_EVENT_TYPES:
         message = _top10_message(event, fcm_token)
     else:
         message = _generic_message(event, fcm_token)
-    return _enforce_payload_limit(message)
+    return _enforce_payload_limit(_with_slot_tag(message, tag))
 
 
 def _enforce_payload_limit(message):
@@ -421,6 +423,16 @@ def _enforce_payload_limit(message):
         raise FcmError("payload is %d bytes; the vendor limit is %d "
                        "(keys and values included)" %
                        (size, PAYLOAD_LIMIT_BYTES))
+    return message
+
+
+def _with_slot_tag(message, tag):
+    """The optional Android shade-slot tag (README §6): the sound
+    unit's group tag. The digest keeps its own fixed DIGEST_TAG and
+    never comes through here; None leaves the payload byte-identical."""
+    if tag is not None:
+        android = message["message"]["android"]
+        android.setdefault("notification", {})["tag"] = tag
     return message
 
 
@@ -504,7 +516,7 @@ def build_aggregation_started_message(event, fcm_token):
     })
 
 
-def build_summary_message(events, fcm_token):
+def build_summary_message(events, fcm_token, tag=None):
     """The sound summary for one observation group's immediate events
     (README §6; docs/ASSUMPTIONS.md P28): two or more TOP10
     transitions the admission policy judged "immediate" share ONE
@@ -513,11 +525,12 @@ def build_summary_message(events, fcm_token):
     order) as "<display> <진입|이탈>" joined with "·", plus " 외 N건"
     for the remainder — deterministic, never invented. priority stays
     "high" and the channel market_rank_changes (the sound channel).
-    data carries the mobile contract fields only: kind, event_ids
-    (comma-joined, ledger order) and count — the per-event fields stay
-    on the single message."""
+    The optional `tag` is the unit's Android shade slot (README §6);
+    None leaves the payload bytes unchanged. data carries the mobile
+    contract fields only: kind, event_ids (comma-joined, ledger order)
+    and count — the per-event fields stay on the single message."""
     body = _summary_body(events)
-    return _enforce_payload_limit({
+    message = {
         "message": {
             "token": fcm_token,
             "notification": {"title": TOP10_TITLE, "body": body},
@@ -532,7 +545,8 @@ def build_summary_message(events, fcm_token):
                 "count": str(len(events)),
             },
         },
-    })
+    }
+    return _enforce_payload_limit(_with_slot_tag(message, tag))
 
 
 def _summary_body(events):

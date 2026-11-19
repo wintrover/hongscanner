@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 ".."))
 
+import group_tag  # noqa: E402
 import market_time  # noqa: E402
 import notify_config  # noqa: E402
 import notify_dispatcher  # noqa: E402
@@ -1128,7 +1129,11 @@ class TestTop10Message(Base):
 
     def message_for(self, **overrides):
         event = make_event(**overrides)
-        return event, notify_fcm.build_message(event, FCM_TOKEN)
+        return event, notify_fcm.build_message(
+            event, FCM_TOKEN, tag=self.slot_tag(event))
+
+    def slot_tag(self, event, device_id="dev-1"):
+        return group_tag.group_tag(event["observed_at"], device_id)
 
     def assert_top10_shape(self, event, message, expected_body):
         inner = message["message"]
@@ -1138,8 +1143,9 @@ class TestTop10Message(Base):
         self.assertEqual(inner["notification"]["body"], expected_body)
         self.assertEqual(inner["android"],
                          {"priority": "high",
-                          "notification": {"channel_id":
-                                           "market_rank_changes"}})
+                          "notification": {
+                              "channel_id": "market_rank_changes",
+                              "tag": self.slot_tag(event)}})
         self.assertEqual(inner["data"]["event_id"], event["event_id"])
         self.assertEqual(inner["data"]["event_type"],
                          event["event_type"])
@@ -1242,8 +1248,9 @@ class TestTop10Message(Base):
                             rule_id="top10-exited", seq=19,
                             name="SK하이닉스", previous_rank=9, rank=None,
                             direction="DOWN")
+        tag = self.slot_tag(entered)
         message = notify_fcm.build_summary_message([entered, exited],
-                                                   FCM_TOKEN)
+                                                   FCM_TOKEN, tag=tag)
         inner = message["message"]
         self.assertEqual(inner["token"], FCM_TOKEN)
         self.assertEqual(inner["notification"]["title"],
@@ -1252,8 +1259,9 @@ class TestTop10Message(Base):
                          "삼성전자 진입·SK하이닉스 이탈")
         self.assertEqual(inner["android"],
                          {"priority": "high",
-                          "notification": {"channel_id":
-                                           notify_fcm.TOP10_CHANNEL_ID}})
+                          "notification": {
+                              "channel_id": notify_fcm.TOP10_CHANNEL_ID,
+                              "tag": tag}})
         # The group data contract: kind, the FULL member list (ledger
         # order) and the count — nothing else; the per-event fields
         # stay on the single message.
@@ -1357,6 +1365,92 @@ class TestTop10Message(Base):
             swapped["message"]["data"]["event_ids"],
             ",".join(event["event_id"]
                      for event in [events[1], events[0], events[2]]))
+
+
+class TestGroupTag(Base):
+    """The sound unit's Android shade-slot tag (README §6;
+    tools/notify/group_tag.py): a deterministic (observed_at,
+    device_id) identity that lets an independent ADB observer join a
+    device notification to its server delivery rows exactly. The
+    digest keeps its own single silent slot (P28); the tag is a slot
+    identity, not a dedupe mechanism."""
+
+    OBSERVED_AT = "2026-11-01T09:12:33+09:00"
+
+    def test_same_group_gets_the_same_tag(self):
+        first = group_tag.group_tag(self.OBSERVED_AT, "dev-1")
+        second = group_tag.group_tag(self.OBSERVED_AT, "dev-1")
+        self.assertEqual(first, second)
+        self.assertEqual(first, "hs-g|%s|dev-1" % self.OBSERVED_AT)
+
+    def test_different_observed_at_or_device_gets_a_different_tag(self):
+        base = group_tag.group_tag(self.OBSERVED_AT, "dev-1")
+        self.assertNotEqual(
+            base, group_tag.group_tag("2026-11-01T09:12:34+09:00",
+                                      "dev-1"))
+        self.assertNotEqual(
+            base, group_tag.group_tag(self.OBSERVED_AT, "dev-2"))
+
+    def test_parse_round_trips(self):
+        tag = group_tag.group_tag(self.OBSERVED_AT, "dev-1")
+        self.assertEqual(group_tag.parse_group_tag(tag),
+                         (self.OBSERVED_AT, "dev-1"))
+        for not_a_tag in ("market_rank_digest", None,
+                          "hs-g|only-two", "other|%s|dev-1"
+                          % self.OBSERVED_AT):
+            with self.assertRaises(ValueError):
+                group_tag.parse_group_tag(not_a_tag)
+
+    def test_group_tag_rejects_whitespace_and_separator(self):
+        for observed_at, device_id in (
+                ("2026-11-01 09:12:33+09:00", "dev-1"),
+                ("%s\n" % self.OBSERVED_AT, "dev-1"),
+                (self.OBSERVED_AT, "dev 1"),
+                (self.OBSERVED_AT, "dev\t1"),
+                (self.OBSERVED_AT, "dev|1"),
+                ("2026-11-01T09:12:33|09:00", "dev-1"),
+                ("", "dev-1"),
+                (self.OBSERVED_AT, "")):
+            with self.assertRaises(ValueError):
+                group_tag.group_tag(observed_at, device_id)
+
+    def test_single_and_summary_carry_the_group_tag(self):
+        tag = group_tag.group_tag(self.OBSERVED_AT, "dev-1")
+        events = [make_event(seq=1), make_event(seq=2)]
+        single = notify_fcm.build_message(events[0], FCM_TOKEN, tag=tag)
+        summary = notify_fcm.build_summary_message(events, FCM_TOKEN,
+                                                   tag=tag)
+        for message in (single, summary):
+            carried = message["message"]["android"]["notification"]["tag"]
+            self.assertEqual(carried, tag)
+            self.assertFalse(any(ch.isspace() for ch in carried))
+            self.assertEqual(group_tag.parse_group_tag(carried),
+                             (self.OBSERVED_AT, "dev-1"))
+
+    def test_no_tag_leaves_the_single_and_summary_payloads_unchanged(self):
+        event = make_event()
+        events = [make_event(seq=1), make_event(seq=2)]
+        for build in (lambda **extra: notify_fcm.build_message(
+                          event, FCM_TOKEN, **extra),
+                      lambda **extra: notify_fcm.build_summary_message(
+                          events, FCM_TOKEN, **extra)):
+            omitted = build()
+            explicit_none = build(tag=None)
+            self.assertEqual(json.dumps(omitted, ensure_ascii=False,
+                                        separators=(",", ":")),
+                             json.dumps(explicit_none, ensure_ascii=False,
+                                        separators=(",", ":")))
+            self.assertNotIn("tag", omitted["message"]["android"]
+                             ["notification"])
+
+    def test_digest_keeps_the_single_silent_slot(self):
+        events = [make_event(seq=1), make_event(seq=2)]
+        message = notify_fcm.build_digest_message(events, FCM_TOKEN)
+        carried = message["message"]["android"]["notification"]["tag"]
+        self.assertEqual(carried, notify_fcm.DIGEST_TAG)
+        self.assertEqual(carried, "market_rank_digest")
+        self.assertNotEqual(
+            carried, group_tag.group_tag(self.OBSERVED_AT, "dev-1"))
 
 
 # ---------------------------------------------------------- dispatcher
@@ -1806,9 +1900,14 @@ class TestDispatcher(Base):
         self.assertEqual(summary["notification"]["body"],
                          "삼성전자 진입·SK하이닉스 이탈")
         self.assertEqual(summary["android"]["priority"], "high")
+        self.assertEqual(
+            summary["android"]["notification"]["tag"],
+            group_tag.group_tag(entered["observed_at"], "dev-1"))
         self.assertEqual(digest["android"]["priority"], "normal")
         self.assertEqual(digest["android"]["notification"]["channel_id"],
                          "market_rank_digest")
+        self.assertEqual(digest["android"]["notification"]["tag"],
+                         notify_fcm.DIGEST_TAG)
         self.assertEqual(summary["data"]["event_ids"],
                          "%s,%s" % (entered["event_id"],
                                     exited["event_id"]))
@@ -1828,9 +1927,10 @@ class TestDispatcher(Base):
             len({r["provider_message_id"] for r in digest_records}), 1)
 
     def test_single_form_is_unchanged_when_the_group_has_one_immediate(self):
-        # The single message form is EXACTLY build_message: the same
-        # data fields, no kind/event_ids/count — a group whose sound
-        # class has one member keeps the historical wire bytes.
+        # The single message form is EXACTLY build_message plus the
+        # unit's slot tag: the same data fields, no kind/event_ids/count
+        # — a group whose sound class has one member keeps the
+        # historical wire bytes and adds only the tag.
         _, cfg = self.config()
         self.write_service_account(cfg)
         entered = make_event(seq=17, name="삼성전자", rank=7)
@@ -1848,8 +1948,11 @@ class TestDispatcher(Base):
         self.assertEqual(code, 0)
         self.assertEqual(transport.send_count(), 2)
         single, digest = self.sends_of(transport)
-        self.assertEqual({"message": single},
-                         notify_fcm.build_message(entered, FCM_TOKEN))
+        self.assertEqual(
+            {"message": single},
+            notify_fcm.build_message(
+                entered, FCM_TOKEN,
+                tag=group_tag.group_tag(entered["observed_at"], "dev-1")))
         for key in ("kind", "event_ids", "count"):
             self.assertNotIn(key, single["data"])
         self.assertEqual(digest["data"]["event_ids"], rank["event_id"])

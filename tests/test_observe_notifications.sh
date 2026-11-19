@@ -6,11 +6,19 @@
 ## dedupe by (tag, when_ms), foreign-package filtering, one-line JSON, and
 ## exit 0 with an `error` line when adb fails or is absent.
 ##
+## Window coverage: --window is loop-only, a start outside the window is one
+## error line and exit 2, and a completed window closes with one observer_end
+## whose polls count proves the sampling reached END.
+##
 ## Run: bash tests/test_observe_notifications.sh
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOL="$REPO_ROOT/tools/observe_notifications.sh"
+TOOL_SHA256="$(sha256sum "$TOOL" 2>/dev/null | cut -d' ' -f1)"
+[ -n "$TOOL_SHA256" ] || TOOL_SHA256="unknown"
+TOOL_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)"
+[ -n "$TOOL_COMMIT" ] || TOOL_COMMIT="unknown"
 
 PASS=0
 FAILED=0
@@ -204,17 +212,26 @@ import sys
 
 lines = [json.loads(line) for line in
          open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+sha_expected, commit_expected = sys.argv[2], sys.argv[3]
 assert len(lines) == 2, "expected 2 records, got %d" % len(lines)
 by_tag = {record["tag"]: record for record in lines}
 
 expected_keys = {"captured_at", "device_serial", "tag", "channel",
                  "importance", "when_ms", "when_kst", "title", "text",
-                 "package"}
+                 "package", "snapshot_status", "observer_git_commit",
+                 "observer_sha256"}
 for record in lines:
     assert set(record) == expected_keys, sorted(record)
     assert record["package"] == "com.hongscanner.hongscanner"
     assert record["device_serial"] == "FAKE123"
     assert record["captured_at"].endswith("+09:00"), record["captured_at"]
+    assert record["snapshot_status"] == "OBSERVED_ACTIVE", record
+    assert record["observer_sha256"] == sha_expected, record
+    assert record["observer_git_commit"] == commit_expected, record
+    if sha_expected != "unknown":
+        assert len(record["observer_sha256"]) == 64, record
+    if commit_expected != "unknown":
+        assert len(record["observer_git_commit"]) == 40, record
 
 fcm = by_tag["FCM-Notification:6446973662"]
 assert fcm["channel"] == "market_rank_changes", fcm
@@ -236,7 +253,7 @@ assert "com.example.app" not in {record["package"] for record in lines}
 assert "Other app" not in {record["title"] for record in lines}
 PY
 assert_python "tag/channel/importance/when/title/text are exact" \
-  "${TMP}/check-a.py" "$EVIDENCE"
+  "${TMP}/check-a.py" "$EVIDENCE" "$TOOL_SHA256" "$TOOL_COMMIT"
 
 # ------------------------------------------------------------- checks (b)
 echo "--- (b) re-running the same dump adds nothing"
@@ -317,9 +334,11 @@ assert record["errors"]["adb"] == record["error"], record
 assert record["device_serial"] == "FAILSERIAL", record
 assert record["package"] == "com.hongscanner.hongscanner", record
 assert "tag" not in record, record
+assert record["observer_sha256"] == sys.argv[2], record
+assert record["observer_git_commit"] == sys.argv[3], record
 PY
 assert_python "failed adb produces one error record" \
-  "${TMP}/check-d.py" "$FAIL_FILE"
+  "${TMP}/check-d.py" "$FAIL_FILE" "$TOOL_SHA256" "$TOOL_COMMIT"
 
 bash "$TOOL" --adb "${TMP}/does-not-exist" --serial MISSING \
   --out-dir "$MISSING_DIR" --once > "${TMP}/run-d2.out" 2>&1
@@ -449,6 +468,119 @@ bash "$TOOL" --adb "$FAKE_ADB" --interval abc --out-dir "${TMP}/bad" \
 assert_eq "non-numeric --interval exits 2" 2 "$?"
 bash "$TOOL" --adb "$FAKE_ADB" --no-such-option > /dev/null 2>&1
 assert_eq "unknown option exits 2" 2 "$?"
+
+# ------------------------------------------------------------- checks (h)
+echo "--- (h) --window is loop-only"
+FUTURE_WINDOW="2099-01-01T00:00:00+09:00/2099-01-01T00:10:00+09:00"
+bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 --out-dir "${TMP}/bad" \
+  --once --window "$FUTURE_WINDOW" > /dev/null 2>&1
+assert_eq "--once with --window exits 2" 2 "$?"
+bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 --out-dir "${TMP}/bad" \
+  --window "$FUTURE_WINDOW" --once > /dev/null 2>&1
+assert_eq "--window then --once exits 2" 2 "$?"
+bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 --out-dir "${TMP}/bad" \
+  --window "$FUTURE_WINDOW" > /dev/null 2>&1
+assert_eq "--window without --interval exits 2" 2 "$?"
+bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 --out-dir "${TMP}/bad" \
+  --interval 5 --window "not-a-window" > /dev/null 2>&1
+assert_eq "malformed --window exits 2" 2 "$?"
+bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 --out-dir "${TMP}/bad" \
+  --interval 5 --window "2099-01-01T00:10:00+09:00/2099-01-01T00:00:00+09:00" \
+  > /dev/null 2>&1
+assert_eq "--window with START after END exits 2" 2 "$?"
+
+# ------------------------------------------------------------- checks (i)
+echo "--- (i) a start outside the window is one error line, no sampling"
+cat > "${TMP}/check-window.py" <<'PY'
+import json
+import sys
+
+lines = [json.loads(line) for line in
+         open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+assert len(lines) == 1, "expected 1 error line, got %d" % len(lines)
+record = lines[0]
+assert record["error"].startswith("observer started outside window: "), record
+assert record["errors"]["window"] == record["error"], record
+assert "tag" not in record and "when_ms" not in record, record
+assert "snapshot_status" not in record, record
+assert record["device_serial"] == "FAKE123", record
+assert record["observer_sha256"] == sys.argv[2], record
+assert record["observer_git_commit"] == sys.argv[3], record
+PY
+
+PAST_DIR="${TMP}/out-window-past"
+PAST_FILE="${PAST_DIR}/notifications-${TODAY}.hcj.jsonl"
+PAST_WINDOW="2020-01-01T00:00:00+09:00/2020-01-01T00:10:00+09:00"
+FAKE_DUMP="$FIXTURE_ONE" bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 \
+  --out-dir "$PAST_DIR" --interval 5 --window "$PAST_WINDOW" \
+  > "${TMP}/run-past.out" 2>&1
+assert_eq "window entirely before now exits 2" 2 "$?"
+assert_eq "window entirely before now writes exactly one line" 1 \
+  "$(wc -l < "$PAST_FILE" 2>/dev/null | tr -d ' ')"
+assert_python "start after END is one non-evidence error record" \
+  "${TMP}/check-window.py" "$PAST_FILE" "$TOOL_SHA256" "$TOOL_COMMIT"
+
+FUTURE_DIR="${TMP}/out-window-future"
+FUTURE_FILE="${FUTURE_DIR}/notifications-${TODAY}.hcj.jsonl"
+FAKE_DUMP="$FIXTURE_ONE" bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 \
+  --out-dir "$FUTURE_DIR" --interval 5 --window "$FUTURE_WINDOW" \
+  > "${TMP}/run-future.out" 2>&1
+assert_eq "window entirely after now exits 2" 2 "$?"
+assert_eq "window entirely after now writes exactly one line" 1 \
+  "$(wc -l < "$FUTURE_FILE" 2>/dev/null | tr -d ' ')"
+assert_python "start before START is one non-evidence error record" \
+  "${TMP}/check-window.py" "$FUTURE_FILE" "$TOOL_SHA256" "$TOOL_COMMIT"
+
+# ------------------------------------------------------------- checks (j)
+echo "--- (j) loop mode inside a short window closes with one observer_end"
+LOOP_DIR="${TMP}/out-window-loop"
+LOOP_FILE="${LOOP_DIR}/notifications-${TODAY}.hcj.jsonl"
+LOOP_WINDOW_START="$(TZ=Asia/Seoul date -d '-1 second' +%Y-%m-%dT%H:%M:%S%:z)"
+LOOP_WINDOW_END="$(TZ=Asia/Seoul date -d '+6 seconds' +%Y-%m-%dT%H:%M:%S%:z)"
+LOOP_STARTED="$(date +%s)"
+FAKE_DUMP="$FIXTURE_ONE" bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 \
+  --out-dir "$LOOP_DIR" --interval 5 \
+  --window "${LOOP_WINDOW_START}/${LOOP_WINDOW_END}" \
+  > "${TMP}/run-loop.out" 2>&1
+LOOP_RC=$?
+LOOP_ELAPSED=$(( $(date +%s) - LOOP_STARTED ))
+assert_eq "loop inside the window exits 0" 0 "$LOOP_RC"
+if [ "$LOOP_ELAPSED" -le 9 ]; then
+  echo "ok   loop stops at END without sleeping past it (${LOOP_ELAPSED}s)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL loop slept past END (${LOOP_ELAPSED}s)"
+  FAILED=$((FAILED + 1))
+fi
+cat > "${TMP}/check-loop.py" <<'PY'
+import json
+import sys
+
+lines = [json.loads(line) for line in
+         open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+ends = [record for record in lines if record.get("kind") == "observer_end"]
+assert len(ends) == 1, "expected exactly one observer_end, got %d" % len(ends)
+end = ends[0]
+assert set(end) == {"kind", "started_at", "ended_at", "window_start",
+                    "window_end", "polls", "exit", "device_serial",
+                    "package", "observer_git_commit", "observer_sha256"}, end
+assert end["exit"] == "ok", end
+assert end["window_start"] == sys.argv[2], end
+assert end["window_end"] == sys.argv[3], end
+assert end["ended_at"] >= end["window_end"], end
+assert end["polls"] >= 1, end
+assert end["device_serial"] == "FAKE123", end
+assert end["package"] == "com.hongscanner.hongscanner", end
+assert end["observer_sha256"] == sys.argv[4], end
+assert end["observer_git_commit"] == sys.argv[5], end
+
+notifications = [record for record in lines if "tag" in record]
+assert notifications, "the window sampled no notification records"
+assert not [record for record in lines if record.get("kind") == "heartbeat"]
+PY
+assert_python "observer_end closes the sampled window" \
+  "${TMP}/check-loop.py" "$LOOP_FILE" "$LOOP_WINDOW_START" "$LOOP_WINDOW_END" \
+  "$TOOL_SHA256" "$TOOL_COMMIT"
 
 # ------------------------------------------------------------- summary
 echo

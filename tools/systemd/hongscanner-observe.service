@@ -7,5 +7,5 @@ Description=Hong Scanner Independent Session Observer (read-only checkpoint)
 
 [Service]
 Type=oneshot
-ExecStart=/home/wintrover/hongscanner/tools/observe_session.sh
+ExecStart=/home/wintrover/hongscanner/tools/observe_session.sh --scheduled
 Environment=PYTHONUNBUFFERED=1

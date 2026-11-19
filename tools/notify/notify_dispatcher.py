@@ -164,6 +164,7 @@ if _TOOLS_DIR not in sys.path:
 
 import market_time  # noqa: E402
 
+import group_tag  # noqa: E402
 import notify_clock  # noqa: E402
 import notify_config  # noqa: E402
 import notify_fcm  # noqa: E402
@@ -485,10 +486,16 @@ class Dispatcher:
                     message_kind=msg_kind)
 
         try:
+            slot = None
+            if msg_kind in ("single", "summary"):
+                slot = group_tag.group_tag(events[0]["observed_at"],
+                                           device_id)
             if msg_kind == "single":
-                message = notify_fcm.build_message(events[0], token)
+                message = notify_fcm.build_message(events[0], token,
+                                                   tag=slot)
             elif msg_kind == "summary":
-                message = notify_fcm.build_summary_message(events, token)
+                message = notify_fcm.build_summary_message(events, token,
+                                                           tag=slot)
             else:
                 message = notify_fcm.build_digest_message(events, token)
         except notify_fcm.FcmError:

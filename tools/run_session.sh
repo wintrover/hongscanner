@@ -82,9 +82,11 @@ _mono_stamp() {
 
 # ------------------------------------------------------------- arguments
 OUT=""
+SESSION_DATE=""
 for arg in "$@"; do
   case "$arg" in
     --out=*) OUT="${arg#--out=}" ;;
+    --session-date=*) SESSION_DATE="${arg#--session-date=}" ;;
   esac
 done
 if [ -z "$OUT" ] || [ "$#" -eq 0 ]; then
@@ -398,12 +400,34 @@ wait_for_run_dir() {
   done
 }
 
+# ------------------------------------------------------------ provenance
+# The launcher records its own execution identity at session start so
+# acceptance evidence names both the commit and the launcher bytes that
+# ran. Each lookup degrades to "unknown" instead of aborting the launch.
+STARTED_AT="$(date --iso-8601=seconds)"
+GIT_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+if ! printf '%s' "$GIT_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+  GIT_COMMIT="unknown"
+fi
+LAUNCHER_SHA256="$(sha256sum "$REPO/tools/run_session.sh" 2>/dev/null || true)"
+LAUNCHER_SHA256="${LAUNCHER_SHA256%% *}"
+if ! printf '%s' "$LAUNCHER_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+  LAUNCHER_SHA256="unknown"
+fi
+GIT_DIRTY="unknown"
+if GIT_STATUS="$(git -C "$REPO" status --porcelain 2>/dev/null)"; then
+  if [ -n "$GIT_STATUS" ]; then GIT_DIRTY=1; else GIT_DIRTY=0; fi
+fi
+
 # ------------------------------------------------------------------- run
 {
   echo "=== run_session start $(date --iso-8601=seconds)"
   echo "collector=$COLLECTOR"
   echo "worker=$NOTIFY_SCRIPT --config $NOTIFY_CONFIG --run-dir $OUT_ABS --watch $EVENTS_FILE"
   echo "log=$LAUNCHER_LOG"
+  echo "RUN_PROVENANCE run_id=$SESSION session_date=${SESSION_DATE:-unknown}" \
+    "git_commit=$GIT_COMMIT launcher_sha256=$LAUNCHER_SHA256" \
+    "git_dirty=$GIT_DIRTY started_at=${STARTED_AT:-unknown}"
 } >>"$LAUNCHER_LOG"
 
 # Collector FIRST, worker SECOND: the worker's --run-dir must exist before

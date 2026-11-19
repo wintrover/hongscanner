@@ -1,0 +1,15 @@
+## 하루짜리 승인 창(2026-11-20 08:58~09:35)을 전 구간 샘플링한다.
+## 창 일반화는 P1이다 — 그때까지 이 유닛은 2026-11-20 하루만 유효하다.
+## Restart=no: 다시 띄우면 시작 가드가 창 밖 시작을 exit 2로 거부하고,
+## observer_end 없는 종료 자체가 놓친 구간의 증거로 남는다.
+## Linger=yes는 로그아웃 후 user manager를 유지할 뿐 절전을 막지 않는다.
+## systemd-inhibit은 이 유닛이 도는 동안 sleep/idle 진입을 차단한다(막지 못하면
+## 관측 공백이 그대로 OBSERVATION_INCOMPLETE로 기록된다).
+[Unit]
+Description=Hong Scanner Notification Observer (one-day acceptance window 2026-11-20)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=hongscanner-notify-observe --why=2026-11-20-acceptance-window --mode=block /home/wintrover/바탕화면/hongscanner/tools/observe_notifications.sh --interval 10 --serial R3CM60B9AQJ --adb /usr/bin/adb --window 2026-11-20T08:58:00+09:00/2026-11-20T09:35:00+09:00
+Restart=no
+TimeoutStopSec=20

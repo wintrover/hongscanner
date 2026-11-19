@@ -1,0 +1,13 @@
+## 2026-11-20 승인 창 시작(08:58)에 관측자를 한 번 띄운다.
+## Persistent=false: 놓친 시작을 소급 실행하지 않는다. 뒤늦게 뜬 관측자는
+## 창 밖 시작으로 거부되므로 창 중간부터의 green이 생길 수 없다.
+[Unit]
+Description=Hong Scanner Notification Observer Timer (one-day acceptance window 2026-11-20)
+
+[Timer]
+OnCalendar=2026-11-20 08:58:00
+Persistent=false
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
