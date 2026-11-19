@@ -10,6 +10,9 @@
 ## error line and exit 2, and a completed window closes with one observer_end
 ## whose polls count proves the sampling reached END.
 ##
+## Timeout: a hung adb is bounded by ADB_TIMEOUT_SEC, the timeout is one
+## error line, and the loop keeps polling.
+##
 ## Run: bash tests/test_observe_notifications.sh
 set -u
 
@@ -54,6 +57,9 @@ EVIDENCE="${OUT_DIR}/notifications-${TODAY}.hcj.jsonl"
 FAKE_ADB="${TMP}/fake-adb"
 cat > "$FAKE_ADB" <<'SH'
 #!/usr/bin/env bash
+if [ -n "${FAKE_ADB_HANG:-}" ]; then
+  exec sleep "${FAKE_ADB_HANG}"
+fi
 if [ "${1:-}" = "devices" ]; then
   if [ -n "${FAKE_ADB_FAIL:-}" ]; then
     echo "error: no devices/emulators found" >&2
@@ -531,6 +537,34 @@ assert_eq "window entirely after now writes exactly one line" 1 \
 assert_python "start before START is one non-evidence error record" \
   "${TMP}/check-window.py" "$FUTURE_FILE" "$TOOL_SHA256" "$TOOL_COMMIT"
 
+LATE_DIR="${TMP}/out-window-late"
+LATE_FILE="${LATE_DIR}/notifications-${TODAY}.hcj.jsonl"
+LATE_START="$(TZ=Asia/Seoul date -d '-300 seconds' +%Y-%m-%dT%H:%M:%S%:z)"
+LATE_END="$(TZ=Asia/Seoul date -d '+30 seconds' +%Y-%m-%dT%H:%M:%S%:z)"
+FAKE_DUMP="$FIXTURE_ONE" bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 \
+  --out-dir "$LATE_DIR" --interval 5 --window "${LATE_START}/${LATE_END}" \
+  > "${TMP}/run-late.out" 2>&1
+assert_eq "start later than the tolerance exits 2" 2 "$?"
+assert_eq "late start writes exactly one line" 1 \
+  "$(wc -l < "$LATE_FILE" 2>/dev/null | tr -d ' ')"
+cat > "${TMP}/check-late.py" <<'PY'
+import json
+import sys
+
+lines = [json.loads(line) for line in
+         open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+assert len(lines) == 1, "expected 1 error line, got %d" % len(lines)
+record = lines[0]
+assert record["error"].startswith("observer started late: "), record
+assert "start tolerance 90s" in record["error"], record
+assert record["errors"]["window"] == record["error"], record
+assert "tag" not in record and "when_ms" not in record, record
+assert "snapshot_status" not in record, record
+assert record["device_serial"] == "FAKE123", record
+PY
+assert_python "late start is one non-evidence error record" \
+  "${TMP}/check-late.py" "$LATE_FILE"
+
 # ------------------------------------------------------------- checks (j)
 echo "--- (j) loop mode inside a short window closes with one observer_end"
 LOOP_DIR="${TMP}/out-window-loop"
@@ -581,6 +615,108 @@ PY
 assert_python "observer_end closes the sampled window" \
   "${TMP}/check-loop.py" "$LOOP_FILE" "$LOOP_WINDOW_START" "$LOOP_WINDOW_END" \
   "$TOOL_SHA256" "$TOOL_COMMIT"
+
+# ------------------------------------------------------------- checks (k)
+echo "--- (k) a hanging adb is bounded and recorded, not waited on"
+HANG_DIR="${TMP}/out-hang"
+HANG_FILE="${HANG_DIR}/notifications-${TODAY}.hcj.jsonl"
+HANG_STARTED="$(date +%s)"
+FAKE_ADB_HANG=30 FAKE_DUMP="$FIXTURE_ONE" ADB_TIMEOUT_SEC=2 \
+  bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 --out-dir "$HANG_DIR" --once \
+  > "${TMP}/run-hang.out" 2>&1
+HANG_RC=$?
+HANG_ELAPSED=$(( $(date +%s) - HANG_STARTED ))
+assert_eq "hanging adb exits 0" 0 "$HANG_RC"
+assert_eq "hanging adb writes one line" 1 \
+  "$(wc -l < "$HANG_FILE" 2>/dev/null | tr -d ' ')"
+if [ "$HANG_ELAPSED" -le 10 ]; then
+  echo "ok   --once returns after the timeout (${HANG_ELAPSED}s)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL --once waited for the hung adb (${HANG_ELAPSED}s)"
+  FAILED=$((FAILED + 1))
+fi
+
+cat > "${TMP}/check-k.py" <<'PY'
+import json
+import sys
+
+lines = [json.loads(line) for line in
+         open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+assert len(lines) == 1, "expected 1 error line, got %d" % len(lines)
+record = lines[0]
+assert record["error"] == "adb shell dumpsys notification timed out after 2s", record
+assert record["errors"]["adb"] == record["error"], record
+assert record["device_serial"] == "FAKE123", record
+assert record["package"] == "com.hongscanner.hongscanner", record
+assert "tag" not in record and "when_ms" not in record, record
+assert "snapshot_status" not in record, record
+assert record["observer_sha256"] == sys.argv[2], record
+assert record["observer_git_commit"] == sys.argv[3], record
+PY
+assert_python "hung adb is one timeout error record" \
+  "${TMP}/check-k.py" "$HANG_FILE" "$TOOL_SHA256" "$TOOL_COMMIT"
+
+HANG_NOSERIAL_DIR="${TMP}/out-hang-noserial"
+HANG_NOSERIAL_FILE="${HANG_NOSERIAL_DIR}/notifications-${TODAY}.hcj.jsonl"
+HANG_NOSERIAL_STARTED="$(date +%s)"
+FAKE_ADB_HANG=30 FAKE_DUMP="$FIXTURE_ONE" ADB_TIMEOUT_SEC=1 \
+  bash "$TOOL" --adb "$FAKE_ADB" --out-dir "$HANG_NOSERIAL_DIR" --once \
+  > "${TMP}/run-hang-noserial.out" 2>&1
+HANG_NOSERIAL_RC=$?
+HANG_NOSERIAL_ELAPSED=$(( $(date +%s) - HANG_NOSERIAL_STARTED ))
+assert_eq "hanging adb devices exits 0" 0 "$HANG_NOSERIAL_RC"
+assert_eq "hanging adb devices writes one line" 1 \
+  "$(wc -l < "$HANG_NOSERIAL_FILE" 2>/dev/null | tr -d ' ')"
+if [ "$HANG_NOSERIAL_ELAPSED" -le 10 ]; then
+  echo "ok   serial resolution times out, dump timeout is still recorded (${HANG_NOSERIAL_ELAPSED}s)"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL serial resolution waited for the hung adb (${HANG_NOSERIAL_ELAPSED}s)"
+  FAILED=$((FAILED + 1))
+fi
+
+cat > "${TMP}/check-k2.py" <<'PY'
+import json
+import sys
+
+lines = [json.loads(line) for line in
+         open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+assert len(lines) == 1, "expected 1 error line, got %d" % len(lines)
+record = lines[0]
+assert record["error"] == "adb shell dumpsys notification timed out after 1s", record
+assert record["device_serial"] is None, record
+PY
+assert_python "devices timeout yields no serial, dump timeout is the record" \
+  "${TMP}/check-k2.py" "$HANG_NOSERIAL_FILE"
+
+HANG_LOOP_DIR="${TMP}/out-hang-loop"
+HANG_LOOP_FILE="${HANG_LOOP_DIR}/notifications-${TODAY}.hcj.jsonl"
+HANG_LOOP_START="$(TZ=Asia/Seoul date -d '-1 second' +%Y-%m-%dT%H:%M:%S%:z)"
+HANG_LOOP_END="$(TZ=Asia/Seoul date -d '+11 seconds' +%Y-%m-%dT%H:%M:%S%:z)"
+FAKE_ADB_HANG=30 FAKE_DUMP="$FIXTURE_ONE" ADB_TIMEOUT_SEC=1 \
+  bash "$TOOL" --adb "$FAKE_ADB" --serial FAKE123 --out-dir "$HANG_LOOP_DIR" \
+  --interval 5 --window "${HANG_LOOP_START}/${HANG_LOOP_END}" \
+  > "${TMP}/run-hang-loop.out" 2>&1
+HANG_LOOP_RC=$?
+assert_eq "loop with a hanging adb exits 0" 0 "$HANG_LOOP_RC"
+cat > "${TMP}/check-k3.py" <<'PY'
+import json
+import sys
+
+lines = [json.loads(line) for line in
+         open(sys.argv[1], "r", encoding="utf-8") if line.strip()]
+ends = [record for record in lines if record.get("kind") == "observer_end"]
+assert len(ends) == 1, "expected one observer_end, got %d" % len(ends)
+errors = [record for record in lines if record.get("error")]
+assert ends[0]["polls"] >= 2, ends[0]
+assert len(errors) == ends[0]["polls"], (len(errors), ends[0])
+for record in errors:
+    assert "timed out after" in record["error"], record
+assert not [record for record in lines if "tag" in record]
+PY
+assert_python "every hung poll is one timeout line and the loop continues" \
+  "${TMP}/check-k3.py" "$HANG_LOOP_FILE"
 
 # ------------------------------------------------------------- summary
 echo

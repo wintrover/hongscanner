@@ -4,16 +4,22 @@
 ## 이벤트는 09:35:45에 도착한다. 창이 09:35에서 끝나면 그 그룹은 관측되지 않아
 ## 정당한 발송이 missing으로 판정된다.
 ## 창 일반화는 P1이다 — 그때까지 이 유닛은 2026-11-20 하루만 유효하다.
-## Restart=no: 다시 띄우면 시작 가드가 창 밖 시작을 exit 2로 거부하고,
-## observer_end 없는 종료 자체가 놓친 구간의 증거로 남는다.
+## Restart=no: 다시 띄우면 시작 가드가 창 시작 + 90초 이후의 시작을 exit 2로
+## 거부하고, observer_end 없는 종료 자체가 놓친 구간의 증거로 남는다.
 ## Linger=yes는 로그아웃 후 user manager를 유지할 뿐 절전을 막지 않는다.
-## systemd-inhibit은 이 유닛이 도는 동안 sleep/idle 진입을 차단한다(막지 못하면
-## 관측 공백이 그대로 OBSERVATION_INCOMPLETE로 기록된다).
+## systemd-inhibit은 이 유닛이 도는 동안 sleep/idle 진입을 차단한다. 덮개 절전은
+## logind 기본값 LidSwitchIgnoreInhibited=yes가 sleep 락을 무시하므로
+## handle-lid-switch를 함께 잡는다(막지 못하면 관측 공백이 그대로
+## OBSERVATION_INCOMPLETE로 기록된다).
+## Type=exec: exec 실패를 systemd가 성공으로 보고하지 않게 한다.
+## RuntimeMaxSec=50min: 창(47분)보다 길게 잡아 루프가 멈춰도 유닛이 무한정
+## running으로 남지 않게 한다.
 [Unit]
 Description=Hong Scanner Notification Observer (one-day acceptance window 2026-11-20)
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=hongscanner-notify-observe --why=2026-11-20-acceptance-window --mode=block /home/wintrover/바탕화면/hongscanner/tools/observe_notifications.sh --interval 10 --serial R3CM60B9AQJ --adb /usr/bin/adb --window 2026-11-20T08:58:00+09:00/2026-11-20T09:45:00+09:00
+Type=exec
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle:handle-lid-switch --who=hongscanner-notify-observe --why=2026-11-20-acceptance-window --mode=block /home/wintrover/바탕화면/hongscanner/tools/observe_notifications.sh --interval 10 --serial R3CM60B9AQJ --adb /usr/bin/adb --window 2026-11-20T08:58:00+09:00/2026-11-20T09:45:00+09:00
 Restart=no
 TimeoutStopSec=20
+RuntimeMaxSec=50min
