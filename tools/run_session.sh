@@ -54,6 +54,12 @@
 ##                              unless this override is set
 ##          HS_PREFLIGHT_MIN_AVAIL  storage preflight threshold in bytes
 ##                              (default 21474836480 = 20 GiB)
+##          HS_WORKER_RUN_DIR_WAIT_SECONDS  bounded wait for the
+##                              collector's run dir before the worker
+##                              starts (default 60, 0.1s polls). On
+##                              timeout the worker is skipped
+##                              (WORKER_SKIPPED) and the session keeps
+##                              running; see wait_for_run_dir.
 ## Exit:    the collector's exit code (0/4 per its README §8); 2 for
 ##          launcher usage errors or a failed storage preflight (nothing
 ##          started).
@@ -175,9 +181,17 @@ echo "PREFLIGHT_OK avail=$PREFLIGHT_AVAIL" >> "$LAUNCHER_LOG"
 WORKER_MODE="none"
 WORKER_PID=0
 WORKER_STOPPED=0
+WORKER_UNIT_ATTEMPTED=0
 WATCHDOG_PID=0
 WATCHDOG_INTERVAL="${HS_WATCHDOG_INTERVAL:-15}"
 STALL_TIMEOUT_SECONDS="${HS_STALL_TIMEOUT_SECONDS:-900}"
+# Bounded wait for the collector's run dir before the worker starts; the
+# rationale is in wait_for_run_dir() below. Non-numeric values fall back
+# to the default instead of silently meaning 0.
+RUN_DIR_WAIT_SECONDS="${HS_WORKER_RUN_DIR_WAIT_SECONDS:-60}"
+if ! printf '%s' "$RUN_DIR_WAIT_SECONDS" | grep -Eq '^[0-9]+$'; then
+  RUN_DIR_WAIT_SECONDS=60
+fi
 
 stop_watchdog() {
   if [ "$WATCHDOG_PID" != "0" ]; then
@@ -231,6 +245,16 @@ start_watchdog() {
   WATCHDOG_PID=$!
 }
 
+# unit_live — is the transient unit still present in the user manager?
+# is-active covers running and auto-restart ("activating"); is-failed
+# covers a unit that exhausted its start limit. A transient unit that
+# exited successfully is unloaded immediately (systemd-run(1)), so these
+# two states are the ones that can still be left to stop.
+unit_live() {
+  systemctl --user is-active --quiet "$UNIT" 2>/dev/null || \
+    systemctl --user is-failed --quiet "$UNIT" 2>/dev/null
+}
+
 stop_worker() {
   stop_watchdog
   if [ "$WORKER_STOPPED" = "1" ]; then return 0; fi
@@ -254,7 +278,20 @@ stop_worker() {
         "systemd 유닛 $UNIT 실패 상태로 종료됨 ($state)"
     fi
     systemctl --user reset-failed "$UNIT" 2>/dev/null || true
-  elif [ "$WORKER_PID" != "0" ]; then
+  elif [ "$WORKER_UNIT_ATTEMPTED" = "1" ] && unit_live; then
+    # The systemd-run attempt did not end as WORKER_MODE=systemd, but its
+    # transient unit can still exist: a failed start keeps the unit in
+    # memory (systemd-run(1)), so Restart=on-failure keeps restarting it
+    # against the fallback worker's single-writer lock — and while the
+    # hsnotify-<name> unit is up, tools/runs_retention.sh grades the run
+    # ACTIVE forever. systemctl(1) says stop fails on a unit that does not
+    # exist, hence the unit_live guard; on an existing but already
+    # stopping/inactive unit it is a no-op, so this stays idempotent.
+    systemctl --user stop "$UNIT" >>"$LAUNCHER_LOG" 2>&1 || true
+    systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+    echo "WORKER_UNIT_STOPPED unit=$UNIT mode=$WORKER_MODE" >>"$LAUNCHER_LOG"
+  fi
+  if [ "$WORKER_MODE" = "background" ] && [ "$WORKER_PID" != "0" ]; then
     kill -TERM "$WORKER_PID" 2>/dev/null || true
     local i
     for i in $(seq 1 100); do
@@ -278,8 +315,13 @@ start_worker() {
       echo "run_session: unit $UNIT is already active (another session" \
         "with the same run dir name?)" >&2
       echo "WORKER_REFUSED unit $UNIT already active" >>"$LAUNCHER_LOG"
+      # The collector is already running (it starts first now): stop it
+      # before the launcher exits, otherwise it would be left orphaned.
+      kill -TERM "$COLLECTOR_PID" 2>/dev/null || true
+      echo "COLLECTOR_TERMINATED reason=worker_refused" >>"$LAUNCHER_LOG"
       exit 2
     fi
+    WORKER_UNIT_ATTEMPTED=1
   fi
   systemctl --user reset-failed "$UNIT" 2>>"$LAUNCHER_LOG" || true
   if command -v systemd-run >/dev/null 2>&1 && \
@@ -297,6 +339,15 @@ start_worker() {
     echo "WORKER_START systemd unit=$UNIT (Type=notify, WatchdogSec=30, Restart=on-failure)" \
       >>"$LAUNCHER_LOG"
   else
+    # A failed start leaves the transient unit behind: without --collect,
+    # failed units stay in memory until reset-failed (systemd-run(1)) and
+    # Restart=on-failure keeps restarting them — the 2026-11-19 crash
+    # loop that competed with the fallback worker for the single-writer
+    # lock. Stop it and clear the failed state BEFORE the fallback starts.
+    if [ "$WORKER_UNIT_ATTEMPTED" = "1" ]; then
+      systemctl --user stop "$UNIT" >>"$LAUNCHER_LOG" 2>&1 || true
+      systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+    fi
     # Development-mode fallback (README §11): loses the auto-restart.
     WORKER_MODE="background"
     echo "WORKER_START background FALLBACK (development mode — NOT an" \
@@ -308,6 +359,45 @@ start_worker() {
   fi
 }
 
+# wait_for_run_dir — bounded wait for the collector's run dir.
+#
+# The run dir is the COLLECTOR's to create (O_EXCL; see the mkdir above),
+# and the worker refuses to start without it ("--run-dir is not a
+# directory", notify_dispatcher.py). Starting the worker first made every
+# session's systemd start job fail on a missing directory, so the
+# launcher fell back to development mode while the failed unit kept
+# restarting (2026-11-19: NRestarts=2738 over 96 minutes of single-writer
+# lock collisions).
+#
+# Waiting loses no events: the worker always begins at byte offset 0 and
+# ingests every complete line already in events.hcj.jsonl on its first
+# tick (notify_dispatcher.py --watch: `offset = 0`, full catch-up), so
+# events the collector writes while we wait are delivered as well.
+#
+# Already present -> no wait (the pre-fix behavior preserved). On timeout,
+# or when the collector is already gone, return 1: the caller records
+# WORKER_SKIPPED run_dir_missing and keeps the session running — the
+# collector owns the session, the worker is an accessory.
+wait_for_run_dir() {
+  [ -d "$OUT_ABS" ] && return 0
+  local limit=$((RUN_DIR_WAIT_SECONDS * 10))
+  local i=0
+  while [ ! -d "$OUT_ABS" ]; do
+    if ! kill -0 "$COLLECTOR_PID" 2>/dev/null; then
+      echo "WORKER_SKIPPED run_dir_missing seconds=$((i / 10)) collector_dead=1" \
+        >>"$LAUNCHER_LOG"
+      return 1
+    fi
+    if [ "$i" -ge "$limit" ]; then
+      echo "WORKER_SKIPPED run_dir_missing seconds=$RUN_DIR_WAIT_SECONDS" \
+        >>"$LAUNCHER_LOG"
+      return 1
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+
 # ------------------------------------------------------------------- run
 {
   echo "=== run_session start $(date --iso-8601=seconds)"
@@ -316,12 +406,18 @@ start_worker() {
   echo "log=$LAUNCHER_LOG"
 } >>"$LAUNCHER_LOG"
 
-start_worker
-
+# Collector FIRST, worker SECOND: the worker's --run-dir must exist before
+# its systemd start job can succeed (wait_for_run_dir explains why the
+# wait cannot lose events). The watchdog starts after the worker is up so
+# its subshell inherits the final WORKER_MODE.
 "$COLLECTOR" "$@" >>"$LAUNCHER_LOG" 2>&1 &
 COLLECTOR_PID=$!
-start_watchdog
 trap 'kill -TERM "$COLLECTOR_PID" 2>/dev/null || true' INT TERM
+
+if wait_for_run_dir; then
+  start_worker
+fi
+start_watchdog
 
 COLLECTOR_RC=0
 while true; do

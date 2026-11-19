@@ -434,7 +434,13 @@ chmod +x "$PF/bin/df" "$PF/bin/systemd-run" "$PF/bin/systemctl"
 printf '{}\n' > "$PF/notify-config.json"
 cat > "$PF/collector-echo" <<'EOF'
 #!/usr/bin/env bash
+# The run dir belongs to the collector (O_EXCL, tools/run_session.sh
+# wait_for_run_dir) and the launcher starts the worker only after it
+# exists, so the fake creates it like the real one does.
 echo "fake-collector $*"
+for a in "$@"; do
+  case "$a" in --out=*) mkdir -p "${a#--out=}" ;; esac
+done
 exit 0
 EOF
 chmod +x "$PF/collector-echo"
@@ -568,8 +574,14 @@ assert_matches "WORKER_UNIT_FAILED line carries t0_observed and stamps" \
   "WORKER_UNIT_FAILED unit=hsnotify-sess-wfail t0_observed=1 mono_ns=[0-9]+ boot_id=[0-9a-f-]+ wall=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 
 # (c) silent stall -> SESSION_STALL_DETECTED + notify
+# The collector starts normally (it creates its run dir, as the real one
+# does) and then goes silent; the watchdog's job is the silence, not a
+# missing directory.
 cat > "$VSA/collector-hang" <<'EOF'
 #!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in --out=*) mkdir -p "${a#--out=}" ;; esac
+done
 sleep 3
 exit 0
 EOF

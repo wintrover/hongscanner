@@ -50,6 +50,9 @@ run bash tests/test_cli_contract.sh
 run bash tests/test_build_contract.sh
 run bash tests/test_install_attested.sh
 run bash tests/test_retention_contract.sh
+run bash tests/test_launcher_ops_alert.sh
+run bash tests/test_launcher_worker_order.sh
+run bash tests/test_observe_notifications.sh
 run python3 tests/test_calendar_source.py
 run python3 tests/test_market_time.py
 run python3 tests/test_ssot_consistency.py
