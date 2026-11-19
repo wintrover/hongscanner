@@ -25,8 +25,10 @@
 ##     is swept one daily_req at a time; only an affirmed response becomes
 ##     a rest_resp record (a failed capture is the daily_capture_failed
 ##     gap and the symbol is skipped — fail-closed per symbol, never per
-##     session), each symbol is requested exactly once, and a re-poll
-##     round never extends the universe;
+##     session), each symbol is requested at most once, and the versioned
+##     universe scope (config.daily_scope) decides whether later poll
+##     rounds extend the FIFO queue (accumulate-v2) or never extend it
+##     (the legacy single-page-initial-pair scope);
 ##   - the deterministic subscription selection between derivation and
 ##     REG composition (sub_input.selectTopPerDirection, policy
 ##     selectionPolicyId): each direction's first 100 candidates in
@@ -48,7 +50,7 @@
 ## vendor response that does not affirm success, an unparseable payload
 ## or an unpaired ack is never mapped to success. INCOMPLETE never calls
 ## finish().
-import std/[strutils, options, algorithm]
+import std/[strutils, options, algorithm, sets]
 import hcj, records, calendars, engine, vendor_input, rest_resp, sub_input,
        subcheck, tickwire
 
@@ -75,6 +77,11 @@ type
                                ## the recorder COMMITTED run_id convention).
                                ## Empty = legacy stream: no run_id key is
                                ## recorded and event ids stay legacy-shaped.
+    dailyScope*: string        ## config.daily_scope (REPLAY_CONTRACT §12.9):
+                               ## "" = legacy (no key recorded, byte-identical
+                               ## streams), "single-page-initial-pair" = the
+                               ## same legacy scope declared explicitly,
+                               ## "accumulate-v2" = FIFO union across polls
     params*: Params
     calendar*: HcjValue        ## the approved calendar snapshot (recorded as seq 1)
 
@@ -129,14 +136,20 @@ type
     closeValues*: seq[string]        ## distinct observed 215 values, in order
     quarantine*: int
     quarantineNotes*: seq[string]
-    dailyUniverse*: seq[string]  ## the once-per-session ka10081 sweep universe:
-                                 ## the first complete non-empty initial pair's
-                                 ## ka10027 row stk_cds, up/down symbols interleaved
-                                 ## by their in-chain appearance order, deduped
+    dailyUniverse*: seq[string]  ## the ka10081 sweep universe (FIFO): the
+                                 ## first complete non-empty initial pair's
+                                 ## ka10027 row stk_cds, up/down symbols
+                                 ## interleaved by their in-chain appearance
+                                 ## order, deduped; accumulate-v2 appends each
+                                 ## later poll round's new symbols
     dailyReady*: bool            ## the universe was explicitly finalized once
     dailyCursor*: int            ## index of the next universe symbol to request
     dailyPending*: string        ## stk_cd of the in-flight daily request (""
                                  ## = none)
+    dailySeen*: HashSet[string]  ## accumulate-v2 assignment ledger (REPLAY
+                                 ## CONTRACT §12.9): a symbol enters the FIFO
+                                 ## universe at most once, so no capture is
+                                 ## ever re-issued on a later poll round
     wsCount*: int
     wsSincePoll*: int
     parseFailures*: int
@@ -170,6 +183,12 @@ const
   realRestDomain* = "https://api.kiwoom.com"
   realWsEndpoint* = "wss://api.kiwoom.com:10000/api/dostk/websocket"
   approvedWatchdog* = "15:40:00+09:00"
+  # The explicit legacy daily scope (REPLAY_CONTRACT §12.9): byte-identical
+  # to an absent config.daily_scope.
+  dailyScopeLegacy* = "single-page-initial-pair"
+  # The FIFO universe scope: later poll rounds append new symbols and the
+  # sweep resumes (REPLAY_CONTRACT §12.9).
+  dailyScopeAccumulate* = "accumulate-v2"
 
 proc restDomainFor*(environment: string): string =
   ## The REST domain derived from the selected environment — the official
@@ -197,7 +216,8 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
                           pricCnd, trdePricaCnd, stexTp: string;
                           params: Params; calendar: HcjValue;
                           tokenSource = "kiwoomcli";
-                          runId = ""): CollectorConfig =
+                          runId = "";
+                          dailyScope = ""): CollectorConfig =
   ## Build and validate the collector configuration. The approved PH-1
   ## values are pinned here (README §5/§6.1): environment-derived
   ## endpoints, page cap 10, repoll 300 s, drain 10 s, ack timeout 10 s,
@@ -228,6 +248,14 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     for c in runId.items:
       if c in {'/', '\\', ' ', '\t', '\n', '\r'}:
         raise cerr("run_id must be a directory basename: " & runId)
+  # config.daily_scope (REPLAY_CONTRACT §12.9): absent/"" is the legacy
+  # single-page-initial-pair scope (no key recorded, streams byte-identical);
+  # the explicit legacy name and the FIFO accumulate-v2 scope are the only
+  # other declared values. Anything else is refused, never silently run.
+  if dailyScope.len > 0 and dailyScope != dailyScopeLegacy and
+     dailyScope != dailyScopeAccumulate:
+    raise cerr("daily_scope must be \"\", " & dailyScopeLegacy & " or " &
+               dailyScopeAccumulate & ": " & dailyScope)
   # The declared query scope must be inside the documented enums for both
   # directions before anything is recorded or sent.
   discard initKa10027Query(dirUp, mrktTp, trdeQtyCnd, stkCnd, crdCnd,
@@ -254,6 +282,7 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     profile: profile,
     tokenSource: tokenSource,
     runId: runId,
+    dailyScope: dailyScope,
     params: params,
     calendar: calendar)
 
@@ -265,7 +294,10 @@ proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
   ## seq 1 (calendar, the approved snapshot verbatim) and seq 2 (config
   ## with every approved PH-1 value recorded — README §6.1). run_id is
   ## recorded only when set: an empty runId keeps the config record — and
-  ## therefore every legacy sealed stream — byte-identical. The
+  ## therefore every legacy sealed stream — byte-identical. daily_scope is
+  ## recorded only when set too (the P24 optional-field pattern): an
+  ## absent/empty scope changes not a single byte of the config record and
+  ## keeps the legacy single-page-initial-pair sweep. The
   ## events_contract marker names the event judgment contract the run's
   ## stream carries (top10-v1); it is recorded on every new run and never
   ## read back by the judgment (which re-derives from the preserved
@@ -304,6 +336,8 @@ proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
         ("trend_min_bp", hInt(cfg.params.trendMinBp)),
         ("warmup_bars", hInt(cfg.params.warmupBars)))),
       ("repoll_seconds", hInt(cfg.repollSeconds))]
+    if cfg.dailyScope.len > 0:
+      pairs.add(("daily_scope", hStr(cfg.dailyScope)))
     if cfg.runId.len > 0:
       pairs.add(("run_id", hStr(cfg.runId)))
     pairs.add(("selection_policy", hStr(selectionPolicyId)))
@@ -623,7 +657,8 @@ proc dailyUniverseOf(c: Collector; upPages, downPages: seq[RawHttpResp];
   ## Out-of-shape codes (the rows the derivation partitioned into
   ## upExcluded/downExcluded) are included: each is a legitimate query
   ## symbol and its capture outcome is judged per symbol, fail-closed.
-  ## Built exactly once, and only for a confirmed non-empty pair.
+  ## Built for the initial pair, and only for a confirmed non-empty one; the
+  ## accumulate-v2 scope reuses it per later poll round (extendDailyUniverse).
   let upChain = PageChain(query: c.cfg.queryOf(dirUp), pages: upPages)
   let downChain = PageChain(query: c.cfg.queryOf(dirDown), pages: downPages)
   let upCodes = chainSymbols(ka10027Spec, upChain, c.cfg.pageCap, upTruncated)
@@ -636,6 +671,23 @@ proc dailyUniverseOf(c: Collector; upPages, downPages: seq[RawHttpResp];
     if i < downCodes.len and downCodes[i] notin result:
       result.add(downCodes[i])
     inc i
+
+proc extendDailyUniverse(c: var Collector; upPages, downPages: seq[RawHttpResp];
+                         upTruncated, downTruncated: bool) =
+  ## accumulate-v2 (REPLAY_CONTRACT §12.9): append a later poll round's new
+  ## symbols to the FIFO sweep universe in vendor appearance order. The
+  ## legacy scope never extends — a symbol that appears only in a later
+  ## poll round stays uncaptured and is never re-issued. dailySeen is the
+  ## assignment ledger: an already-queued (or already-swept) symbol is
+  ## never appended twice, so no capture is ever repeated. The sweep ends at
+  ## teardown: after the close evidence a completing poll chain extends
+  ## nothing (the daily_universe_unfinished gap is already recorded).
+  if c.cfg.dailyScope != dailyScopeAccumulate: return
+  if c.closeSeen: return
+  for sym in dailyUniverseOf(c, upPages, downPages, upTruncated, downTruncated):
+    if sym notin c.dailySeen:
+      c.dailySeen.incl(sym)
+      c.dailyUniverse.add(sym)
 
 proc dailyRespRecord(c: Collector; stkCd: string; resp: RawHttpResp): RecOut =
   ## One rest_resp record of the daily sweep (rest_resp.nim ka10081 schema:
@@ -660,13 +712,13 @@ proc dailyRespRecord(c: Collector; stkCd: string; resp: RawHttpResp): RecOut =
     ("status", hInt(resp.status))))
 
 proc dailyStep(c: var Collector): seq[Directive] =
-  ## Issue the next daily_req of the once-per-session sweep, if and only if
-  ## the universe was explicitly finalized and a symbol remains: one
-  ## request in flight at a time, each universe symbol exactly once (no
-  ## re-issue on re-poll — a symbol that appears only in a later poll
-  ## round stays uncaptured and is excluded downstream), and nothing new
-  ## after the close evidence or outside the active phases
-  ## (teardown/drain/end issue nothing).
+  ## Issue the next daily_req of the sweep, if and only if the universe was
+  ## explicitly finalized and a symbol remains: one request in flight at a
+  ## time, each universe symbol at most once (accumulate-v2 appends only
+  ## unseen symbols, so a later poll round can resume an exhausted queue
+  ## but never re-issue a capture), and nothing new after the close
+  ## evidence or outside the active phases (teardown/drain/end issue
+  ## nothing).
   if not c.dailyReady: return @[]
   if c.dailyPending.len > 0: return @[]
   if c.dailyCursor >= c.dailyUniverse.len: return @[]
@@ -686,6 +738,35 @@ proc dailySkipRecord(stkCd, detail, t: string): RecOut =
     "ka10081 daily capture failed (stk_cd " & stkCd & "): " & detail &
     " — the symbol is skipped, excluded from this session's daily-bar " &
     "evidence, never marked captured", t)
+
+proc dailyCompletedDays(c: Collector; rows: seq[HcjValue]): int =
+  ## Distinct completed trading days in an affirmed ka10081 page: the dt
+  ## values strictly before the session date (the session date's own row
+  ## is the in-progress first bar, so the strict comparison excludes it).
+  let sessionDigits = c.cfg.sessionDate.replace("-", "")
+  var seen = initHashSet[string]()
+  for row in rows:
+    let dto = row.getOpt("dt")
+    if dto.isNone or dto.get.kind != hkStr: continue
+    let dt = dto.get.strVal
+    if dt.len > 0 and dt < sessionDigits and dt notin seen:
+      seen.incl(dt)
+      inc result
+
+proc dailyHistoryShortGap(c: Collector; stkCd: string; rows: seq[HcjValue];
+                          t: string): Option[RecOut] =
+  ## accumulate-v2 (REPLAY_CONTRACT §12.9): fewer than 20 completed trading
+  ## days behind base_dt is the daily_history_short gap. The legacy scope
+  ## records nothing — an empty/absent daily_scope changes no byte.
+  if c.cfg.dailyScope != dailyScopeAccumulate:
+    return none(RecOut)
+  let completed = c.dailyCompletedDays(rows)
+  if completed >= 20:
+    return none(RecOut)
+  some(gapRecord(stkCd, "daily_history_short",
+    "ka10081 daily history has " & $completed & " completed trading days " &
+    "strictly before " & c.cfg.sessionDate.replace("-", "") &
+    " (need 20): the opening-MA20 warmup is short", t))
 
 proc maybeTeardown(c: var Collector; records: var seq[RecOut];
                    t: string): seq[Directive]
@@ -882,13 +963,17 @@ proc chainAdvance(c: var Collector; records: var seq[RecOut];
   if finished.purpose == cpInitial:
     c.candPending = cand
     c.candidatesKnown = true
-    # The once-per-session ka10081 daily sweep (VS-1, REPLAY_CONTRACT §12.9):
-    # the universe is the first complete non-empty initial pair's row
-    # stk_cd union — built here, exactly once from that snapshot; a
-    # re-poll round never extends it (a symbol that appears only later
-    # stays uncaptured, excluded downstream).
+    # The ka10081 daily sweep (VS-1, REPLAY_CONTRACT §12.9): the universe
+    # is seeded from the first complete non-empty initial pair's row stk_cd
+    # union. Under accumulate-v2 this is the FIFO seed (later poll rounds
+    # append their new symbols via extendDailyUniverse); under the legacy
+    # scope a symbol that appears only in a later round stays uncaptured.
     c.dailyUniverse = dailyUniverseOf(c, upPages, downPages,
                                       finished.firstTruncated, truncated)
+    if c.cfg.dailyScope == dailyScopeAccumulate:
+      c.dailySeen = initHashSet[string]()
+      for sym in c.dailyUniverse:
+        c.dailySeen.incl(sym)
     c.dailyReady = true
     c.dailyCursor = 0
     c.dailyPending = ""
@@ -913,6 +998,13 @@ proc chainAdvance(c: var Collector; records: var seq[RecOut];
       result.add(c.issueReg(records, data, t))
       c.awaiting = awSwapReg
       c.awaitingGen = c.subGen
+  # accumulate-v2 (REPLAY_CONTRACT §12.9): a completed poll pair extends the
+  # FIFO sweep universe with that round's new symbols and the sweep resumes.
+  # Queue exhaustion is not completion — a later round's append resumes it.
+  # The legacy scope returns immediately from extendDailyUniverse.
+  c.extendDailyUniverse(upPages, downPages, finished.firstTruncated, truncated)
+  for d in c.dailyStep():
+    result.add(d)
   c.phase = phStreaming
 
 proc handleWsPayload(c: var Collector; records: var seq[RecOut];
@@ -977,6 +1069,17 @@ proc beginTeardown(c: var Collector; records: var seq[RecOut];
   ## Close evidence observed: remove the full active 0B generation. With
   ## no active codes there is no honest REMOVE (composeRemoveData rejects
   ## empty) and the minimum close evidence can never complete — INCOMPLETE.
+  if c.cfg.dailyScope == dailyScopeAccumulate and
+     (c.dailyCursor < c.dailyUniverse.len or c.dailyPending.len > 0):
+    # REPLAY_CONTRACT §12.9: queue exhaustion is not completion, but the
+    # sweep does end at teardown — a still pending queue is recorded here
+    # (remaining count, cursor, queue size, the symbol in flight).
+    let remaining = c.dailyUniverse.len - c.dailyCursor
+    records.add(gapRecord("", "daily_universe_unfinished",
+      "accumulate-v2 daily sweep unfinished at teardown: remaining " &
+      $remaining & ", cursor " & $c.dailyCursor & ", queue size " &
+      $c.dailyUniverse.len & ", pending " &
+      (if c.dailyPending.len > 0: c.dailyPending else: "none"), t))
   let active = c.guard.active0BCodes()
   if active.len == 0:
     return c.goIncomplete(records, t,
@@ -1124,8 +1227,15 @@ proc handleEvent*(c: var Collector; line: string;
     # per-symbol skip policy must not reject the whole sealed stream. A
     # failed capture is the honest gap and the symbol is skipped.
     try:
-      discard parsePageRows(ka10081Spec, resp)
+      let rows = parsePageRows(ka10081Spec, resp)
       records.add(c.dailyRespRecord(sym, resp))
+      # accumulate-v2 only (REPLAY_CONTRACT §12.9): an affirmed capture
+      # with fewer than 20 completed days is recorded as daily_history_short
+      # for that symbol. The rest_resp record itself is unchanged, and the
+      # legacy scope records neither.
+      let short = c.dailyHistoryShortGap(sym, rows, t)
+      if short.isSome:
+        records.add(short.get)
     except VendorInputError as e:
       records.add(dailySkipRecord(sym, e.msg, t))
     c.dailyPending = ""

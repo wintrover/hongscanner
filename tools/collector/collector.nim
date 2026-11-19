@@ -29,6 +29,7 @@ const usageText = """collector — the VS-2 live collector (demo|real)
             --calendar=<path>
             [--environment=demo]
             [--token-source=kiwoomcli]
+            [--daily-scope=single-page-initial-pair|accumulate-v2]
             [--mrkt-tp=000 --trde-qty-cnd=0000 --stk-cnd=0 --crd-cnd=0
              --updown-incls=1 --pric-cnd=0 --trde-prica-cnd=0 --stex-tp=1]
             [--lookback-bars=3 --warmup-bars=0 --trend-min-bp=50
@@ -49,6 +50,12 @@ APP_KEY_REAL/APP_SECRET_REAL for real; README §5.1 — the cloud
 container path). Any other value is refused. The env path never
 substitutes one environment's credentials for the other: a real session
 refuses to start on demo variables, and vice versa.
+
+--daily-scope names the ka10081 sweep universe scope (REPLAY_CONTRACT
+§12.9): "" (default — the legacy scope, no config key recorded) or
+"single-page-initial-pair" (the same legacy scope declared explicitly)
+or "accumulate-v2" (the FIFO universe: each later poll round appends its
+new symbols and the sweep resumes). Any other value is refused.
 
 Exit codes: 0 normal, 2 usage/contract, 4 INCOMPLETE (unsealed, preserved).
 """
@@ -242,6 +249,7 @@ proc main(): int =
                     else:
                       "demo"
   let tokenSource = argValue(args, "token-source").defaultStr("kiwoomcli")
+  let dailyScope = argValue(args, "daily-scope")
   if profile.len == 0 or sessionDate.len == 0 or outDir.len == 0:
     fail(2, "collector requires --profile, --session-date and --out")
   if calendarPath.len == 0:
@@ -288,7 +296,8 @@ proc main(): int =
             "hold-on-degraded") != 0),
       readDocFile(calendarPath),
       tokenSource,
-      lastPathPart(outDir))
+      lastPathPart(outDir),
+      dailyScope = dailyScope)
   except CollectorError as e:
     fail(2, "COLLECTOR CONFIG: " & e.msg)
   except CoverageError as e:

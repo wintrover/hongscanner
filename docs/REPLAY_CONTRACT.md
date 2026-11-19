@@ -565,6 +565,14 @@ contract on the same `rest_resp` envelope as §12.1/§12.8:
     appended and the sweep resumes. The sweep ends at teardown; a still
     pending queue is the `daily_universe_unfinished` gap (remaining count,
     cursor, queue size).
+    An affirmed capture whose completed-day count is below 20 records the
+    `daily_history_short` gap for that symbol (the completed-day count in
+    the detail); completed days are the distinct `dt` values strictly
+    before the session date (the session's in-progress first bar is
+    excluded). The `rest_resp` record itself is unchanged and is always
+    recorded, so the shortfall is additional evidence, never a
+    replacement. The legacy scope records neither gap — an empty/absent
+    `daily_scope` keeps every legacy byte.
   - Before the first non-empty pair the sweep stays unstarted and the
     re-poll loop records the `daily_universe_waiting` gap (the empty-universe
     branch of the §12.1 first-completion rule).

@@ -4,7 +4,7 @@
 ## credentials. The stream-level end-to-end lives in
 ## test_collector_stream_contract.nim.
 ## Run: nim c -r --hints:off --warnings:off --path:src tests/test_collector_contract.nim
-import std/[strutils]
+import std/[strutils, sets]
 import hs/[hcj, records, calendars, engine, sub_input, vendor_input,
            rest_resp, tickwire, subcheck, collector]
 
@@ -42,14 +42,14 @@ proc calRaw(): HcjValue =
   hObj(("days", hObj(
     ("2026-10-29", day("09:00:00+09:00", "15:30:00+09:00")))))
 
-proc newCollector(): Collector =
+proc newCollector(dailyScope = ""): Collector =
   startCollector(initCollectorConfig(
     "2026-10-29", "demo", "demo-profile",
     "000", "0000", "0", "0", "1", "0", "0", "1",
     Params(warmupBars: 0, lookbackBars: 3, trendMinBp: 50,
            countermoveMinBp: 50, directionalTriggerBp: 30,
            holdOnDegraded: true),
-    calRaw()))
+    calRaw(), dailyScope = dailyScope))
 
 proc newCfg(tokenSource: string): CollectorConfig =
   ## The same approved config with an explicit init-line token_source
@@ -126,6 +126,44 @@ proc step(c: var Collector; line: string): (seq[RecOut], seq[Directive]) =
   var recs: seq[RecOut]
   let dirs = c.handleEvent(line, recs)
   (recs, dirs)
+
+proc evRestDaily(status: int; body: string; contYn = "Y";
+                 nextKey = "A0059302024052200010000"; t = ts): string =
+  ev("rest_daily", t,
+     ("api_id", hStr(ka10081ApiId)), ("body_hex", hStr(hexOf(body))),
+     ("cont_yn", hStr(contYn)), ("next_key", hStr(nextKey)),
+     ("page", hInt(1)), ("status", hInt(status)))
+
+proc dailyBody(stkCd: string; dts: openArray[string]): string =
+  ## A measured-shape ka10081 success body: the 12 measured row fields,
+  ## the top-level stk_cd echo, and (measured) cont-yn=Y carried by the
+  ## event — legitimate on the single-page declared scope.
+  var rows: seq[string]
+  for d in dts:
+    rows.add("{\"cur_prc\":\"187000\",\"dt\":\"" & d & "\"," &
+      "\"high_pric\":\"195400\",\"low_pric\":\"183800\"," &
+      "\"open_pric\":\"187200\",\"pred_pre\":\"-1700\"," &
+      "\"pred_pre_sig\":\"5\",\"trde_prica\":\"3790580\"," &
+      "\"trde_qty\":\"19855892\",\"trde_tern_rt\":\"+0.34\"," &
+      "\"upd_rt\":\"\",\"upd_stkpc_tp\":\"\"}")
+  "{\"return_code\":0,\"return_msg\":\"정상적으로 처리되었습니다\"," &
+    "\"stk_cd\":\"" & stkCd & "\",\"stk_dt_pole_chart_qry\":[" &
+    rows.join(",") & "]}"
+
+proc completedDts(n: int): seq[string] =
+  ## n distinct completed days strictly before the 2026-10-29 session date
+  ## (only distinct YYYYMMDD strings matter to the history-short count).
+  for i in 1 .. n:
+    result.add("202610" & align($(29 - i), 2, '0'))
+
+proc startToInitialPair(c: var Collector; upCodes, downCodes: openArray[string]):
+    (seq[RecOut], seq[Directive]) =
+  ## The common opener up to and including the initial chain pair.
+  discard c.step(ev("ready", ts))
+  discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+  discard c.step(evWs(1, ackPayload()))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(upCodes)))
+  c.step(evRest("down", 1, 200, "N", "", restBody(downCodes)))
 
 proc kinds(recs: seq[RecOut]): seq[string] =
   for r in recs: result.add(kindName(r.kind))
@@ -711,29 +749,6 @@ block dailySweep:
   ## request in flight at a time, each symbol exactly once, an affirmed
   ## response recorded as a rest_resp record, a failed capture as the
   ## daily_capture_failed gap (fail-closed per symbol, never per session).
-  proc evRestDaily(status: int; body: string; contYn = "Y";
-                   nextKey = "A0059302024052200010000"; t = ts): string =
-    ev("rest_daily", t,
-       ("api_id", hStr(ka10081ApiId)), ("body_hex", hStr(hexOf(body))),
-       ("cont_yn", hStr(contYn)), ("next_key", hStr(nextKey)),
-       ("page", hInt(1)), ("status", hInt(status)))
-
-  proc dailyBody(stkCd: string; dts: openArray[string]): string =
-    ## A measured-shape ka10081 success body: the 12 measured row fields,
-    ## the top-level stk_cd echo, and (measured) cont-yn=Y carried by the
-    ## event — legitimate on the single-page declared scope.
-    var rows: seq[string]
-    for d in dts:
-      rows.add("{\"cur_prc\":\"187000\",\"dt\":\"" & d & "\"," &
-        "\"high_pric\":\"195400\",\"low_pric\":\"183800\"," &
-        "\"open_pric\":\"187200\",\"pred_pre\":\"-1700\"," &
-        "\"pred_pre_sig\":\"5\",\"trde_prica\":\"3790580\"," &
-        "\"trde_qty\":\"19855892\",\"trde_tern_rt\":\"+0.34\"," &
-        "\"upd_rt\":\"\",\"upd_stkpc_tp\":\"\"}")
-    "{\"return_code\":0,\"return_msg\":\"정상적으로 처리되었습니다\"," &
-      "\"stk_cd\":\"" & stkCd & "\",\"stk_dt_pole_chart_qry\":[" &
-      rows.join(",") & "]}"
-
   var c = newCollector()
   discard c.step(ev("ready", ts))
   discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
@@ -937,6 +952,149 @@ block dailySweepTransport:
       ("what", hStr("rest"))), r))
 
 
+
+# ------------------------------------------- daily_scope versions (§12.9)
+
+block dailyScopeConfig:
+  ## REPLAY_CONTRACT §12.9: the optional config.daily_scope — absent/"" keeps
+  ## the legacy config record key-free (byte-identical streams); the two
+  ## declared values are recorded verbatim; anything else is refused.
+  let pre = newCollector().cfg.preambleRecords()
+  check("an absent/empty daily scope leaves the config record key-free",
+        "daily_scope" notin canonical(pre[1].raw))
+  check("the explicit legacy scope is recorded",
+        "\"daily_scope\":\"" & dailyScopeLegacy & "\"" in
+          canonical(newCollector(dailyScope = dailyScopeLegacy)
+            .cfg.preambleRecords()[1].raw))
+  check("the accumulate-v2 scope is recorded",
+        "\"daily_scope\":\"" & dailyScopeAccumulate & "\"" in
+          canonical(newCollector(dailyScope = dailyScopeAccumulate)
+            .cfg.preambleRecords()[1].raw))
+  coreErr("an unknown daily scope is refused", "daily_scope must be",
+          proc () =
+            discard newCollector(dailyScope = "accumulate-v3"))
+
+block accumulateSweep:
+  ## accumulate-v2: the initial pair seeds a FIFO queue; queue exhaustion is
+  ## not completion (a later poll round's new symbol is appended and the
+  ## sweep resumes); an already-seen symbol is never re-issued.
+  var c = newCollector(dailyScope = dailyScopeAccumulate)
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = startToInitialPair(c, ["005930"], ["000660"])
+  check("accumulate-v2 seeds the FIFO universe from the initial pair",
+        c.dailyUniverse == @["005930", "000660"] and c.dailySeen.len == 2 and
+        c.dailyCursor == 1 and c.dailyPending == "005930" and
+        dirs.dirKinds() == @["reg", "daily_req"] and
+        dirs[1].daily.stkCd == "005930")
+  discard c.step(evWs(1, ackPayload()))
+  (recs, dirs) = c.step(evRestDaily(200,
+    dailyBody("005930", completedDts(20))))
+  check("the first capture advances the sweep",
+        recs.kinds() == @["rest_resp"] and c.dailyPending == "000660" and
+        c.dailyCursor == 2 and dirs.dirKinds() == @["daily_req"] and
+        dirs[0].daily.stkCd == "000660")
+  (recs, dirs) = c.step(evRestDaily(200,
+    dailyBody("000660", completedDts(20))))
+  check("queue exhaustion is not completion: no directive until an append",
+        recs.kinds() == @["rest_resp"] and dirs.len == 0 and
+        c.dailyPending == "" and c.dailyCursor == 2)
+  discard c.step(ev("timer", ts, ("kind", hStr("poll"))))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(@["005930"])))
+  (recs, dirs) = c.step(evRest("down", 1, 200, "N", "",
+                               restBody(@["777777"])))
+  check("a later poll round appends its new symbol and resumes the sweep",
+        c.dailyUniverse == @["005930", "000660", "777777"] and
+        c.dailySeen.len == 3 and c.dailyCursor == 3 and
+        c.dailyPending == "777777" and
+        dirs.dirKinds() == @["remove", "daily_req"] and
+        dirs[1].daily.stkCd == "777777")
+  (recs, dirs) = c.step(evRestDaily(200,
+    dailyBody("777777", completedDts(20))))
+  check("the resumed sweep completes without re-issuing a seen symbol",
+        recs.kinds() == @["rest_resp"] and dirs.len == 0 and
+        c.dailyPending == "" and c.dailyUniverse.len == 3)
+
+block legacySweep:
+  ## The explicit legacy scope never extends: the same later poll round's
+  ## new symbol stays uncaptured and receives no daily_req (the absent-key
+  ## legacy path is covered by the dailySweep block above).
+  var c = newCollector(dailyScope = dailyScopeLegacy)
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = startToInitialPair(c, ["005930"], ["000660"])
+  discard c.step(evWs(1, ackPayload()))
+  (recs, dirs) = c.step(evRestDaily(200,
+    dailyBody("005930", completedDts(20))))
+  (recs, dirs) = c.step(evRestDaily(200,
+    dailyBody("000660", completedDts(20))))
+  discard c.step(ev("timer", ts, ("kind", hStr("poll"))))
+  discard c.step(evRest("up", 1, 200, "N", "", restBody(@["005930"])))
+  (recs, dirs) = c.step(evRest("down", 1, 200, "N", "", restBody(@["777777"])))
+  check("the legacy scope never extends the universe across poll rounds",
+        c.dailyUniverse == @["005930", "000660"] and c.dailySeen.len == 0 and
+        c.dailyCursor == 2 and c.dailyPending == "" and
+        "daily_req" notin dirs.dirKinds())
+
+block dailyScopeTeardown:
+  ## REPLAY_CONTRACT §12.9: the sweep ends at teardown; a still pending
+  ## queue is the daily_universe_unfinished gap under accumulate-v2 and
+  ## nothing under the legacy scope.
+  var c = newCollector(dailyScope = dailyScopeAccumulate)
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = startToInitialPair(c, ["005930"], ["000660"])
+  discard c.step(evWs(1, ackPayload()))
+  (recs, dirs) = c.step(evWs(1, state0S("4")))
+  check("an unfinished accumulate-v2 queue is the teardown gap",
+        recs.kinds() == @["ws_raw", "gap", "sub"] and
+        recs[1].raw.get("what").strVal == "daily_universe_unfinished" and
+        recs[1].raw.get("symbol").isNull and
+        "remaining 1" in recs[1].raw.get("detail").strVal and
+        "cursor 1" in recs[1].raw.get("detail").strVal and
+        "queue size 2" in recs[1].raw.get("detail").strVal and
+        "pending 005930" in recs[1].raw.get("detail").strVal and
+        dirs.dirKinds() == @["remove"] and c.closeSeen)
+  var l = newCollector()
+  (recs, dirs) = startToInitialPair(l, ["005930"], ["000660"])
+  discard l.step(evWs(1, ackPayload()))
+  (recs, dirs) = l.step(evWs(1, state0S("4")))
+  check("the legacy scope records no unfinished-universe gap",
+        recs.kinds() == @["ws_raw", "sub"] and
+        dirs.dirKinds() == @["remove"])
+  var swept = newCollector(dailyScope = dailyScopeAccumulate)
+  (recs, dirs) = startToInitialPair(swept, ["005930"], ["000660"])
+  discard swept.step(evWs(1, ackPayload()))
+  discard swept.step(evRestDaily(200, dailyBody("005930", completedDts(20))))
+  discard swept.step(evRestDaily(200, dailyBody("000660", completedDts(20))))
+  (recs, dirs) = swept.step(evWs(1, state0S("4")))
+  check("a fully swept accumulate-v2 queue records no unfinished gap",
+        recs.kinds() == @["ws_raw", "sub"] and
+        dirs.dirKinds() == @["remove"])
+
+block dailyHistoryShort:
+  ## accumulate-v2: an affirmed capture with fewer than 20 completed days is
+  ## the daily_history_short gap for that symbol; 20 is enough, and the
+  ## legacy scope records neither.
+  var c = newCollector(dailyScope = dailyScopeAccumulate)
+  var recs: seq[RecOut]
+  var dirs: seq[Directive]
+  (recs, dirs) = startToInitialPair(c, ["005930"], ["000660"])
+  (recs, dirs) = c.step(evRestDaily(200, dailyBody("005930", @["20261029"])))
+  check("zero completed days under accumulate-v2 is daily_history_short",
+        recs.kinds() == @["rest_resp", "gap"] and
+        recs[1].raw.get("what").strVal == "daily_history_short" and
+        recs[1].raw.get("symbol").strVal == "005930" and
+        "0 completed trading days" in recs[1].raw.get("detail").strVal)
+  (recs, dirs) = c.step(evRestDaily(200,
+    dailyBody("000660", completedDts(20))))
+  check("twenty completed days record only the rest_resp",
+        recs.kinds() == @["rest_resp"])
+  var l = newCollector()
+  (recs, dirs) = startToInitialPair(l, ["005930"], ["000660"])
+  (recs, dirs) = l.step(evRestDaily(200, dailyBody("005930", @["20261029"])))
+  check("the legacy scope records no daily_history_short gap",
+        recs.kinds() == @["rest_resp"])
 
 # ---------------------------------------------------- parse-failure counting
 
