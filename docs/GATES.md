@@ -1141,5 +1141,8 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 | main attest | 런 [44478531310](https://github.com/wintrover/hongscanner/actions/runs/44478531310) success |
 | 서버 | `66d9ffb` 고정 유지, `git status --porcelain` 0줄, 세션 타이머 NEXT 2026-11-20 08:50 |
 | 노트북 관측 | NEXT 2026-11-20 08:58, ExecStart `--window 2026-11-20T08:58:00+09:00/2026-11-20T09:45:00+09:00` |
+| 노트북 달력 입력 | `~/.local/share/hongscanner/calendars/krx-2026q4.json`가 `05dee867…`(**11/19 open 09:00** — 승인본과 불일치)였다. 승인본 `db895b09…`로 교체하고 `calendars/krx-2027.json`도 함께 반입해 `sha256sum -c calendars/CALENDAR_INDEX.sha256` **2/2 OK**. 달력 JSON은 gitignore 대상이라 기계마다 인덱스로 검증해야 한다 |
+
+**달력 무결성 사전점검**: `calendars/CALENDAR_INDEX.sha256`만 커밋되고 JSON은 gitignore다. 노트북 사본은 11/19 개장을 09:00으로 적은 오래된 파일이었고, 11/20 값(09:00)은 우연히 같아 판정은 바뀌지 않았지만 입력 해시가 승인 인덱스와 달라 증거 사슬이 끊길 수 있었다. 교체 후 서버·노트북 모두 `db895b09…`다.
 
 **경계**: 11/19 P0는 여전히 **FAILED**다. 11/20 09:00 피크 판정은 아직 없다 — 관측 창과 판정기가 준비됐을 뿐, 수용은 실측 뒤에만 기록한다.
