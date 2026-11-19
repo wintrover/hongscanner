@@ -409,6 +409,20 @@ class AttestationTests(unittest.TestCase):
         self.assertTrue(report["vacuous"])
         self.assertIsNone(report["coverage"])
 
+    def test_failed_peak_delivery_is_not_vacuous(self):
+        # FCM이 실패한 피크 그룹은 ACCEPTED가 없어 expected에서도 빠진다.
+        # 그대로 두면 분모가 0이 되어 조용히 통과한다 — 실패로 남긴다.
+        self.case.deliveries = [
+            delivery(EVENT_A, "single", state="FAILED"),
+            delivery(EVENT_B, "summary", state="FAILED")]
+        self.case.observer = default_heartbeats() + [observer_end()]
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "COVERAGE_INCOMPLETE")
+        self.assertEqual(sorted(report["undelivered"]), sorted([TAG_A, TAG_B]))
+        self.assertEqual(report["expected_count"], 0)
+        self.assertTrue(report["vacuous"])
+
     def test_no_peak_groups_is_vacuous_acceptance(self):
         # 시장이 실제로 그룹을 만들지 않은 날은 소리가 0번 나는 것이 정상이다.
         # 다만 vacuous=true로 드러내 조용한 통과를 숨기지 않는다.

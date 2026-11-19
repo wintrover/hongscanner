@@ -187,21 +187,22 @@ def _delivery_facts(delivery_path, events, peak, device_id, window):
       분모이자, 전부 관측되어야 하는 집합.
     accounted: 세션 원장이 주장하는 모든 가청 발송 tag. 기기에만 보이는
       미계상 tag를 가려내는 기준 — 피크 밖 그룹은 여기 속할 뿐 실패가 아니다.
-    late: 피크 그룹인데 관측 창 밖에서 발송된 tag. 관측자가 증명할 수 없는
-      구간이므로 성공으로 접지 않는다(fail-closed).
+    late: 피크 그룹인데 ACCEPTED 발송이 관측 창 밖인 tag. 관측자가 증명할 수
+      없는 구간이므로 성공으로 접지 않는다(fail-closed).
+    undelivered: 피크 그룹인데 ACCEPTED 발송이 하나도 없는 tag. FCM 실패·미완료
+      그룹이 분모에서 조용히 빠지는 fail-open을 막는다.
     preopen: 개장 전 관측 이벤트가 피크 중에 가청 발송된 증거.
     unclassified: 종류를 알 수 없는 ACCEPTED 발송. 가청 여부를 판정할 수
       없으므로 fail-closed.
     """
     peak_tags = set()
+    dispatched_peak = set()
     expected = set()
     accounted = set()
     preopen = []
     seen_preopen = set()
     unclassified = set()
     for record in _read_jsonl(delivery_path):
-        if record.get("state") != "ACCEPTED":
-            continue
         if record.get("device_id") != device_id:
             continue
         event_id = record.get("event_id")
@@ -209,20 +210,27 @@ def _delivery_facts(delivery_path, events, peak, device_id, window):
         if event is None:
             continue
         kind = record.get("message_kind")
+        accepted = record.get("state") == "ACCEPTED"
         if not _known_kind(kind):
-            unclassified.add(event_id)
+            if accepted:
+                unclassified.add(event_id)
             continue
         if kind not in AUDIBLE_KINDS:
+            continue
+        tag = group_tag(event["observed_at"], device_id)
+        in_peak = peak["open"] <= event["at"] < peak["end"]
+        if in_peak:
+            peak_tags.add(tag)
+            if accepted:
+                dispatched_peak.add(tag)
+        if not accepted:
             continue
         emitted = _moment(record.get("updated_at"))
         if emitted is None:
             raise InputError("%s: delivery %s has no aware updated_at"
                              % (delivery_path, event_id))
-        tag = group_tag(event["observed_at"], device_id)
         accounted.add(tag)
-        in_peak = peak["open"] <= event["at"] < peak["end"]
         if in_peak:
-            peak_tags.add(tag)
             if window["start"] is not None and window["end"] is not None and \
                     window["start"] <= emitted <= window["end"]:
                 expected.add(tag)
@@ -237,7 +245,8 @@ def _delivery_facts(delivery_path, events, peak, device_id, window):
                                 "tag": tag})
     return {"expected": expected,
             "accounted": accounted,
-            "late": peak_tags - expected,
+            "late": dispatched_peak - expected,
+            "undelivered": peak_tags - dispatched_peak,
             "preopen": preopen,
             "unclassified": unclassified}
 
@@ -446,6 +455,7 @@ def _empty_report(inputs, tool):
         "missing": [],
         "unaccounted": [],
         "late": [],
+        "undelivered": [],
         "preopen_delivered": [],
         "unclassified_accepted": [],
         "completeness": {},
@@ -510,6 +520,7 @@ def attest(args):
         "missing": missing,
         "unaccounted": unaccounted,
         "late": late,
+        "undelivered": sorted(facts["undelivered"]),
         "preopen_delivered": facts["preopen"],
         "unclassified_accepted": sorted(facts["unclassified"]),
         "completeness": completeness,
@@ -518,7 +529,8 @@ def attest(args):
     if not completeness["ok"]:
         report["verdict"] = "OBSERVATION_INCOMPLETE"
         return report, EXIT_FAIL
-    if facts["unclassified"] or missing or unaccounted or late:
+    if facts["unclassified"] or missing or unaccounted or late or \
+            facts["undelivered"]:
         report["verdict"] = "COVERAGE_INCOMPLETE"
         return report, EXIT_FAIL
     if not contamination["ok"]:

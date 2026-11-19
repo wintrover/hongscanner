@@ -140,8 +140,10 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
 - `accounted` — 세션 원장이 주장하는 모든 가청 그룹. 기기에만 보이는 tag를
   가려내는 기준이다. 피크 밖 그룹이 여기 속하는 것은 실패가 아니다.
   `unaccounted = observed − accounted`만 `COVERAGE_INCOMPLETE`다.
-- `late` — 피크 그룹인데 관측 창 밖에서 발송된 tag. 관측자가 증명할 수 없는
-  구간이므로 분모에서 조용히 빼지 않고 실패로 남긴다.
+- `late` — 피크 그룹인데 ACCEPTED 발송이 관측 창 밖인 tag. 관측자가 증명할
+  수 없는 구간이므로 분모에서 조용히 빼지 않고 실패로 남긴다.
+- `undelivered` — 피크 그룹인데 ACCEPTED 발송이 하나도 없는 tag(FCM 실패·미완료).
+  이 집합이 없으면 실패한 그룹이 분모에서 빠져 0/0 통과가 된다.
 - `preopen_delivered` — 개장 전 관측 이벤트가 피크 중에 발송된 증거.
   `PREOPEN_CONTAMINATION`이다.
 
