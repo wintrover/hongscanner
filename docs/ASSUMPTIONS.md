@@ -303,9 +303,10 @@ still requires G2 credentials.
   누적거래량 · '14' 누적거래대금 · '290' 장구분 · '9081' KRX/NXT 구분;
   the value set carries **no per-trade unique identifier field** (checked).
 - ka10081 주식일봉차트조회요청 (demo measured 2026-11-10, transcripts
-  preserved at /tmp/hs-ka10081/REPORT.md·attempts.jsonl, agent-59; ka10081
-  is **absent from the official kiwoom_api_spec.json** — every fact below
-  is mock-measured, never official): `POST
+  preserved at /tmp/hs-ka10081/REPORT.md·attempts.jsonl, agent-59; the TR
+  **is listed in the official spec JSON** (`Kiwoom-Securities/Kiwoom-REST-API`)
+  — the query/row shape below is nonetheless the mock-measured one, and an
+  official rate figure does not override the measured mock limit): `POST
   https://mockapi.kiwoom.com/api/dostk/chart` (the same path as ka10080;
   the real-domain behavior is UNVERIFIED), api-id header `ka10081`, body
   `{"stk_cd","base_dt","upd_stkpc_tp"}` — **all three fields required**
@@ -330,9 +331,18 @@ still requires G2 credentials.
   TR flow ~1/s: sleepless consecutive requests → HTTP 429 + body
   return_code 5, recovered after ~1 s; 1.5 s pacing saw zero 429s (the
   sidecar paces daily_req through the shared REST pacer and retries 429
-  once after 1 s, then reports the final response). At 1 TR/s a full
-  ~2,500-symbol universe sweep takes ≈ 41.7 min. Production-environment
-  behavior: UNVERIFIED (G2/G4).
+  once after 1 s, then reports the final response). Re-measured 2026-11-19
+  with `tools/collector/pace_probe.py` (demo): 0.2 s → 5/10 429, 0.5 s →
+  3/10, 1.0 s → 1/10, **1.5 s → 0/12**, 2.0 s → 0/12; a mixed
+  ka10027/ka10081 loop at 1.0 s saw 0/12 — whether the undocumented
+  group/total caps (error codes 1701/1702) exist remains UNKNOWN. At the
+  operational 1.5 s pacing a full ~2,500-symbol sweep takes ≈ 62.5 min; at
+  1 TR/s it is ≈ 41.7 min. The official policy (portal `/intro`, notice
+  #49) is per account(token) per TR: real 조회 TR = 초당 5회, mock =
+  TR 1개당 1초 1회. The mock measurement therefore matches the documented
+  **mock** policy; the real 5/s figure is documented but UNMEASURED here
+  (no real credentials), so no real-domain pacing change is licensed.
+  Production-environment behavior: UNVERIFIED (G2/G4).
 - FCM / Android notification behavior (official Firebase + FlutterFire
   docs and plugin source, collected 2026-11-11 — the basis of the market
   alert slice): notification messages on Android are **not displayed while

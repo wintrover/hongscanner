@@ -511,8 +511,12 @@ The opening MA20 mode's daily-bar evidence (VS-1) declares its own capture
 contract on the same `rest_resp` envelope as §12.1/§12.8:
 
 - API: Kiwoom REST `ka10081` (주식일봉차트조회요청), `POST /api/dostk/chart`.
-  All vendor behavior here is mock-measured (ASSUMPTIONS "Vendor facts",
-  ka10081 entry); the TR is absent from the official spec JSON.
+  The TR is listed in the official spec JSON
+  (`Kiwoom-Securities/Kiwoom-REST-API`); the measured request/response shape
+  is recorded in ASSUMPTIONS "Vendor facts", ka10081 entry. An official
+  rate-limit figure is not a capture guarantee: the mock domain measured
+  ≈1 request/second on 2026-11-19 (GATES), and the real domain is UNKNOWN
+  until measured there.
 - Query scope: exactly `stk_cd`, `base_dt` (REQUIRED, YYYYMMDD, the session
   date without dashes) and `upd_stkpc_tp`, pinned to the declared capture
   scope `"1"` (the other measured value `"0"` is a valid vendor value but a
@@ -539,13 +543,44 @@ contract on the same `rest_resp` envelope as §12.1/§12.8:
   record — the symbol is skipped, excluded from this session's daily-bar
   evidence, never marked captured — and the session continues
   (fail-closed per symbol, not per session).
-- The sweep runs exactly once per session, started when the session's
-  initial chain pair (§12.1, first completion only — a re-poll round never
-  restarts it) completes. The universe is the initial pair's row `stk_cd`
-  union in vendor order (up chain rows then down chain rows, deduped,
-  candidate-shaped and non-candidate-shaped codes alike — the whole
-  recorded in-scope universe, not the selected subscription set). A symbol
-  that appears only in a later poll round stays uncaptured: no re-issue.
+- **Logical task and physical attempts**: one symbol's daily capture is one
+  logical task per session. Inside that task the sidecar may issue at most
+  two physical attempts (one initial + one bounded 429 retry, collector
+  README §2.8); the ledger records only the task's final outcome — one
+  affirming `rest_resp` or one `daily_capture_failed` gap. A ledger count of
+  ka10081 records is therefore a count of logical tasks, never of physical
+  requests.
+- **Universe scope is versioned by the optional `config.daily_scope`** (the
+  P24 optional-field pattern; a config without the field keeps the legacy
+  scope, so legacy streams replay byte-identically):
+  - absent or `"single-page-initial-pair"`: the universe is the initial
+    pair's row `stk_cd` union, interleaved by each leg's vendor appearance
+    order (up #1, down #1, up #2, …), deduped at first appearance. A symbol
+    that appears only in a later poll round stays uncaptured: no re-issue.
+  - `"accumulate-v2"`: the universe is a FIFO queue seeded from the initial
+    pair in the same interleaved order and extended at each later poll round
+    with that round's new symbols in vendor appearance order. `dailySeen`
+    prevents a second assignment; a symbol is captured at most once.
+    Queue exhaustion is NOT completion: a later round's new symbol is
+    appended and the sweep resumes. The sweep ends at teardown; a still
+    pending queue is the `daily_universe_unfinished` gap (remaining count,
+    cursor, queue size).
+    An affirmed capture whose completed-day count is below 20 records the
+    `daily_history_short` gap for that symbol (the completed-day count in
+    the detail); completed days are the distinct `dt` values strictly
+    before the session date (the session's in-progress first bar is
+    excluded). The `rest_resp` record itself is unchanged and is always
+    recorded, so the shortfall is additional evidence, never a
+    replacement. The legacy scope records neither gap — an empty/absent
+    `daily_scope` keeps every legacy byte.
+  - Before the first non-empty pair the sweep stays unstarted and the
+    re-poll loop records the `daily_universe_waiting` gap (the empty-universe
+    branch of the §12.1 first-completion rule).
+- Both scopes keep the one-page rule and the whole recorded in-scope
+  universe (candidate-shaped and non-candidate-shaped codes alike, not the
+  selected subscription set). The sweep starts when the session's initial
+  chain pair completes (§12.1, first completion only — a re-poll round
+  never restarts the seed).
 - `base_dt` is the session date (the day's in-progress first row included);
   the descending `dt` order, the unsigned `cur_prc` (closing price) and
   the `stk_cd` echo of the measured shape are preserved verbatim in

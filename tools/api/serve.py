@@ -156,7 +156,13 @@ OPS_ALERT_TIMEOUT_S = 10
 # these all-day-growing files is ever read.
 MARKET_ENVIRONMENTS = ("demo", "real")
 SESSION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-MARKET_CONFIG_HEAD_BYTES = 16384
+# The config/calendar head cap (README §3.7 적격 판정): a file within the
+# cap is read whole (the calendar snapshot's first record may be a large
+# approved calendar — the 2027 KRX snapshot is 49,460 bytes, well past
+# the old 16 KiB window); a file larger than the cap (the input grows all
+# day) is read only through the cap, and a committed config record that
+# is not inside it is a DataFault — never a silent drop.
+MARKET_CONFIG_HEAD_BYTES = 1024 * 1024
 MARKET_EVENTS_TAIL_BYTES = 65536
 MARKET_TOP_N = 10
 MARKET_HISTORY_N = 100
@@ -178,6 +184,13 @@ MARKET_SORT_FALLING = "3"
 MARKET_MA20_API = "ka10081"
 MARKET_MA20_LIST_KEY = "stk_dt_pole_chart_qry"
 MARKET_MA20_DAYS = 20
+# The failed-capture gap (REPLAY_CONTRACT §12.9): a ka10081 capture that
+# never produced an affirming rest_resp is recorded as one gap record
+# whose raw.what names the failure and whose raw.symbol is the skipped
+# symbol. The fold indexes these symbols (coverage attribution only —
+# a gap contributes no name, price or close). Any other gap kind is
+# scanned and contributes nothing.
+MARKET_CAPTURE_GAP_WHAT = "daily_capture_failed"
 # The VS-2 opening window (README §3.7) is owned by the single session-
 # time authority, tools/market_time.py (P30): [recorded session open,
 # open + PEAK_WINDOW) on the selected run's session_date. No 09:00
@@ -526,14 +539,26 @@ def _read_ledger_tail_inc(path, prev_state=None):
 
 def read_head_config(path):
     """The committed config record near the head of an input.hcj.jsonl —
-    the recorded identity of a real collection run. Bounded: only the
-    first MARKET_CONFIG_HEAD_BYTES are read (the file grows all day) and
-    parsing stops at the first kind:"config" record. A line counts only
-    if LF-terminated (a non-LF tail is not committed yet); a malformed
-    committed line before the config record is a DataFault — the same
-    discipline as read_committed_lines. Returns the config record's
-    `raw` object, or None when no committed config record is in the
-    window (absence is served, never guessed)."""
+    the recorded identity of a real collection run.
+
+    A file within MARKET_CONFIG_HEAD_BYTES is read whole; the larger
+    file (it grows all day) is read only through the cap. Lines count
+    only if LF-terminated (a non-LF tail is not committed yet) and
+    parsing stops at the first kind:"config" record; a malformed
+    committed line before it is a DataFault — the same discipline as
+    read_committed_lines. Returns the config record's `raw` object, or
+    None when a file within the cap holds no committed config record
+    (absence is served, never guessed). When the file EXCEEDS the cap
+    and no committed config record is inside it, that is a DataFault:
+    absence cannot be proven from a truncated head, so the run is never
+    silently dropped."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DataFault("%s unreadable: %s"
+                        % (os.path.basename(path), _reason(exc)))
     try:
         with open(path, "rb") as f:
             data = f.read(MARKET_CONFIG_HEAD_BYTES)
@@ -542,9 +567,14 @@ def read_head_config(path):
     except OSError as exc:
         raise DataFault("%s unreadable: %s"
                         % (os.path.basename(path), _reason(exc)))
+    over_cap = st.st_size > MARKET_CONFIG_HEAD_BYTES
     if data and not data.endswith(b"\n"):
         data = data[:data.rfind(b"\n") + 1]
     if not data:
+        if over_cap:
+            raise DataFault(
+                "%s has no committed line within the %d-byte config head"
+                % (os.path.basename(path), MARKET_CONFIG_HEAD_BYTES))
         return None
     name = os.path.basename(path)
     for i, raw in enumerate(data.split(b"\n")[:-1], start=1):
@@ -563,6 +593,9 @@ def read_head_config(path):
                 raise DataFault("%s line %d config raw is not a JSON "
                                 "object" % (name, i))
             return config
+    if over_cap:
+        raise DataFault("%s config record is not within the %d-byte head"
+                        % (name, MARKET_CONFIG_HEAD_BYTES))
     return None
 
 
@@ -612,6 +645,7 @@ class _MarketFoldState:
     __slots__ = (
         "path", "session_date", "st_dev", "st_ino", "offset", "line_no",
         "names", "snapshots", "chain", "pair_rising", "bars", "ma20",
+        "gaps", "affirmed", "sha",
     )
 
     def __init__(self, path, session_date, st_dev=0, st_ino=0):
@@ -627,6 +661,16 @@ class _MarketFoldState:
         self.pair_rising = None
         self.bars = {}
         self.ma20 = {}
+        # The coverage vocabulary's evidence (README §3.7): every
+        # daily_capture_failed gap's symbol, and every symbol with an
+        # affirming ka10081 rest_resp (the body carried the documented
+        # list key — a recorded non-success body affirms nothing).
+        self.gaps = set()
+        self.affirmed = set()
+        # The input snapshot's streaming half (README §3.7): sha256 over
+        # exactly the bytes consumed up to the last committed LF —
+        # state.offset is their size.
+        self.sha = hashlib.sha256()
 
 
 def _clone_fold_state(src):
@@ -641,6 +685,9 @@ def _clone_fold_state(src):
         if src.pair_rising is not None else None
     dst.bars = {k: [set(v[0]), v[1], v[2]] for k, v in src.bars.items()}
     dst.ma20 = dict(src.ma20)
+    dst.gaps = set(src.gaps)
+    dst.affirmed = set(src.affirmed)
+    dst.sha = src.sha.copy()
     return dst
 
 
@@ -650,7 +697,9 @@ def _fold_market_projection_inc(path, session_date, prev_state=None):
     Resumes from prev_state.offset when (path, session_date, st_dev, st_ino)
     match and st_size >= prev_state.offset; otherwise starts fresh from 0.
     Torn trailing lines (no LF) are never consumed and leave offset at the
-    last committed LF. Returns a new _MarketFoldState on success without
+    last committed LF. The returned state carries the input snapshot: the
+    sha256 (incremental across resumes) and size of exactly the committed
+    bytes consumed. Returns a new _MarketFoldState on success without
     mutating prev_state if a DataFault is raised.
     """
     if not isinstance(session_date, str) \
@@ -686,6 +735,9 @@ def _fold_market_projection_inc(path, session_date, prev_state=None):
         pair_rising = state.pair_rising
         bars = state.bars
         ma20 = state.ma20
+        gaps = state.gaps
+        affirmed = state.affirmed
+        sha = state.sha
         i = state.line_no
         committed_offset = state.offset
         while True:
@@ -696,6 +748,8 @@ def _fold_market_projection_inc(path, session_date, prev_state=None):
                 break  # torn tail: a concurrent append, not committed yet
             i += 1
             committed_offset = f.tell()
+            sha.update(raw)  # the snapshot covers exactly the committed
+            #                  prefix; the LF is part of the consumed bytes
             raw = raw[:-1]
             if not raw:
                 raise DataFault("%s line %d is empty" % (name, i))
@@ -706,6 +760,27 @@ def _fold_market_projection_inc(path, session_date, prev_state=None):
                                 % (name, i, exc))
             if not isinstance(obj, dict):
                 raise DataFault("%s line %d is not a JSON object" % (name, i))
+            if obj.get("kind") == "gap":
+                # The only gap the projection consumes: the collector's
+                # per-symbol failed daily capture (REPLAY_CONTRACT §12.9).
+                # Its envelope follows the same discipline as a rest_resp
+                # record's — a gap whose raw/what is not the recorded
+                # shape is corruption, never a silent skip.
+                gap_raw = obj.get("raw")
+                if not isinstance(gap_raw, dict):
+                    raise DataFault("%s line %d gap raw is not a JSON "
+                                    "object" % (name, i))
+                what = gap_raw.get("what")
+                if not isinstance(what, str):
+                    raise DataFault("%s line %d gap has no what" % (name, i))
+                if what == MARKET_CAPTURE_GAP_WHAT:
+                    symbol = gap_raw.get("symbol")
+                    if not isinstance(symbol, str):
+                        raise DataFault(
+                            "%s line %d %s gap has no symbol"
+                            % (name, i, MARKET_CAPTURE_GAP_WHAT))
+                    gaps.add(symbol)
+                continue
             if obj.get("kind") != "rest_resp":
                 continue
             rec = obj.get("raw")
@@ -808,6 +883,7 @@ def _fold_market_projection_inc(path, session_date, prev_state=None):
                 if isinstance(doc, dict):
                     rows = doc.get(MARKET_MA20_LIST_KEY)
                     if isinstance(rows, list):
+                        affirmed.add(symbol)  # a success-shaped response
                         entry = bars.get(symbol)
                         for row in rows:
                             if not isinstance(row, dict):
@@ -896,7 +972,8 @@ def _as_of_text(as_of):
     return as_of.astimezone(KST).isoformat(timespec="seconds")
 
 
-def opening_market_top10(mode, confirmed, snapshots, ma20):
+def opening_market_top10(mode, confirmed, snapshots, ma20, day_counts=None,
+                         capture_failed=None, affirmed=None):
     """The VS-2 opening MA20 projection (README §3.7): the top10 lists
     reconstituted from the recorded prices of the reference group's
     chain-pair against the recorded 20-day close sums — a display-only
@@ -931,6 +1008,19 @@ def opening_market_top10(mode, confirmed, snapshots, ma20):
     exactly at the average — never a fallback to the core
     classification.
 
+    `day_counts`, `capture_failed` and `affirmed` carry the fold's
+    coverage evidence (README §3.7 개장 모드 수집 상태): the per-symbol
+    count of valid completed ka10081 days, the symbols whose
+    daily_capture_failed gap is recorded, and the symbols with an
+    affirming ka10081 rest_resp. Every state symbol lands in exactly
+    one bucket, by the contract's precedence: capture_failed (a gap
+    and no affirming response) → no_record (an affirming response with
+    zero valid completed days; a symbol with neither a gap nor a
+    response is the same recorded absence) → history_short (1-19) →
+    no_price (≥20 days, no price in the mapped snapshot) → flat (≥20
+    days and 20·P == ΣC) → computable (the two lists' contents). The
+    six counts partition candidate_count.
+
     Classification: 20·P vs ΣC (P = the recorded current price of the
     mapped snapshot, ΣC = the recorded 20-close sum): above → the
     rising list, below → the falling list. Each list is ordered by
@@ -960,16 +1050,43 @@ def opening_market_top10(mode, confirmed, snapshots, ma20):
                         "group %d upsert symbols are in no chain-pair "
                         "snapshot (offsets 0/+1/-1)"
                         % (INPUT_JSONL, index))
+    day_counts = day_counts or {}
+    capture_failed = capture_failed or frozenset()
+    affirmed = affirmed or frozenset()
     above, below = [], []
+    capture_failed_count = 0
+    no_record_count = 0
+    history_short_count = 0
+    no_price_count = 0
+    flat_count = 0
     for symbol, item in state.items():
         price = snapshot.get(symbol)
         close_sum = ma20.get(symbol)
-        if price is None or close_sum is None:
-            continue  # honest exclusion: no recorded price / closes
-        if 20 * price > close_sum:
+        days = day_counts.get(symbol, 0)
+        if symbol in capture_failed and symbol not in affirmed:
+            # The collector's recorded failed capture and no affirming
+            # success response for the symbol.
+            capture_failed_count += 1
+        elif symbol not in affirmed or days == 0:
+            # A success-shaped response with zero valid completed days
+            # (or no record at all — the same recorded absence).
+            no_record_count += 1
+        elif days < MARKET_MA20_DAYS:
+            history_short_count += 1
+        elif price is None or close_sum is None:
+            # ≥20 valid days but nothing to classify against: no price
+            # in the selected chain-pair snapshot. (close_sum is always
+            # recorded once 20 days are; the check is defensive.)
+            no_price_count += 1
+        elif 20 * price > close_sum:
             above.append((price, close_sum, symbol, item))
         elif 20 * price < close_sum:
             below.append((price, close_sum, symbol, item))
+        else:
+            # Exactly at the recorded average: excluded from both lists
+            # (the existing honest exclusion) but never silently lost —
+            # the coverage counts it.
+            flat_count += 1
     rising, falling = [], []
     for entries, is_above, target in ((above, True, rising),
                                       (below, False, falling)):
@@ -982,7 +1099,12 @@ def opening_market_top10(mode, confirmed, snapshots, ma20):
     falling_complete = len(below) >= MARKET_TOP_N
     coverage = {
         "candidate_count": len(state),
+        "capture_failed_count": capture_failed_count,
         "computable_count": len(above) + len(below),
+        "flat_count": flat_count,
+        "history_short_count": history_short_count,
+        "no_price_count": no_price_count,
+        "no_record_count": no_record_count,
         "rising_count": len(above),
         "falling_count": len(below),
         "rising_complete": rising_complete,
@@ -1003,10 +1125,10 @@ class Projector:
         self.ledger_path = ledger_path
         self.delivery_path = delivery_path
         self._runs_real = os.path.realpath(runs_root)
-        # The §3.7 market-fold memoization: one entry, the last
-        # published (path, size, mtime_ns) -> (names, snapshots, ma20)
-        # fold. ThreadingHTTPServer serves concurrent requests, so the
-        # slot is guarded by one lock.
+        # The §3.7 market-fold memoization: one entry, the last published
+        # (path, size, mtime_ns) -> fold state (names, snapshots, ma20,
+        # coverage evidence, input snapshot). ThreadingHTTPServer serves
+        # concurrent requests, so the slot is guarded by one lock.
         self._fold_lock = threading.Lock()
         self._fold_entry = None
         # The events.hcj.jsonl committed-lines memoization: one slot,
@@ -1467,10 +1589,11 @@ class Projector:
 
     # ---- mobile market view (README §3.7) ---------------------------------
 
-    def _market_projection(self, path, session_date):
+    def _market_projection_state(self, path, session_date):
         """The memoized §3.7 market fold for one input.hcj.jsonl: a pure
         derivation of recorded bytes (the ka10027 names and prices, the
-        ka10081 close sums), so unlike the per-request event fold it is
+        ka10081 close sums and coverage evidence, the consumed-prefix
+        input snapshot), so unlike the per-request event fold it is
         cached in-process. The key is the practical invalidation triple
         (path, size, mtime_ns) — not a cryptographic fingerprint: a
         rewrite restoring the same size and mtime_ns would be served
@@ -1481,12 +1604,20 @@ class Projector:
         as its consistent prefix, never cached). A DataFault is never
         cached — a corrupt file faults on every request until it is
         fixed. The slot holds one entry: a different selected run
-        rescans."""
+        rescans. The returned state carries the input snapshot with
+        the fold, so a cache hit serves the same {size, sha256}."""
         with self._fold_lock:
             state = _fold_market_projection_inc(path, session_date,
                                                 self._fold_entry)
             self._fold_entry = state
-            return state.names, state.snapshots, state.ma20
+            return state
+
+    def _market_projection(self, path, session_date):
+        """The fold's original tuple view (names, snapshots, ma20) — the
+        pure-function contract fold_market_projection and the fold unit
+        suite share. The endpoint reads the full state instead."""
+        state = self._market_projection_state(path, session_date)
+        return state.names, state.snapshots, state.ma20
 
     def _session_open(self, run_dir, session_date):
         """The session opening recorded in the run's calendar snapshot
@@ -1704,9 +1835,9 @@ class Projector:
                              config.get("events_contract")))
         if not eligible:
             return {"as_of": None, "coverage": None, "data_as_of": None,
-                    "history": [], "latest": None, "mode": "core",
-                    "mode_as_of": _as_of_text(as_of), "run": None,
-                    "rising_top10": [],
+                    "history": [], "input_snapshot": None, "latest": None,
+                    "mode": "core", "mode_as_of": _as_of_text(as_of),
+                    "run": None, "rising_top10": [],
                     "falling_top10": [], "runs_present": bool(names),
                     "status": None}
         # Selection (README §3.7): max session_date, then max last
@@ -1731,8 +1862,18 @@ class Projector:
             raise DataFault("%s config events_contract is not %s"
                             % (INPUT_JSONL, MARKET_EVENTS_CONTRACT))
         fact_path = events_contract == MARKET_EVENTS_CONTRACT
-        stock_names, snapshots, ma20 = self._market_projection(
+        state = self._market_projection_state(
             os.path.join(run_dir, INPUT_JSONL), session_date)
+        stock_names, snapshots, ma20 = \
+            state.names, state.snapshots, state.ma20
+        # The §3.7 input snapshot: {size, sha256} over exactly the
+        # committed bytes the fold consumed. It rides the memoized state
+        # (the state's incremental hash) — never a second file read —
+        # and is part of this response's determinism key F(input_snapshot,
+        # as_of). size counts the committed prefix, so a torn tail is
+        # excluded.
+        input_snapshot = {"size": state.offset,
+                          "sha256": state.sha.hexdigest()}
         events, _ = self._events_committed_lines(
             os.path.join(run_dir, EVENTS_JSONL))
         # The seal (README §3.7): the recorder's finish() marker — the
@@ -1950,7 +2091,11 @@ class Projector:
             changes = self._fact_history(facts, last_stamp_pos, sealed,
                                          stock_names)
         (opening_rising, opening_falling, coverage) = \
-            opening_market_top10(mode, confirmed, snapshots, ma20)
+            opening_market_top10(
+                mode, confirmed, snapshots, ma20,
+                day_counts={symbol: entry[2]
+                            for symbol, entry in state.bars.items()},
+                capture_failed=state.gaps, affirmed=state.affirmed)
         if mode == "opening_ma20":
             rising, falling = opening_rising, opening_falling
         else:
@@ -1974,6 +2119,7 @@ class Projector:
             "coverage": coverage,
             "data_as_of": data_as_of,
             "history": changes,
+            "input_snapshot": input_snapshot,
             "latest": ({field: last[field] for field in
                         ("data_quality", "event_id", "event_type",
                          "observed_at")} if last else None),

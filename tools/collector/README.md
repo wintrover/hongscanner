@@ -500,6 +500,7 @@ durable-completion 프로토콜이 이미 내구를 보장하므로 이 규칙 �
    "stex_tp":"1","sort_tp":"1|3 양방향"},
  "repoll_seconds":300,"page_cap":10,"drain_seconds":10,
  "ack_timeout_seconds":10,"watchdog":"15:40:00+09:00",
+ "daily_scope":"accumulate-v2",
  "subscription_caps":{"per_direction":100,"total":200},
  "selection_policy":"kiwoom_response_order_first_100_v1",
  "collector":{"schema":"hong-scanner-collector-config/1",
@@ -518,6 +519,18 @@ durable-completion 프로토콜이 이미 내구를 보장하므로 이 규칙 �
 레코드에서 단일 판정 함수로 재도출된다). serve 표시 분기용 최상위
 키이며, 레거시 스트림에는 키가 없다(그 스트림은 재생 바이트가
 그대로다).
+
+`daily_scope`(선택): config 레코드에 기록되는 ka10081 일봉 스윕의
+유니버스 스코프다(REPLAY_CONTRACT §12.9). 설정된 경우에만 키가
+기록되며, 키가 없거나 빈 값이면 레거시 스코프 그대로 — config 레코드를
+포함한 스트림이 바이트 동일하다. `"single-page-initial-pair"`는 그
+레거시 스코프의 명시 선언이고, `"accumulate-v2"`는 초기 체인쌍의
+유니버스를 FIFO 큐로 두고 각 재조회 라운드의 새 종목을 vendor 등장
+순서로 append한다(이미 본 종목은 재발행하지 않는다). 큐 소진은 완료가
+아니며, 이후 라운드의 append로 스윕이 재개된다. 종료 시 미완료 큐는
+`daily_universe_unfinished` 갭(remaining·cursor·queue size·pending),
+성립 응답의 완료일 수가 20 미만이면 `daily_history_short` 갭(완료일
+수)을 남긴다. 그 외 값은 시작 거부(exit 2)다.
 
 `repoll_seconds`·`page_cap`의 config 선언은 rest_resp.nim이 예약한
 "승인된 확장 경로"다: cadence가 선언된 스트림에서만 같은 스코프의
@@ -554,8 +567,9 @@ req(refresh="1") → ack → 스트리밍. 상한 도달 시
 세션을 죽이지 않는다. 사실은 REST_TRUNCATED 이벤트가 담당). 초기 체인쌍
 완성 직후 ka10081 일봉 스윕이 1회 시작된다(유니버스 = 초기 체인쌍 행의
 stk_cd 합집합, 응답 순서; 종목당 1페이지 `daily_req` → `rest_daily` →
-성립 rest_resp/실패 daily_capture_failed 갭, §2.8/§12.9 — 재조회
-라운드로 재발행되지 않는다). 이후
+성립 rest_resp/실패 daily_capture_failed 갭, §2.8/§12.9 — 기본(레거시)
+스코프는 재조회 라운드로 확장되지 않고, `daily_scope="accumulate-v2"`는
+각 재조회 라운드의 새 종목을 FIFO 큐에 append해 스윕을 재개한다). 이후
 `timer poll`마다
 재조회 → 도출·선출 → 후보 변화 시 스왑: REMOVE(구세대 전체)→ack(return_code 0)→
 REG(신세대, refresh="1")→ack. 0s는 스왑 경로에 절대 등장하지 않는다
