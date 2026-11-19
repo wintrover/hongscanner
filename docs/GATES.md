@@ -1102,3 +1102,44 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 **직전 절의 미완 항목 해소**: "이번에 하지 않은 것"의 1(배포 미룸)·2(관측 유닛 미스케줄)·3(15:40까지 재시작 루프)은 이 배포로 해소됐다.
 
 **경계**: 11/19의 P0 판정은 여전히 **FAILED**다 — 오전 피크는 미수용이고, 15:40 watchdog 종료로 전체 거래일(16:30 폐장)의 관측·봉인은 없다. 11/20 09:00 피크의 수용은 `tools/attest_notifications.py` 결과로 별도 기록한다.
+
+### Evidence log (2026-11-19, 저녁 2) — 게시 판정의 거짓 실패·fail-open 제거 (PR [#135](https://github.com/wintrover/hongscanner/pull/135), merge `a92efbd`)
+
+11/19 봉인 원장을 새 판정기로 다시 읽어, 11/20 수용을 거짓 실패로 만들 결함 2건과 fail-open 1건을 실측으로 확정하고 고쳤다.
+
+**발견 — 11/19 원장 재분석**
+
+| 결함 | 실측 |
+|---|---|
+| `extra = observed − expected(peak)` | 서버가 정당하게 보낸 1건이 이상으로 오판됐다. 09:59:57 관측 `TOP10_ENTERED`/`CANDIDATE_ENTERED`가 10:00:50 `summary`로 전달됐고, 피크 밖 그룹이라 `extra`가 됐다 |
+| 관측 창 종료 `09:35` | 피크 이벤트 114건의 관측→전달 지연 **5.6 / 5.7 / 5.8분**(최소·중앙·최대). 09:29:59 이벤트는 09:35:45에 도착 → 창을 넘겨 `missing` |
+| FCM 실패 그룹 | `ACCEPTED` 기록이 없으면 `expected`에서도 빠져 **0/0 통과**가 가능했다(fail-open). 11/19 실측은 0건 |
+
+**수정 (`tools/attest_notifications.py`)**
+
+`expected`(피크 + 창 안 발송) · `accounted`(세션 전체 가청) · `late`(피크인데 ACCEPTED 발송이 창 밖) · `undelivered`(피크인데 ACCEPTED 0건) · `preopen_delivered`(개장 전 관측이 피크 중 발송)로 분리했다. `unaccounted = observed − accounted`만 미계상 실패이고, 피크 밖 그룹이 `accounted`에 있는 것은 실패가 아니다. 피크 그룹 0건은 `vacuous: true` + `coverage: null`로 수용하되 리포트에 드러낸다. 판정 축은 [docs/LIMITS.md](LIMITS.md)에 기록했다.
+
+**관측 창**: `08:58~09:45`(`tools/systemd/hongscanner-notify-observe.service`). 근거는 위 전달 지연 실측이다.
+
+**개장 전 오염 — 독립 증거 2건**
+
+| 증거 | 관측 |
+|---|---|
+| 전달 원장 | 09:59:57 스냅샷 이벤트 8건이 10:00:50 `summary`로 `ACCEPTED` — 개장 전 데이터로 만든 소리가 피크 중에 났다 |
+| 세션 관측 | `10:05` 체크포인트 `top10_observed_max=09:59:57`(개장 3초 전). `10:15`에야 `10:05:19`로 갱신 |
+
+따라서 11/19 오전은 `PREOPEN_CONTAMINATION`이다. 원인은 수집기 랭킹 스냅샷 주기이며 개장 전 후보 필터는 P1 범위다.
+
+**검증**
+
+| 항목 | 관측 |
+|---|---|
+| 로컬 게이트 | `bash tools/run_tests.sh` exit 0, `ALL CONTRACT SUITES PASSED` 1회 |
+| attest 테스트 | `python3 tests/test_attest_notifications.py` 25 tests OK |
+| PR CI | 런 [44477966496](https://github.com/wintrover/hongscanner/actions/runs/44477966496) success, 마커 1회 |
+| main CI | 런 [44478531281](https://github.com/wintrover/hongscanner/actions/runs/44478531281) success, 마커 1회 |
+| main attest | 런 [44478531310](https://github.com/wintrover/hongscanner/actions/runs/44478531310) success |
+| 서버 | `66d9ffb` 고정 유지, `git status --porcelain` 0줄, 세션 타이머 NEXT 2026-11-20 08:50 |
+| 노트북 관측 | NEXT 2026-11-20 08:58, ExecStart `--window 2026-11-20T08:58:00+09:00/2026-11-20T09:45:00+09:00` |
+
+**경계**: 11/19 P0는 여전히 **FAILED**다. 11/20 09:00 피크 판정은 아직 없다 — 관측 창과 판정기가 준비됐을 뿐, 수용은 실측 뒤에만 기록한다.
