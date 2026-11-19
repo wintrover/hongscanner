@@ -631,8 +631,14 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
    일봉 종가 — 한 번의 스캔에서 함께 접는다). 라인 규약은 §0와 같다:
    비-LF 꼬리는 미커밋이라 스캔을 멈추고, 커밋된 라인이 불량 JSON·
    빈 줄이면 DataFault. 대상 레코드는 `kind:"rest_resp"`·
-   `raw.api_id`가 `"ka10027"` 또는 `"ka10081"`인 것뿐(ka10080 등
-   다른 레코드는 스캔만 하고 어떤 원천으로도 안 쓴다).
+   `raw.api_id`가 `"ka10027"` 또는 `"ka10081"`인 것, 그리고
+   `kind:"gap"`·`what:"daily_capture_failed"`인 것뿐이다(ka10080 등
+   다른 레코드는 스캔만 하고 어떤 원천으로도 안 쓴다; 갭 레코드는
+   실패한 종목을 `coverage.capture_failed_count`에 귀속시키는 데만
+   쓰인다). 같은 스캔이 **입력 스냅샷 id**도 계산한다: 커밋 경계까지
+   소비한 바이트의 `{size, sha256}`(그 바이트들에 대한 해시, 캐시된
+   투영과 함께 보존). 이 id가 §4의 결정론 계약 `F(input_snapshot,
+   as_of)`의 첫 인자다.
 2. **레코더가 보장하는 인벨로프**(`raw` 객체·문자열 api_id·hex
    body_hex)가 깨진 커밋 레코드는 오염이다 — DataFault, 조용한 스킵
    없음. **본문 내용은 레코더가 보장하지 않는다**(성공·실패 응답을
@@ -748,6 +754,23 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   최소 10개 이상일 때만 true입니다. 이는 기준 그룹 범위 안의 완전성일
   뿐 전체 시장 TOP10 완전성이 아니며, 앱은 PARTIAL을 명시적으로 표시
  해야 합니다.
+  `status`의 의미는 **바뀌지 않는다** — 두 목록이 각각 10개 이상인지를
+  말할 뿐, 모든 후보가 계산 가능하다는 뜻이 아니다. 그 사실은 다음
+  가산 카운트로 드러낸다(종목별 최종 결과 하나, 우선순위 순):
+  `capture_failed_count`(`daily_capture_failed` 갭이 있고 성공 응답이
+  없음) → `no_record_count`(성공 응답, 유효 완료일 0행) →
+  `history_short_count`(성공 응답, 완료일 1~19) → `no_price_count`
+  (완료일 ≥20이나 페어 스냅샷에 가격 없음) → `flat_count`(완료일 ≥20,
+  `20·P == ΣC`) → `computable_count`(기존 값, `20·P != ΣC`).
+  불변식: `computable + flat + no_price + history_short + no_record +
+  capture_failed == candidate_count`. `not_requested`(관측됐지만
+  논리 작업이 배정되지 않은 종목)는 **coverage 키가 아니다** — 원장
+  수집 완전성은 스윕 완료 시 0이어야 하는 운영 카운터다(별도 검증).
+- **입력 스냅샷**: 응답 최상위 `input_snapshot`은 이 투영이 소비한
+  커밋 입력의 `{size, sha256}`이다. 계약은 `F(input_snapshot, as_of) =
+  projection`이며, 같은 스냅샷·같은 `as_of`의 두 응답은 바이트
+  동일해야 한다. 오프라인 재계산도 같은 sha256의 파일을 써야 한다.
+  `data_as_of`는 기록 시각 표시로 남고 스냅샷 id와 별개다.
 
 - **캐비앗**: (1) 이중 방향 코드는 event_gen이 UP 방향으로 한 번만
   판정하므로(중복 제거) DOWN 목록에서 누락될 수 있다. (2) `history`는
