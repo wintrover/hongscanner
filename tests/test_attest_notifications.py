@@ -77,9 +77,9 @@ def event(event_id, observed_at):
 
 
 def delivery(event_id, message_kind="single", state="ACCEPTED",
-             device=DEVICE):
+             device=DEVICE, updated_at="2026-11-19T09:05:01+09:00"):
     record = {"attempts": 1, "device_id": device, "event_id": event_id,
-              "state": state, "updated_at": "2026-11-19T09:05:01+09:00"}
+              "state": state, "updated_at": updated_at}
     if message_kind is not _MISSING:
         record["message_kind"] = message_kind
     return record
@@ -226,7 +226,7 @@ class AttestationTests(unittest.TestCase):
         self.assertEqual(report["expected_count"], 2)
         self.assertEqual(report["observed_count"], 2)
         self.assertEqual(report["missing"], [])
-        self.assertEqual(report["extra"], [])
+        self.assertEqual(report["unaccounted"], [])
         self.assertEqual(report["unclassified_accepted"], [])
         self.assertTrue(report["completeness"]["ok"])
         self.assertEqual(report["completeness"]["window_start"], WINDOW_START)
@@ -263,18 +263,18 @@ class AttestationTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(report["verdict"], "COVERAGE_INCOMPLETE")
         self.assertEqual(report["missing"], [TAG_B])
-        self.assertEqual(report["extra"], [])
+        self.assertEqual(report["unaccounted"], [])
         self.assertEqual(report["coverage"], 0.5)
 
-    def test_extra_observed_tag_is_coverage_incomplete(self):
-        extra_tag = group_tag("2026-11-19T09:15:00+09:00", DEVICE)
+    def test_unaccounted_observed_tag_is_coverage_incomplete(self):
+        unaccounted_tag = group_tag("2026-11-19T09:15:00+09:00", DEVICE)
         self.case.observer.insert(
-            -1, notification(extra_tag, "2026-11-19T09:15:30+09:00"))
+            -1, notification(unaccounted_tag, "2026-11-19T09:15:30+09:00"))
         code, report = self.case.run()
         self.assertEqual(code, 1)
         self.assertEqual(report["verdict"], "COVERAGE_INCOMPLETE")
         self.assertEqual(report["missing"], [])
-        self.assertEqual(report["extra"], [extra_tag])
+        self.assertEqual(report["unaccounted"], [unaccounted_tag])
         self.assertEqual(report["coverage"], 1.0)
 
     def test_git_commit_mismatch_is_provenance_mismatch(self):
@@ -361,20 +361,65 @@ class AttestationTests(unittest.TestCase):
         self.assertEqual(report["unclassified_accepted"], [EVENT_A])
         self.assertEqual(report["coverage"], 1.0)
         self.assertEqual(report["missing"], [])
-        self.assertEqual(report["extra"], [])
+        self.assertEqual(report["unaccounted"], [])
 
-    def test_pre_open_group_is_excluded_and_not_extra(self):
+    def test_pre_open_delivery_before_open_is_accounted_not_unaccounted(self):
+        # 개장 전 관측이 개장 전에 발송된 경우: 피크 그룹도 아니고 기기 tag도
+        # 미계상이 아니므로 수용에 영향을 주지 않는다.
         self.case.events.append(event(EVENT_PRE, AT_PRE))
-        self.case.deliveries.append(delivery(EVENT_PRE, "single"))
+        self.case.deliveries.append(
+            delivery(EVENT_PRE, "single",
+                     updated_at="2026-11-19T08:52:00+09:00"))
         self.case.observer.insert(
-            -1, notification(TAG_PRE, "2026-11-19T08:50:30+09:00"))
+            -1, notification(TAG_PRE, "2026-11-19T08:52:30+09:00"))
         code, report = self.case.run()
         self.assertEqual(code, 0)
         self.assertEqual(report["verdict"], "ACCEPTED")
         self.assertEqual(report["expected_count"], 2)
         self.assertEqual(report["observed_count"], 2)
         self.assertEqual(report["missing"], [])
-        self.assertEqual(report["extra"], [])
+        self.assertEqual(report["unaccounted"], [])
+        self.assertEqual(report["preopen_delivered"], [])
+
+    def test_pre_open_event_delivered_in_peak_is_contamination(self):
+        # 개장 전 관측으로 만든 알림이 피크 중에 발송되면 그 소리는 개장 전
+        # 정보에 대한 것이다 — 수용 실패로 기록한다(2026-11-19 실측 사례).
+        self.case.events.append(event(EVENT_PRE, AT_PRE))
+        self.case.deliveries.append(delivery(EVENT_PRE, "single"))
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "PREOPEN_CONTAMINATION")
+        self.assertEqual(len(report["preopen_delivered"]), 1)
+        self.assertEqual(report["preopen_delivered"][0]["event_id"], EVENT_PRE)
+        self.assertFalse(report["contamination"]["ok"])
+
+    def test_peak_group_delivered_after_window_is_late(self):
+        # 서버가 주장한 피크 그룹이 관측 창 밖에서 발송되면 관측자가 증명할
+        # 수 없다 — 분모에서 조용히 빼지 않고 실패로 남긴다.
+        self.case.deliveries = [
+            delivery(EVENT_A, "single",
+                     updated_at="2026-11-19T10:00:00+09:00"),
+            delivery(EVENT_B, "summary",
+                     updated_at="2026-11-19T10:00:00+09:00")]
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "COVERAGE_INCOMPLETE")
+        self.assertEqual(report["expected_count"], 0)
+        self.assertEqual(sorted(report["late"]), sorted([TAG_A, TAG_B]))
+        self.assertTrue(report["vacuous"])
+        self.assertIsNone(report["coverage"])
+
+    def test_no_peak_groups_is_vacuous_acceptance(self):
+        # 시장이 실제로 그룹을 만들지 않은 날은 소리가 0번 나는 것이 정상이다.
+        # 다만 vacuous=true로 드러내 조용한 통과를 숨기지 않는다.
+        self.case.deliveries = []
+        self.case.observer = default_heartbeats() + [observer_end()]
+        code, report = self.case.run()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["verdict"], "ACCEPTED")
+        self.assertEqual(report["expected_count"], 0)
+        self.assertIsNone(report["coverage"])
+        self.assertTrue(report["vacuous"])
 
     def test_missing_calendar_open_is_unknown_input(self):
         self.case.calendar_data = {

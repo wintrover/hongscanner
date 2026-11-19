@@ -180,8 +180,24 @@ def _known_kind(kind):
     return isinstance(kind, str) and kind in MESSAGE_KINDS
 
 
-def _expected_groups(delivery_path, events, peak, device_id):
+def _delivery_facts(delivery_path, events, peak, device_id, window):
+    """서버가 주장한 발송을 증명 가능성에 따라 나눈다.
+
+    expected: 피크에 속한 그룹이면서 관측 창 안에서 발송된 tag. coverage
+      분모이자, 전부 관측되어야 하는 집합.
+    accounted: 세션 원장이 주장하는 모든 가청 발송 tag. 기기에만 보이는
+      미계상 tag를 가려내는 기준 — 피크 밖 그룹은 여기 속할 뿐 실패가 아니다.
+    late: 피크 그룹인데 관측 창 밖에서 발송된 tag. 관측자가 증명할 수 없는
+      구간이므로 성공으로 접지 않는다(fail-closed).
+    preopen: 개장 전 관측 이벤트가 피크 중에 가청 발송된 증거.
+    unclassified: 종류를 알 수 없는 ACCEPTED 발송. 가청 여부를 판정할 수
+      없으므로 fail-closed.
+    """
+    peak_tags = set()
     expected = set()
+    accounted = set()
+    preopen = []
+    seen_preopen = set()
     unclassified = set()
     for record in _read_jsonl(delivery_path):
         if record.get("state") != "ACCEPTED":
@@ -192,14 +208,38 @@ def _expected_groups(delivery_path, events, peak, device_id):
         event = events.get(event_id) if isinstance(event_id, str) else None
         if event is None:
             continue
-        if not (peak["open"] <= event["at"] < peak["end"]):
-            continue
         kind = record.get("message_kind")
-        if isinstance(kind, str) and kind in AUDIBLE_KINDS:
-            expected.add(group_tag(event["observed_at"], device_id))
-        elif not _known_kind(kind):
+        if not _known_kind(kind):
             unclassified.add(event_id)
-    return expected, unclassified
+            continue
+        if kind not in AUDIBLE_KINDS:
+            continue
+        emitted = _moment(record.get("updated_at"))
+        if emitted is None:
+            raise InputError("%s: delivery %s has no aware updated_at"
+                             % (delivery_path, event_id))
+        tag = group_tag(event["observed_at"], device_id)
+        accounted.add(tag)
+        in_peak = peak["open"] <= event["at"] < peak["end"]
+        if in_peak:
+            peak_tags.add(tag)
+            if window["start"] is not None and window["end"] is not None and \
+                    window["start"] <= emitted <= window["end"]:
+                expected.add(tag)
+        if not in_peak and event["at"] < peak["open"] and \
+                peak["open"] <= emitted < peak["end"]:
+            key = (event_id, record.get("updated_at"))
+            if key not in seen_preopen:
+                seen_preopen.add(key)
+                preopen.append({"event_id": event_id,
+                                "observed_at": event["observed_at"],
+                                "delivered_at": record.get("updated_at"),
+                                "tag": tag})
+    return {"expected": expected,
+            "accounted": accounted,
+            "late": peak_tags - expected,
+            "preopen": preopen,
+            "unclassified": unclassified}
 
 
 def _observer_window(observer_end, records):
@@ -341,7 +381,7 @@ def _analyse_observer(observed_path, start_tolerance_sec, end_tolerance_sec,
         observer_end_ok, polls_ok, window["ok"], start_ok, end_ok, gap_ok,
         no_errors, timestamps_ok,
     ))
-    return observed, completeness
+    return observed, completeness, window
 
 
 def _analyse_contamination(path, peak):
@@ -398,11 +438,15 @@ def _input_entry(path):
 def _empty_report(inputs, tool):
     return {
         "verdict": None,
-        "coverage": 0.0,
+        "coverage": None,
+        "vacuous": False,
         "expected_count": 0,
         "observed_count": 0,
+        "accounted_count": 0,
         "missing": [],
-        "extra": [],
+        "unaccounted": [],
+        "late": [],
+        "preopen_delivered": [],
         "unclassified_accepted": [],
         "completeness": {},
         "contamination": {},
@@ -437,35 +481,44 @@ def attest(args):
         report["peak"] = {"open": peak["open"].isoformat(),
                           "end": peak["end"].isoformat()}
         events = _load_events(events_path)
-        expected, unclassified = _expected_groups(
-            args.delivery, events, peak, args.device_id)
-        observed, completeness = _analyse_observer(
+        observed, completeness, window = _analyse_observer(
             args.observed, args.start_tolerance_sec, args.end_tolerance_sec,
             args.max_gap_sec)
+        facts = _delivery_facts(args.delivery, events, peak, args.device_id,
+                                window)
         contamination = _analyse_contamination(args.session_observer, peak)
     except InputError as exc:
         report["verdict"] = "UNKNOWN_INPUT"
         print("attest: %s" % exc, file=sys.stderr)
         return report, EXIT_FAIL
 
+    expected = facts["expected"]
     missing = sorted(expected - observed)
-    extra = sorted(observed - expected)
-    coverage = len(expected & observed) / len(expected) if expected else 0.0
+    unaccounted = sorted(observed - facts["accounted"])
+    late = sorted(facts["late"])
+    coverage = len(expected & observed) / len(expected) if expected else None
+
+    contamination["delivered_preopen"] = facts["preopen"]
+    contamination["ok"] = contamination["ok"] and not facts["preopen"]
 
     report.update({
         "coverage": coverage,
+        "vacuous": not expected,
         "expected_count": len(expected),
         "observed_count": len(observed),
+        "accounted_count": len(facts["accounted"]),
         "missing": missing,
-        "extra": extra,
-        "unclassified_accepted": sorted(unclassified),
+        "unaccounted": unaccounted,
+        "late": late,
+        "preopen_delivered": facts["preopen"],
+        "unclassified_accepted": sorted(facts["unclassified"]),
         "completeness": completeness,
         "contamination": contamination,
     })
     if not completeness["ok"]:
         report["verdict"] = "OBSERVATION_INCOMPLETE"
         return report, EXIT_FAIL
-    if unclassified or missing or extra or coverage < 1.0:
+    if facts["unclassified"] or missing or unaccounted or late:
         report["verdict"] = "COVERAGE_INCOMPLETE"
         return report, EXIT_FAIL
     if not contamination["ok"]:

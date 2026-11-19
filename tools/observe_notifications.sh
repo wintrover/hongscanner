@@ -28,7 +28,7 @@
 ## seen. It refuses to start outside the window (exit 2, one error line), emits
 ## a heartbeat for every 60 s of loop time, and closes with one observer_end
 ## when it reaches END. A laptop that wakes at 09:10 therefore cannot produce a
-## clean-looking 09:10-09:35 run: the missing heartbeats and observer_end make
+## clean-looking 09:10-09:45 run: the missing heartbeats and observer_end make
 ## the gap visible. Heartbeats and observer_end are coverage metadata, never
 ## notification evidence.
 ##
@@ -69,7 +69,7 @@ usage: observe_notifications.sh [--once] [--interval SECONDS] [--serial SERIAL]
   --interval N        capture every N seconds (N >= 5) until SIGTERM or window END
   --serial SERIAL     adb -s SERIAL; default: first device in `adb devices`
   --window START/END  only run inside the ISO-8601 window, e.g.
-                      2026-11-20T08:58:00+09:00/2026-11-20T09:35:00+09:00
+                      2026-11-20T08:58:00+09:00/2026-11-20T09:45:00+09:00
                       (requires --interval; a single snapshot cannot cover a window)
   --out-dir DIR       output directory (default ~/.local/share/hongscanner/observe)
   --adb PATH          adb executable (default: adb on PATH)
