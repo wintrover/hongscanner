@@ -939,3 +939,46 @@ ka10080)는 각각 판정되며 하나의 판정으로 통합하지 않는다(�
 | S10 수신 조건(토큰 유효) | 2026-11-18 `delivery.hcj.jsonl` 집계: `wuyoni-sm-g977n` **1,024건 전부 `ACCEPTED`**(마지막 `15:28:10`), `wuyoni-sm-s938n` 1,024건. 채널 `market_rank_changes` importance=4, `mSound=content://settings/system/notification_sound`, `zen_mode=0`, `POST_NOTIFICATION: allow`, standby bucket 10(ACTIVE). **FCM provider 수락이며 기기 게시·소리 발생의 증거가 아니다** |
 
 **경계**: 위 표는 2026-11-19 오전 피크를 위한 *준비*의 증거다. 10:00 개장·피크 모드·그룹별 1회 판정·기기 게시·실제 소리는 2026-11-19 관측 뒤에만 기록한다. `FCM accepted ≠ delivered ≠ posted ≠ audible`.
+
+### Evidence log (2026-11-19 오전) — P0 수용 판정: **FAILED**
+
+판정 명령(운영 서버, 10:32:23 KST): `python3 ~/.local/share/hongscanner/tools/accept_1119.py --date 2026-11-19`
+→ `33 checks, 2 failed, 0 unproven` / `P0 acceptance FAILED` / exit 1.
+
+**통과한 계약(실측)**
+
+| 계약 | 관측 |
+|---|---|
+| 달력 10:00 개장 | 08:55·09:55 체크포인트 `calendar_open=10:00:00+09:00`, `sha256sum -c calendars/CALENDAR_INDEX.sha256` 2/2 OK |
+| 독립 관측자 | 세션 외부 타이머가 `08:45 08:55 09:55 10:05 10:15 10:25 10:31` **7줄** 기록(`observe-2026-11-19.hcj.jsonl`) — 세션이 살아 있는 동안 관측자도 살아 있었다 |
+| 피크 경계 | `as_of=10:29:59` → `opening_ma20`, `as_of=10:30:00` → `core`; 10:31:08 실시간 조회도 `core` |
+| 모드 전환 | 10:05·10:15·10:25 체크포인트 `mode=opening_ma20`, 10:31 `mode=core` |
+| 발송 대상 | 7개 체크포인트 전부 `devices_active=1`; 10:00~10:31 `delivery.hcj.jsonl` `ACCEPTED` **150쌍 전부 `wuyoni-sm-g977n`**, S25(`wuyoni-sm-s938n`) **0건** |
+| 그룹 발송 단위 | 10:00~10:31 `provider_message_id` **12개** = 소리 채널 `summary` **7통** + 무음 채널 `digest` **5통**. `summary`가 복수 `event_id`를 1통에 실었고(8·26·40·16·12·12·8건), `digest`는 `RANK_CHANGED` 무음 채널이다(`tools/notify/notify_dispatcher.py:19-20`). `digest`가 없는 그룹은 10:00·10:10 둘 — 그 그룹에 `RANK_CHANGED`가 없었다. 그룹당 소리 단위는 1통 |
+| 세션 생존 | 10:05·10:15·10:25·10:31 `unit_active=activating`(oneshot 실행 중), `unit_result=success` |
+| S1 기록 전용 경로 | 런처 로그 `^OPS_ALERT ` **0줄**, `OPS_ALERT_SUPPRESSED` **0줄** — 단, 오늘 장애 이벤트 자체가 없었으므로 이 0은 **공허한 증거**다(함수 단위 증거는 PR #124 기록이 정본) |
+
+**실패한 계약(실측)**
+
+| 계약 | 관측 |
+|---|---|
+| 개장 전 TOP10 오염 없음 | 10:05 체크포인트 `top10_observed_min=2026-11-19T09:59:57+09:00` < 10:00:00 → **FAIL**. `events.hcj.jsonl`의 개장 전 `TOP10_ENTERED` **8건**(`observed_at=09:59:57`), 이 8건이 FCM **1통**(`.../messages/0:1795050050788012%2e19e6a12e19e6a1`, `10:00:50 ACCEPTED`)으로 나갔다 |
+| 15:45 종료 확인 | 10:32 시점 체크포인트 없음 — 세션이 15:40에 끝나므로 구조적으로 아직 존재할 수 없다. 도구가 이를 FAIL로 세지만, 이 항목의 실판정은 15:45 이후에만 가능하다 |
+
+**도구가 판정하지 않는 추가 결함 2건(같은 관측에서 실측)**
+
+| 결함 | 관측 |
+|---|---|
+| MA20 커버리지 붕괴 | 10:23 `market-view` → `coverage.status=PARTIAL`, `candidate_count=2312`, `computable_count=8`, `rising_count=1`, `falling_count=7`. 스윕 유니버스가 개장 직전 첫 완전 페어(그룹 스탬프 `09:59:57`, `ka10027:stex_tp=1:sort_tp=3` DOWN 8종목 `rank=1..8`)로 확정된 뒤 재폴링에서 확장되지 않는다(`src/hs/collector.nim:617-638`, `:885-894`) — 순위표가 8종목 풀에서만 나온다. 같은 규칙의 공집합 발현은 2026-11-11 런에서 이미 기록돼 있다(위 표 "룬북 예상 폴백 적용" 행) |
+| 알림 워커가 감독 밖 + 유닛 크래시 루프 | 런처 로그 10행 `WORKER_START background FALLBACK (development mode — NOT an operational run: no auto-restart, README §11)`. 원인: 08:50:00 `systemd-run` 기동 시 run 디렉터리 미생성(`dispatcher: --run-dir is not a directory`) → 유닛 시작 잡 실패 → 폴백. 이후 `hsnotify-session-2026-11-19`가 `NRestarts=2738`(10:33), `ActiveState=activating/auto-restart`로 2초마다 재시작하며 `delivery.hcj.jsonl` 락 획득 실패(런처 로그 2,571줄). 실제 발송은 폴백 워커(PID 60309)가 수행. `stop_worker()`는 `WORKER_MODE=systemd`일 때만 유닛을 멈추므로(`tools/run_session.sh:238`), 폴백 런에서는 이 유닛이 남아 `runs_retention.sh:358`이 해당 런을 계속 ACTIVE로 판정한다 |
+
+**기기 관측(10:41 KST, S10 USB 연결, 부분 증거)**
+
+| 항목 | 관측 |
+|---|---|
+| 채널 설정 | `market_rank_changes` importance=4, `mSound=content://settings/system/notification_sound`, `mBypassDnd=false`, `mVibrationEnabled=false`; `market_rank_digest` importance=2(무음) |
+| 게시된 알림 | 현재 트레이에 시장 알림 2건: `10:25:56` "자이언트스텝 진입·위메이드맥스 진입 외 10건", `10:30:55` "한울앤제주 진입·위메이드맥스 이탈 외 6건". archive key 3건(FCM 2 + digest 1) 추가 확인 |
+| 한계 | 12통 전부의 게시는 증명되지 않는다 — 트레이가 최신 2건만 유지하고 `mArchive`는 시스템 전역 100건이라 오래된 항목이 밀려난다. 그룹별 게시의 사후 증명은 상시 수집 없이는 불가능하다(P1) |
+| 소리 | 채널에 소리 URI가 설정되고 DND가 아님을 확인했을 뿐, 실제 스피커 출력은 **증명하지 않는다** |
+
+**판정**: 2026-11-19 오전 피크(10:00~10:30) 운영 수용은 **실패**다. 피크 경계·발송 대상·그룹당 1통은 실측으로 통과했으나, 개장 전 이벤트가 TOP10/FCM에 섞였고(10:05 FAIL), 순위표 유니버스가 8종목으로 동결됐으며, 워커는 문서가 정의한 운영 모드(systemd 감독)가 아니다. 실제 소리 발생·기기 게시·전체 거래일(16:30 종가) 수용은 **주장하지 않는다**(`FCM accepted ≠ delivered ≠ posted ≠ audible`).
