@@ -1,0 +1,13 @@
+## S10 타이머와 같은 시각(2026-11-20 08:58)에 S25 관측자를 띄운다.
+## Persistent=false와 늦은 시작 가드는 hongscanner-notify-observe.timer
+## 주석과 같다 — 늦게 뜬 관측은 실패로 남기지, 정상 관측으로 접지 않는다.
+[Unit]
+Description=Hong Scanner Notification Observer Timer for S25 (one-day acceptance window 2026-11-20)
+
+[Timer]
+OnCalendar=2026-11-20 08:58:00
+Persistent=false
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

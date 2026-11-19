@@ -2,23 +2,32 @@
 """개장 피크 알림 게시 증명(읽기 전용, 동결 입력만 사용).
 
 서버가 주장한 알림(전달 원장의 ACCEPTED single/summary)이 수용 창
-[개장, 개장+30분) 동안 S10 트레이에 실제로 게시됐는지를 관측 파일과
-대조해 판정한다. 판정 입력은 전부 CLI로 받은 동결 파일이며, 도구는
+[개장, 개장+30분) 동안 대상 기기 트레이에 실제로 게시됐는지를 관측
+파일과 대조해 판정한다. 판정 입력은 전부 CLI로 받은 동결 파일이며, 도구는
 입력을 절대 쓰지 않는다. 유일한 쓰기는 --out 이다.
+
+--observed-second 와 --device-id-second 를 함께 주면 두 기기를 각각
+판정한 뒤, 두 기기가 받은 논리 그룹 집합이 서로 같고 서버가 주장한
+집합과도 같은지를 별도로 검사한다. 기기 tag 에는 device_id 가 들어가므로
+비교는 tag 문자열이 아니라 device_id 를 뗀 (observed_at) 그룹으로 한다.
 
 판정(우선순위, 모두 exit 1):
   PROVENANCE_MISMATCH   RUN_PROVENANCE 1줄이 승인값과 다르다
   UNKNOWN_INPUT         캘린더 개장·입력 JSONL을 읽거나 해석할 수 없다
   OBSERVATION_INCOMPLETE 관측이 수용 창을 연속으로 덮었다는 증거가 없다
   COVERAGE_INCOMPLETE   기대 그룹 태그와 관측 태그가 다르거나 미분류 전달이 있다
+  CROSS_DEVICE_MISMATCH 두 기기의 논리 그룹/슬롯 집합이 다르다
   PREOPEN_CONTAMINATION 피크 체크포인트의 최신 랭킹이 개장 이전이거나 증명 불가
   ACCEPTED              모든 검사 통과(exit 0)
 
 범위·한계:
 - 기대 태그는 (observed_at, device_id) 그룹의 트레이 슬롯 이름
-  (tools/notify/group_tag.py)이다. digest/aggregation_started 전달은
-  피크 그룹 주장이 아니므로 무시하고, message_kind가 없거나 원장 enum
-  밖이면 미분류로 기록해 fail-closed 한다.
+  (tools/notify/group_tag.py)이다. message_kind가 없거나 원장 enum 밖이면
+  미분류로 기록해 fail-closed 한다.
+- digest 전달은 소리 그룹 주장이 아니지만 트레이에는 고정 슬롯
+  (notify_fcm.DIGEST_TAG)으로 남는다. 수용된 digest 전달이 있는 기기의
+  관측에서 그 슬롯 하나만 면제하고, 전달 주장 없이 관측되면 미계상으로
+  실패한다. aggregation_started 는 슬롯 계약이 없으므로 면제하지 않는다.
 - 관측 태그는 OBSERVED_ACTIVE 스냅샷만 센다. 관측되지 않은 게시는
   "없었다"가 아니라 "이 증거로는 증명되지 않는다"이다.
 - peak 계산은 market_time 의 개장 파서와 30분 창을 그대로 쓴다.
@@ -30,7 +39,8 @@
   python3 tools/attest_notifications.py --date YYYY-MM-DD --run-dir DIR \
     --delivery FILE --observed FILE --session-observer FILE --calendar FILE \
     --launcher-log FILE --approved-commit SHA \
-    --approved-launcher-sha256 HEX [--out FILE]
+    --approved-launcher-sha256 HEX [--out FILE] \
+    [--device-id ID] [--observed-second FILE --device-id-second ID]
 """
 from __future__ import annotations
 
@@ -51,11 +61,13 @@ for _path in (_TOOLS_DIR, _NOTIFY_DIR):
         sys.path.insert(0, _path)
 
 import market_time  # noqa: E402
-from group_tag import group_tag  # noqa: E402
+from group_tag import group_tag, parse_group_tag  # noqa: E402
 from notify_ledger import MESSAGE_KINDS  # noqa: E402
+from notify_fcm import DIGEST_TAG  # noqa: E402
 
 DEFAULT_DEVICE_ID = "wuyoni-sm-g977n"
 AUDIBLE_KINDS = frozenset(("single", "summary"))
+SILENT_SLOT_KINDS = {"digest": DIGEST_TAG}
 EVENTS_FILE = "events.hcj.jsonl"
 PROVENANCE_PREFIX = "RUN_PROVENANCE"
 EXIT_OK = 0
@@ -194,11 +206,15 @@ def _delivery_facts(delivery_path, events, peak, device_id, window):
     preopen: 개장 전 관측 이벤트가 피크 중에 가청 발송된 증거.
     unclassified: 종류를 알 수 없는 ACCEPTED 발송. 가청 여부를 판정할 수
       없으므로 fail-closed.
+    silent_slots: 이 기기에 ACCEPTED 로 전달된 무음 슬롯(현재는 digest
+      고정 tag). 트레이에 남지만 소리 그룹 주장이 아니므로 미계상에서
+      면제한다. 전달 주장이 없으면 면제하지 않는다(fail-closed).
     """
     peak_tags = set()
     dispatched_peak = set()
     expected = set()
     accounted = set()
+    silent_slots = set()
     preopen = []
     seen_preopen = set()
     unclassified = set()
@@ -216,6 +232,8 @@ def _delivery_facts(delivery_path, events, peak, device_id, window):
                 unclassified.add(event_id)
             continue
         if kind not in AUDIBLE_KINDS:
+            if accepted and kind in SILENT_SLOT_KINDS:
+                silent_slots.add(SILENT_SLOT_KINDS[kind])
             continue
         tag = group_tag(event["observed_at"], device_id)
         in_peak = peak["open"] <= event["at"] < peak["end"]
@@ -245,6 +263,7 @@ def _delivery_facts(delivery_path, events, peak, device_id, window):
                                 "tag": tag})
     return {"expected": expected,
             "accounted": accounted,
+            "silent_slots": silent_slots,
             "late": dispatched_peak - expected,
             "undelivered": peak_tags - dispatched_peak,
             "preopen": preopen,
@@ -278,12 +297,22 @@ def _observer_window(observer_end, records):
 
 
 def _analyse_observer(observed_path, start_tolerance_sec, end_tolerance_sec,
-                      max_gap_sec):
+                      max_gap_sec, window_override=None):
     records = _read_jsonl(observed_path)
     ends = [record for record in records
             if record.get("kind") == "observer_end"]
     observer_end = ends[0] if ends else None
-    window = _observer_window(observer_end, records)
+    declared = _observer_window(observer_end, records)
+    window = declared
+    window_matches = True
+    if window_override is not None:
+        # 두 번째 기기의 관측은 첫 기기가 확정한 동일 창에서만 센다.
+        # 자기 창을 다르게 선언했다면 그 자체가 설정 불일치다.
+        window_matches = (
+            declared["ok"] and
+            declared["start"] == window_override["start"] and
+            declared["end"] == window_override["end"])
+        window = dict(window_override)
 
     heartbeats = []
     notifications = []
@@ -371,6 +400,7 @@ def _analyse_observer(observed_path, start_tolerance_sec, end_tolerance_sec,
         "polls_ok": polls_ok,
         "window_source": window["source"],
         "window_ok": window["ok"],
+        "window_matches": window_matches,
         "window_start": window["start_raw"],
         "window_end": window["end_raw"],
         "first_sample_at": first_sample.isoformat()
@@ -387,10 +417,118 @@ def _analyse_observer(observed_path, start_tolerance_sec, end_tolerance_sec,
         "timestamps_ok": timestamps_ok,
     }
     completeness["ok"] = all((
-        observer_end_ok, polls_ok, window["ok"], start_ok, end_ok, gap_ok,
-        no_errors, timestamps_ok,
+        observer_end_ok, polls_ok, window["ok"], window_matches, start_ok,
+        end_ok, gap_ok, no_errors, timestamps_ok,
     ))
     return observed, completeness, window
+
+
+def _logical_groups(tags, device_id):
+    """기기 tag 집합을 device_id를 뗀 논리 그룹/외부/미분류로 나눈다.
+
+    S10과 S25의 트레이 tag 문자열은 device_id 때문에 다르다. 비교 대상은
+    그룹(observed_at)이지 tag가 아니다. parse되지 않는 tag(digest 같은
+    고정 슬롯)는 unparsed로, 다른 기기 소유 tag는 foreign으로 분리한다.
+    """
+    groups = set()
+    foreign = set()
+    unparsed = set()
+    for tag in tags:
+        try:
+            observed_at, owner = parse_group_tag(tag)
+        except ValueError:
+            unparsed.add(tag)
+            continue
+        if owner != device_id:
+            foreign.add(tag)
+            continue
+        groups.add(observed_at)
+    return groups, foreign, unparsed
+
+
+def _device_pass(args, device_id, observed_path, events, peak,
+                 window_override=None):
+    """한 기기의 판정 입력을 모은다. 판정은 attest()가 조립한다."""
+    observed, completeness, window = _analyse_observer(
+        observed_path, args.start_tolerance_sec, args.end_tolerance_sec,
+        args.max_gap_sec, window_override)
+    facts = _delivery_facts(args.delivery, events, peak, device_id, window)
+    claimed = facts["accounted"] | facts["silent_slots"]
+    missing = sorted(facts["expected"] - observed)
+    unaccounted = sorted(observed - claimed)
+    coverage = len(facts["expected"] & observed) / len(facts["expected"]) \
+        if facts["expected"] else None
+    ok = not (facts["unclassified"] or missing or unaccounted or
+              facts["late"] or facts["undelivered"])
+    return {
+        "device_id": device_id,
+        "observed": observed,
+        "window": window,
+        "completeness": completeness,
+        "facts": facts,
+        "missing": missing,
+        "unaccounted": unaccounted,
+        "late": sorted(facts["late"]),
+        "coverage": coverage,
+        "coverage_ok": ok,
+    }
+
+
+def _device_summary(pass_result):
+    facts = pass_result["facts"]
+    return {
+        "device_id": pass_result["device_id"],
+        "coverage": pass_result["coverage"],
+        "expected_count": len(facts["expected"]),
+        "observed_count": len(pass_result["observed"]),
+        "accounted_count": len(facts["accounted"]),
+        "silent_slots": sorted(facts["silent_slots"]),
+        "unclassified_accepted": sorted(facts["unclassified"]),
+        "missing": pass_result["missing"],
+        "unaccounted": pass_result["unaccounted"],
+        "late": pass_result["late"],
+        "undelivered": sorted(facts["undelivered"]),
+        "completeness_ok": pass_result["completeness"]["ok"],
+        "coverage_ok": pass_result["coverage_ok"],
+    }
+
+
+def _cross_device(first, second):
+    """두 기기가 같은 논리 그룹·슬롯을 받았는지 비교한다.
+
+    각자의 ACCEPTED 두 개로는 전체 동등성을 증명할 수 없다. 관측 집합과
+    서버 주장(expected) 집합을 모두 device_id 없는 그룹 단위로 비교한다.
+    """
+    groups_a, foreign_a, unparsed_a = _logical_groups(
+        first["observed"], first["device_id"])
+    groups_b, foreign_b, unparsed_b = _logical_groups(
+        second["observed"], second["device_id"])
+    expected_a, _, _ = _logical_groups(
+        first["facts"]["expected"], first["device_id"])
+    expected_b, _, _ = _logical_groups(
+        second["facts"]["expected"], second["device_id"])
+    only_a = sorted(groups_a - groups_b)
+    only_b = sorted(groups_b - groups_a)
+    slot_only_a = sorted(unparsed_a - unparsed_b)
+    slot_only_b = sorted(unparsed_b - unparsed_a)
+    expected_only_a = sorted(expected_a - expected_b)
+    expected_only_b = sorted(expected_b - expected_a)
+    ok = not (only_a or only_b or slot_only_a or slot_only_b or
+              foreign_a or foreign_b or expected_only_a or expected_only_b)
+    return {
+        "ok": ok,
+        "devices": [first["device_id"], second["device_id"]],
+        "groups": sorted(groups_a | groups_b),
+        "group_count": len(groups_a | groups_b),
+        "only_a": only_a,
+        "only_b": only_b,
+        "slots_only_a": slot_only_a,
+        "slots_only_b": slot_only_b,
+        "foreign_tags_a": sorted(foreign_a),
+        "foreign_tags_b": sorted(foreign_b),
+        "expected_only_a": expected_only_a,
+        "expected_only_b": expected_only_b,
+    }
 
 
 def _analyse_contamination(path, peak):
@@ -447,11 +585,13 @@ def _input_entry(path):
 def _empty_report(inputs, tool):
     return {
         "verdict": None,
+        "device_id": None,
         "coverage": None,
         "vacuous": False,
         "expected_count": 0,
         "observed_count": 0,
         "accounted_count": 0,
+        "silent_slots": [],
         "missing": [],
         "unaccounted": [],
         "late": [],
@@ -460,6 +600,8 @@ def _empty_report(inputs, tool):
         "unclassified_accepted": [],
         "completeness": {},
         "contamination": {},
+        "devices": [],
+        "cross_device": None,
         "peak": {"open": None, "end": None},
         "inputs": inputs,
         "tool": tool,
@@ -476,7 +618,11 @@ def attest(args):
         "calendar": _input_entry(args.calendar),
         "launcher_log": _input_entry(args.launcher_log),
     }
+    if getattr(args, "observed_second", None):
+        inputs["observed_second"] = _input_entry(args.observed_second)
     report = _empty_report(inputs, _tool_info())
+    report["device_id"] = args.device_id
+    peer_id = getattr(args, "device_id_second", None)
 
     fields, provenance_error = _read_provenance(args.launcher_log)
     if provenance_error is not None or _provenance_mismatches(fields, args):
@@ -491,47 +637,57 @@ def attest(args):
         report["peak"] = {"open": peak["open"].isoformat(),
                           "end": peak["end"].isoformat()}
         events = _load_events(events_path)
-        observed, completeness, window = _analyse_observer(
-            args.observed, args.start_tolerance_sec, args.end_tolerance_sec,
-            args.max_gap_sec)
-        facts = _delivery_facts(args.delivery, events, peak, args.device_id,
-                                window)
+        first = _device_pass(args, args.device_id, args.observed, events, peak)
+        second = None
+        if peer_id is not None:
+            second = _device_pass(args, peer_id, args.observed_second, events,
+                                  peak, window_override=first["window"])
         contamination = _analyse_contamination(args.session_observer, peak)
     except InputError as exc:
         report["verdict"] = "UNKNOWN_INPUT"
         print("attest: %s" % exc, file=sys.stderr)
         return report, EXIT_FAIL
 
-    expected = facts["expected"]
-    missing = sorted(expected - observed)
-    unaccounted = sorted(observed - facts["accounted"])
-    late = sorted(facts["late"])
-    coverage = len(expected & observed) / len(expected) if expected else None
-
+    facts = first["facts"]
     contamination["delivered_preopen"] = facts["preopen"]
     contamination["ok"] = contamination["ok"] and not facts["preopen"]
 
     report.update({
-        "coverage": coverage,
-        "vacuous": not expected,
-        "expected_count": len(expected),
-        "observed_count": len(observed),
+        "coverage": first["coverage"],
+        "vacuous": not facts["expected"],
+        "expected_count": len(facts["expected"]),
+        "observed_count": len(first["observed"]),
         "accounted_count": len(facts["accounted"]),
-        "missing": missing,
-        "unaccounted": unaccounted,
-        "late": late,
+        "silent_slots": sorted(facts["silent_slots"]),
+        "missing": first["missing"],
+        "unaccounted": first["unaccounted"],
+        "late": first["late"],
         "undelivered": sorted(facts["undelivered"]),
         "preopen_delivered": facts["preopen"],
         "unclassified_accepted": sorted(facts["unclassified"]),
-        "completeness": completeness,
+        "completeness": first["completeness"],
         "contamination": contamination,
+        "devices": [_device_summary(first)],
     })
-    if not completeness["ok"]:
+    if second is not None:
+        report["devices"].append(_device_summary(second))
+        report["peer"] = _device_summary(second)
+        report["cross_device"] = _cross_device(first, second)
+
+    if not first["completeness"]["ok"]:
         report["verdict"] = "OBSERVATION_INCOMPLETE"
         return report, EXIT_FAIL
-    if facts["unclassified"] or missing or unaccounted or late or \
-            facts["undelivered"]:
+    if second is not None and not second["completeness"]["ok"]:
+        report["verdict"] = "OBSERVATION_INCOMPLETE"
+        return report, EXIT_FAIL
+    if not first["coverage_ok"]:
         report["verdict"] = "COVERAGE_INCOMPLETE"
+        return report, EXIT_FAIL
+    if second is not None and not second["coverage_ok"]:
+        report["verdict"] = "COVERAGE_INCOMPLETE"
+        return report, EXIT_FAIL
+    if second is not None and not report["cross_device"]["ok"]:
+        report["verdict"] = "CROSS_DEVICE_MISMATCH"
         return report, EXIT_FAIL
     if not contamination["ok"]:
         report["verdict"] = "PREOPEN_CONTAMINATION"
@@ -575,6 +731,8 @@ def _parser():
     parser.add_argument("--approved-commit", required=True)
     parser.add_argument("--approved-launcher-sha256", required=True)
     parser.add_argument("--device-id", default=DEFAULT_DEVICE_ID)
+    parser.add_argument("--observed-second")
+    parser.add_argument("--device-id-second")
     parser.add_argument("--start-tolerance-sec", type=_tolerance_arg,
                         default=120)
     parser.add_argument("--end-tolerance-sec", type=_tolerance_arg,
@@ -585,7 +743,14 @@ def _parser():
 
 
 def main(argv=None):
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if bool(args.observed_second) != bool(args.device_id_second):
+        parser.error("--observed-second and --device-id-second must be "
+                     "given together")
+    if args.device_id_second is not None and \
+            args.device_id_second == args.device_id:
+        parser.error("--device-id-second must differ from --device-id")
     report, code = attest(args)
     text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     if args.out:

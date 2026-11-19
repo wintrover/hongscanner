@@ -1,0 +1,17 @@
+## S25(192.168.0.16:5555) 관측자 — S10 유닛과 동일한 창·주기·하드닝.
+## 두 기기는 같은 2026-11-20 승인 창을 독립 관측한다. 증거는 out-dir로
+## 분리해 기기별 파일 하나씩 남긴다(attest가 --observed/--observed-second로
+## 각각 받는다).
+## S25는 LAN TCP adb라 IP가 바뀌면 -s가 실패하고, 관측자는 그 사실을
+## error 레코드로 남긴다 — 조용한 성공으로 접지 않는다.
+## 나머지 근거(창 09:45 종료, RuntimeMaxSec, Restart=no, systemd-inhibit)는
+## hongscanner-notify-observe.service 주석과 같다.
+[Unit]
+Description=Hong Scanner Notification Observer for S25 (one-day acceptance window 2026-11-20)
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle:handle-lid-switch --who=hongscanner-notify-observe-s25 --why=2026-11-20-acceptance-window --mode=block /home/wintrover/바탕화면/hongscanner/tools/observe_notifications.sh --interval 10 --serial 192.168.0.16:5555 --adb /usr/bin/adb --out-dir /home/wintrover/.local/share/hongscanner/observe-s25 --window 2026-11-20T08:58:00+09:00/2026-11-20T09:45:00+09:00
+Restart=no
+TimeoutStopSec=20
+RuntimeMaxSec=50min
