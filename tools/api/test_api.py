@@ -77,8 +77,18 @@ def canonical(obj):
                       separators=(",", ":")).encode("utf-8")
 
 
+def jsonl(*objects):
+    return b"".join(canonical(o) + b"\n" for o in objects)
+
+
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def snapshot_of(data):
+    """The §3.7 input snapshot of fully committed fixture bytes:
+    {size, sha256} over exactly those bytes."""
+    return {"size": len(data), "sha256": sha(data)}
 
 
 def event_id(tag):
@@ -385,6 +395,17 @@ MV_WINNER_INPUT = [
      "seq": 7},
 ]
 
+
+def mv_input_bytes():
+    """The winner's exact input.hcj.jsonl bytes (calendar + config +
+    the rest_resp records) — the §3.7 input snapshot's fixture."""
+    return jsonl(
+        {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+        {"kind": "config", "raw": {"environment": "demo",
+                                   "run_id": MV_WINNER,
+                                   "session_date": "2026-11-09"}, "seq": 2},
+        *MV_WINNER_INPUT)
+
 # The folded dictionary the winner's input must project: latest record
 # wins for 006660, the error and ka10080 bodies contribute nothing, and
 # 000660 is never named.
@@ -455,6 +476,7 @@ MV_EXPECTED = {
                       mv_item(MV_G4_DN01, MV_NAME_MAP),
                       mv_item(MV_G4_DN03, MV_NAME_MAP)],
     "history": MV_HISTORY_G2,  # the unsealed run: group 4 is excluded
+    "input_snapshot": snapshot_of(mv_input_bytes()),
     "latest": {"data_quality": "INCOMPLETE",
                "event_id": MV_INCOMPLETE_SUB["event_id"],
                "event_type": "SUBSCRIPTION_TRUNCATED",
@@ -628,7 +650,21 @@ def ka10081_record(seq, symbol, close, completed=20):
         query={"base_dt": "", "stk_cd": symbol, "tick_kind": "2"})
 
 
-def om_winner_input(variant, pre_empty_pairs=0):
+def daily_capture_failed_gap(seq, symbol):
+    """The collector's failed-capture gap (REPLAY_CONTRACT §12.9): a
+    ka10081 capture that never affirmed success is recorded as this gap,
+    symbol = the skipped stock, what = daily_capture_failed. It is the
+    only gap record the §3.7 fold consumes — coverage attribution."""
+    return {"kind": "gap",
+            "raw": {"detail": "ka10081 daily capture failed (stk_cd %s): "
+                              "HTTP status 502" % symbol,
+                    "symbol": symbol,
+                    "t": "2026-11-10T09:20:00+09:00",
+                    "what": "daily_capture_failed"},
+            "seq": seq}
+
+
+def om_winner_input(variant, pre_empty_pairs=0, failed_symbol=None):
     """The winner's recorded rest_resp sequence. `variant` moves the
     reference group's upsert symbols between chain-pair snapshots:
     "0" keeps both in snapshot 2 (offset 0, the measured default),
@@ -637,7 +673,9 @@ def om_winner_input(variant, pre_empty_pairs=0):
     `pre_empty_pairs` prepends that many pre-open polls — both legs
     affirming success with no ranking rows (the 2026-11-11 live
     pre-open shape): an empty pair contributes no snapshot and must
-    not drift the snapshot index against the candidate-group index."""
+    not drift the snapshot index against the candidate-group index.
+    `failed_symbol` appends one daily_capture_failed gap for that
+    symbol — the coverage capture_failed evidence."""
     s1_falling = om_rows(("011060", 90000))
     if variant == "-1":
         s1_falling += om_rows(("006660", 30000))
@@ -675,7 +713,25 @@ def om_winner_input(variant, pre_empty_pairs=0):
         records.append(ka10081_record(seq, symbol, OM_MA20_CLOSES[symbol]))
         seq += 1
     records.append(ka10081_record(seq, "005490", 10000, completed=19))
+    seq += 1
+    if failed_symbol is not None:
+        records.append(daily_capture_failed_gap(seq, failed_symbol))
     return records
+
+
+def om_input_bytes(variant="0", pre_empty_pairs=0,
+                   open_text="09:00:00+09:00", failed_symbol=None):
+    """The opening winner's exact input.hcj.jsonl bytes: the calendar
+    snapshot, the config identity and the recorded captures — the §3.7
+    input snapshot's fixture (and the same bytes every sandbox builder
+    writes)."""
+    return jsonl(
+        market_calendar(OM_SESSION_DATE, open_text),
+        {"kind": "config", "raw": {"environment": "demo",
+                                   "run_id": OM_WINNER,
+                                   "session_date": OM_SESSION_DATE},
+         "seq": 2},
+        *om_winner_input(variant, pre_empty_pairs, failed_symbol))
 
 
 def om_item(ev, ma20_tag):
@@ -691,10 +747,11 @@ def om_item(ev, ma20_tag):
 
 
 def om_expected(ref_stamp, rising, falling, coverage=None,
-                as_of=OM_REF_STAMP):
+                as_of=OM_REF_STAMP, input_snapshot=None):
     """One opening-mode expected body. `ref_stamp` stamps the recorded
     reference group; `as_of` is the request's decision moment — the
-    mode authority whose KST text is served as mode_as_of."""
+    mode authority whose KST text is served as mode_as_of; the default
+    `input_snapshot` is the default fixture's committed bytes."""
     history = [
         mv_change("CANDIDATE_EXITED", om_g2_017960x(ref_stamp), None, 5,
                   OM_NAMES),
@@ -706,13 +763,21 @@ def om_expected(ref_stamp, rising, falling, coverage=None,
     return {
         "as_of": OM_TEND,
         "coverage": coverage if coverage is not None else {
-            "candidate_count": 12, "computable_count": 8,
+            "candidate_count": 12,
+            "capture_failed_count": 0,
+            "computable_count": 8,
+            "flat_count": 1,
+            "history_short_count": 1,
+            "no_price_count": 1,
+            "no_record_count": 1,
             "rising_count": 5, "falling_count": 3,
             "rising_complete": False, "falling_complete": False,
             "status": "PARTIAL"},
         "data_as_of": OM_TEND,
         "falling_top10": falling,
         "history": history,
+        "input_snapshot": (snapshot_of(om_input_bytes())
+                           if input_snapshot is None else input_snapshot),
         "latest": {"data_quality": "INCOMPLETE",
                    "event_id": OM_TAIL["event_id"],
                    "event_type": "SUBSCRIPTION_TRUNCATED",
@@ -746,22 +811,36 @@ def om_expected_bodies(ref_stamp, as_of=OM_REF_STAMP):
         [om_item(om_g2_011060(ref_stamp), "ABOVE"),
          om_item(om_g2_006660(ref_stamp), "ABOVE")],
         [om_item(g1["012330"], "BELOW"), om_item(g1["005930"], "BELOW")],
-        {"candidate_count": 12, "computable_count": 4,
+        {"candidate_count": 12,
+         "capture_failed_count": 0,
+         "computable_count": 4,
+         "flat_count": 0,
+         "history_short_count": 1,
+         "no_price_count": 6,
+         "no_record_count": 1,
          "rising_count": 2, "falling_count": 2,
          "rising_complete": False, "falling_complete": False,
          "status": "PARTIAL"},
-        as_of=as_of)
+        as_of=as_of,
+        input_snapshot=snapshot_of(om_input_bytes(variant="+1")))
     minus_one = om_expected(
         ref_stamp,
         [om_item(om_g2_011060(ref_stamp), "ABOVE")],
         [om_item(g1["000660"], "BELOW"),
          om_item(om_g2_006660(ref_stamp), "BELOW"),
          om_item(g1["005930"], "BELOW")],
-        {"candidate_count": 12, "computable_count": 4,
+        {"candidate_count": 12,
+         "capture_failed_count": 0,
+         "computable_count": 4,
+         "flat_count": 0,
+         "history_short_count": 1,
+         "no_price_count": 6,
+         "no_record_count": 1,
          "rising_count": 1, "falling_count": 3,
          "rising_complete": False, "falling_complete": False,
          "status": "PARTIAL"},
-        as_of=as_of)
+        as_of=as_of,
+        input_snapshot=snapshot_of(om_input_bytes(variant="-1")))
     return zero, plus_one, minus_one
 
 
@@ -781,21 +860,19 @@ def market_calendar(session_date, open_text="09:00:00+09:00"):
 
 def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0",
                           pre_empty_pairs=0,
-                          open_text="09:00:00+09:00"):
+                          open_text="09:00:00+09:00",
+                          failed_symbol=None):
     """The §3.7 opening-mode fixture tree: the eligible winner run
     whose calendar snapshot opens at `open_text` (the mode window's
     recorded evidence) and one smoke-like ineligible directory
     (runs_present stays true while selection has exactly one eligible
-    run)."""
+    run). `failed_symbol` plants one daily_capture_failed gap for that
+    symbol."""
     box = Sandbox()
     run_dir = box.session_dir(OM_WINNER)
-    box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
-        market_calendar(OM_SESSION_DATE, open_text),
-        {"kind": "config", "raw": {"environment": "demo",
-                                   "run_id": OM_WINNER,
-                                   "session_date": OM_SESSION_DATE},
-         "seq": 2},
-        *om_winner_input(variant, pre_empty_pairs)))
+    box.write(os.path.join(run_dir, "input.hcj.jsonl"),
+              om_input_bytes(variant, pre_empty_pairs, open_text,
+                             failed_symbol))
     box.write(os.path.join(run_dir, "events.hcj.jsonl"),
               jsonl(*om_winner_events(ref_stamp)))
     smoke = box.session_dir("smoke-like-2026-11-10")
@@ -961,6 +1038,20 @@ TF_WINNER_INPUT = [
 ]
 
 
+def tf_input_bytes(events_contract="top10-v1"):
+    """The fact run's exact input.hcj.jsonl bytes — the §3.7 input
+    snapshot's fixture. `events_contract` None omits the discriminator
+    (the legacy-path branch)."""
+    config = {"environment": "demo", "run_id": TF_WINNER,
+              "session_date": TF_SESSION_DATE}
+    if events_contract is not None:
+        config["events_contract"] = events_contract
+    return jsonl(
+        {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+        {"kind": "config", "raw": config, "seq": 2},
+        *TF_WINNER_INPUT)
+
+
 def tf_change(fact, names=None):
     """The §3.7 fact-path change record of a fixture fact: the fact's
     own nine whitelisted fields — change_type is the event_type
@@ -1001,6 +1092,7 @@ TF_EXPECTED = {
     "data_as_of": TF_T3,
     "falling_top10": [tf_item(TF_G2[4]), tf_item(TF_G2[5])],
     "history": TF_HISTORY_G2,  # the unsealed run: flush facts ineligible
+    "input_snapshot": snapshot_of(tf_input_bytes()),
     "latest": {"data_quality": "OBSERVING",
                "event_id": TF_SESSION_END["event_id"],
                "event_type": "SESSION_ENDED",
@@ -1067,24 +1159,14 @@ def build_fact_sandbox(events_contract="top10-v1", sealed=False):
     marker."""
     box = Sandbox()
     run_dir = box.session_dir(TF_WINNER)
-    config = {"environment": "demo", "run_id": TF_WINNER,
-              "session_date": TF_SESSION_DATE}
-    if events_contract is not None:
-        config["events_contract"] = events_contract
-    box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
-        {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
-        {"kind": "config", "raw": config, "seq": 2},
-        *TF_WINNER_INPUT))
+    box.write(os.path.join(run_dir, "input.hcj.jsonl"),
+              tf_input_bytes(events_contract))
     box.write(os.path.join(run_dir, "events.hcj.jsonl"),
               jsonl(*tf_winner_events()))
     if sealed:
         box.write(os.path.join(run_dir, "input.hcj.jsonl.committed"),
                   tf_committed_marker(TF_WINNER))
     return box
-
-
-def jsonl(*objects):
-    return b"".join(canonical(o) + b"\n" for o in objects)
 
 
 class Sandbox:
@@ -2122,7 +2204,8 @@ class MarketViewEmptySuite(unittest.TestCase):
         box = Sandbox()
         self.run_with(box)
         expected = {"as_of": None, "coverage": None, "data_as_of": None,
-                    "falling_top10": [], "history": [], "latest": None,
+                    "falling_top10": [], "history": [],
+                    "input_snapshot": None, "latest": None,
                     "mode": "core", "mode_as_of": MV_AS_OF,
                     "rising_top10": [], "run": None, "runs_present": False,
                     "status": None}
@@ -2149,6 +2232,7 @@ class MarketViewEmptySuite(unittest.TestCase):
         self.assertEqual(body, {"as_of": None, "coverage": None,
                                 "data_as_of": None,
                                 "falling_top10": [], "history": [],
+                                "input_snapshot": None,
                                 "latest": None, "mode": "core",
                                 "mode_as_of": MV_AS_OF,
                                 "rising_top10": [], "run": None,
@@ -2157,11 +2241,12 @@ class MarketViewEmptySuite(unittest.TestCase):
     def test_selected_run_zero_committed_events(self):
         box = Sandbox()
         run_dir = box.session_dir("market-2026-11-09-empty")
-        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+        input_bytes = jsonl(
             {"kind": "calendar", "raw": {}, "seq": 1},
             {"kind": "config", "raw": {"environment": "demo",
                                        "session_date": "2026-11-09"},
-             "seq": 2}))
+             "seq": 2})
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), input_bytes)
         box.write(os.path.join(run_dir, "events.hcj.jsonl"), b"")
         self.run_with(box)
         status, body, _, _ = self.server.get_json(
@@ -2169,7 +2254,9 @@ class MarketViewEmptySuite(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, {
             "as_of": None, "coverage": None, "data_as_of": None,
-            "falling_top10": [], "history": [], "latest": None,
+            "falling_top10": [], "history": [],
+            "input_snapshot": snapshot_of(input_bytes),
+            "latest": None,
             "mode": "core", "mode_as_of": MV_AS_OF, "rising_top10": [],
             "run": {"environment": "demo", "run_id": None,
                     "session": "market-2026-11-09-empty",
@@ -2288,9 +2375,10 @@ class MarketViewOpeningSuite(unittest.TestCase):
 
     def opening_server(self, ref_stamp=OM_REF_STAMP, variant="0",
                        pre_empty_pairs=0,
-                       open_text="09:00:00+09:00"):
+                       open_text="09:00:00+09:00",
+                       failed_symbol=None):
         box = build_opening_sandbox(ref_stamp, variant, pre_empty_pairs,
-                                    open_text)
+                                    open_text, failed_symbol)
         self.addCleanup(box.cleanup)
         server = ServerProc(box, with_delivery=False)
         self.addCleanup(self._reap, server)
@@ -2322,7 +2410,13 @@ class MarketViewOpeningSuite(unittest.TestCase):
                               "observed_at", "rank", "symbol"])
             self.assertIn(item["ma20_tag"], ("ABOVE", "BELOW"))
         self.assertEqual(body["coverage"], {
-            "candidate_count": 12, "computable_count": 8,
+            "candidate_count": 12,
+            "capture_failed_count": 0,
+            "computable_count": 8,
+            "flat_count": 1,
+            "history_short_count": 1,
+            "no_price_count": 1,
+            "no_record_count": 1,
             "rising_count": 5, "falling_count": 3,
             "rising_complete": False, "falling_complete": False,
             "status": "PARTIAL"})
@@ -2395,6 +2489,79 @@ class MarketViewOpeningSuite(unittest.TestCase):
 
     # -- the chain-pair correspondence --------------------------------------
 
+    def test_opening_mode_flat_and_missing_evidence_counted(self):
+        # the coverage vocabulary counts the symbols the lists honestly
+        # exclude: 001440 sits exactly at MA20 (flat), 003490 has twenty
+        # closes but no snapshot price (no_price), 005490 only nineteen
+        # completed days (history_short), 002420 no ka10081 record
+        # (no_record); computable is the two lists' contents and the six
+        # counts partition candidate_count. The lists themselves still
+        # exclude every one of them.
+        _, body, _, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        coverage = body["coverage"]
+        self.assertEqual(coverage["capture_failed_count"], 0)
+        self.assertEqual(coverage["no_record_count"], 1)
+        self.assertEqual(coverage["history_short_count"], 1)
+        self.assertEqual(coverage["no_price_count"], 1)
+        self.assertEqual(coverage["flat_count"], 1)
+        self.assertEqual(coverage["computable_count"], 8)
+        self.assertEqual(
+            coverage["capture_failed_count"] + coverage["no_record_count"]
+            + coverage["history_short_count"] + coverage["no_price_count"]
+            + coverage["flat_count"] + coverage["computable_count"],
+            coverage["candidate_count"])
+        served = {i["symbol"] for i in body["rising_top10"]
+                  + body["falling_top10"]}
+        for symbol in ("001440", "003490", "005490", "002420"):
+            self.assertNotIn(symbol, served)
+
+    def test_opening_mode_capture_failed_bucket_and_partition(self):
+        # a daily_capture_failed gap for 002420 (no affirming ka10081
+        # response) moves that symbol from no_record to capture_failed;
+        # the partition invariant holds and nothing is served for it.
+        # The gap is evidence only — it never contributes a name, price
+        # or close.
+        server = self.opening_server(failed_symbol="002420")
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        coverage = body["coverage"]
+        self.assertEqual(coverage["capture_failed_count"], 1)
+        self.assertEqual(coverage["no_record_count"], 0)
+        # 005490 remains the history_short symbol (19 completed days)
+        self.assertEqual(coverage["history_short_count"], 1)
+        self.assertEqual(coverage["flat_count"], 1)
+        self.assertEqual(coverage["computable_count"], 8)
+        self.assertEqual(
+            coverage["capture_failed_count"] + coverage["no_record_count"]
+            + coverage["history_short_count"] + coverage["no_price_count"]
+            + coverage["flat_count"] + coverage["computable_count"],
+            coverage["candidate_count"])
+        self.assertEqual(coverage["candidate_count"], 12)
+        served = {i["symbol"] for i in body["rising_top10"]
+                  + body["falling_top10"]}
+        self.assertNotIn("002420", served)
+        self.assertLessEqual(len(raw), 65536)
+
+    def test_opening_mode_input_snapshot_stable(self):
+        # the §3.7 input snapshot is the committed prefix the fold
+        # consumed: {size, sha256} of the fixture's exact bytes; the
+        # memoized second request serves the same value and bytes
+        expected = snapshot_of(om_input_bytes())
+        status, body, raw, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["input_snapshot"], expected)
+        self.assertEqual(len(body["input_snapshot"]["sha256"]), 64)
+        status2, body2, raw2, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2["input_snapshot"], expected)
+        self.assertEqual(raw2, raw)
+
+    # -- the chain-pair correspondence --------------------------------------
+
     def test_opening_mode_offset_zero_is_the_default(self):
         # snapshots 1 and 3 carry trap prices that would flip the
         # classification (005930 +50000/+40000 would be BELOW, 011060
@@ -2419,6 +2586,7 @@ class MarketViewOpeningSuite(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
+        self.assertLessEqual(len(raw), 65536)
 
     def test_opening_mode_offset_minus_one(self):
         # neither snapshot 2 nor 3 carries 011060, snapshot 1 carries
@@ -2431,6 +2599,7 @@ class MarketViewOpeningSuite(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
+        self.assertLessEqual(len(raw), 65536)
 
     def test_opening_mode_all_offsets_fail_is_data_fault(self):
         # no snapshot's symbol set covers the reference group's
@@ -2451,6 +2620,11 @@ class MarketViewOpeningSuite(unittest.TestCase):
         # and the mode fails closed on sound data
         server = self.opening_server(variant="0", pre_empty_pairs=2)
         expected, _, _ = om_expected_bodies(OM_REF_STAMP)
+        # the two prepended empty pairs change the committed input bytes
+        # and nothing else: the snapshot is theirs, the lists and
+        # coverage must not drift
+        expected["input_snapshot"] = snapshot_of(
+            om_input_bytes(pre_empty_pairs=2))
         status, body, raw, _ = server.get_json(
             "/mobile/market-view?as_of=" + OM_REF_STAMP)
         self.assertEqual(status, 200)
@@ -2633,12 +2807,13 @@ class MarketViewOpeningSuite(unittest.TestCase):
         box = Sandbox()
         self.addCleanup(box.cleanup)
         run_dir = box.session_dir("market-2026-11-10-empty")
-        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+        input_bytes = jsonl(
             market_calendar(OM_SESSION_DATE),
             {"kind": "config", "raw": {"environment": "demo",
                                        "run_id": "market-2026-11-10-empty",
                                        "session_date": OM_SESSION_DATE},
-             "seq": 2}))
+             "seq": 2})
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), input_bytes)
         box.write(os.path.join(run_dir, "events.hcj.jsonl"), b"")
         server = ServerProc(box, with_delivery=False)
         self.addCleanup(self._reap, server)
@@ -2652,6 +2827,79 @@ class MarketViewOpeningSuite(unittest.TestCase):
         self.assertEqual(body["mode_as_of"], OM_REF_STAMP)
         self.assertIsNone(body["as_of"])
         self.assertIsNone(body["data_as_of"])
+        # the fold still consumed the input: the snapshot is present
+        self.assertEqual(body["input_snapshot"],
+                         snapshot_of(input_bytes))
+
+    def test_calendar_file_past_the_old_head_window_is_still_read(self):
+        # the 2027 KRX calendar snapshot is 49,460 bytes — the recorded
+        # first record alone is past the old 16 KiB window. The run is
+        # eligible and the opening read from its calendar snapshot still
+        # selects the window (README §3.7: the head cap is 1 MiB).
+        calendar = market_calendar(OM_SESSION_DATE)
+        calendar["raw"]["days"]["2027-01-04"] = {
+            "close": "15:30:00+09:00", "half_day": False,
+            "open": "09:00:00+09:00", "reason": None}
+        # pad to the real 49,460-byte snapshot's size with inert day
+        # entries (every value a recorded shape)
+        filler = 0
+        while len(canonical(calendar)) < 49460:
+            filler += 1
+            calendar["raw"]["days"]["2027-%02d-%02d"
+                                    % (1 + filler // 28, 1 + filler % 28)] = {
+                "close": "15:30:00+09:00", "half_day": False,
+                "open": "09:00:00+09:00", "reason": None}
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        run_dir = box.session_dir(OM_WINNER)
+        input_bytes = jsonl(
+            calendar,
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "run_id": OM_WINNER,
+                                       "session_date": OM_SESSION_DATE},
+             "seq": 2},
+            *om_winner_input("0"))
+        self.assertGreater(len(canonical(calendar)), 16384)
+        self.assertLessEqual(len(input_bytes), serve.MARKET_CONFIG_HEAD_BYTES)
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), input_bytes)
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+                  jsonl(*om_winner_events(OM_REF_STAMP)))
+        server = ServerProc(box, with_delivery=False)
+        self.addCleanup(self._reap, server)
+        status, body, _, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["mode"], "opening_ma20")
+        self.assertEqual(self.symbols(body, "falling_top10"),
+                         ["011060", "008480", "006660"])
+        self.assertEqual(body["input_snapshot"],
+                         snapshot_of(input_bytes))
+
+    def test_over_cap_calendar_head_faults_instead_of_dropping(self):
+        # a committed config record beyond the head cap cannot be proven
+        # absent from a truncated head: the run is never silently
+        # dropped — the projection raises DataFault (the endpoint's
+        # data_fault, README §4) instead of serving the empty state.
+        box = Sandbox()
+        self.addCleanup(box.cleanup)
+        run_dir = box.session_dir(OM_WINNER)
+        calendar = market_calendar(OM_SESSION_DATE)
+        calendar["raw"]["pad"] = "x" * serve.MARKET_CONFIG_HEAD_BYTES
+        input_bytes = jsonl(
+            calendar,
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "run_id": OM_WINNER,
+                                       "session_date": OM_SESSION_DATE},
+             "seq": 2},
+            *om_winner_input("0"))
+        self.assertGreater(len(input_bytes),
+                           serve.MARKET_CONFIG_HEAD_BYTES)
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), input_bytes)
+        box.write(os.path.join(run_dir, "events.hcj.jsonl"),
+                  jsonl(*om_winner_events(OM_REF_STAMP)))
+        projector = serve.Projector(box.runs, box.ledger)
+        with self.assertRaises(serve.DataFault):
+            projector.market_view(datetime.fromisoformat(OM_REF_STAMP))
 
     def test_opening_mode_stamp_zone_is_not_the_authority(self):
         # the recorded reference stamp in +00:00 (00:20 = 09:20 KST) is
@@ -2937,7 +3185,8 @@ class MarketViewFactSuite(unittest.TestCase):
         status, body, raw, _ = server.get_json(
             "/mobile/market-view?as_of=" + TF_AS_OF)
         self.assertEqual(status, 200)
-        expected = dict(TF_EXPECTED, history=TF_LEGACY_HISTORY_G2)
+        expected = dict(TF_EXPECTED, history=TF_LEGACY_HISTORY_G2,
+                        input_snapshot=snapshot_of(tf_input_bytes(None)))
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
         # sealed, the legacy derivation confirms group 3 on the same
@@ -2988,14 +3237,15 @@ class MarketViewFactSuite(unittest.TestCase):
         box = Sandbox()
         self.addCleanup(box.cleanup)
         run_dir = box.session_dir(OM_WINNER)
-        box.write(os.path.join(run_dir, "input.hcj.jsonl"), jsonl(
+        input_bytes = jsonl(
             market_calendar(OM_SESSION_DATE),
             {"kind": "config", "raw": {"environment": "demo",
                                        "events_contract": "top10-v1",
                                        "run_id": OM_WINNER,
                                        "session_date": OM_SESSION_DATE},
              "seq": 2},
-            *om_winner_input("0")))
+            *om_winner_input("0"))
+        box.write(os.path.join(run_dir, "input.hcj.jsonl"), input_bytes)
         facts = [
             # group 2's boundary facts: the disappearance (rank null),
             # and the two TOP10 entries the correspondence check is
@@ -3017,6 +3267,7 @@ class MarketViewFactSuite(unittest.TestCase):
         expected, _, _ = om_expected_bodies(OM_REF_STAMP)
         expected = dict(expected,
                         history=[tf_change(f, OM_NAMES) for f in facts],
+                        input_snapshot=snapshot_of(input_bytes),
                         status={"by_data_quality": {"INCOMPLETE": 1,
                                                     "OBSERVING": 19}})
         status, body, raw, _ = server.get_json(
@@ -3025,6 +3276,82 @@ class MarketViewFactSuite(unittest.TestCase):
         self.assertEqual(body, expected)
         self.assertEqual(raw, canonical(expected) + b"\n")
         self.assertEqual(body["mode"], "opening_ma20")
+
+
+class CoveragePartitionSuite(unittest.TestCase):
+    """The §3.7 coverage vocabulary (README 개장 모드 수집 상태): every
+    candidate-state symbol lands in exactly one of the six additive
+    buckets by the documented precedence, so
+    capture_failed + no_record + history_short + no_price + flat +
+    computable == candidate_count. A pure-function contract over
+    opening_market_top10 — no server, no files."""
+
+    STAMP = "2026-11-10T09:10:00+09:00"
+
+    @classmethod
+    def item(cls, symbol):
+        return {"data_quality": "OBSERVING", "direction": "UP",
+                "event_id": sha(b"coverage-" + symbol.encode()),
+                "event_type": "CANDIDATE_ENTERED", "ma20_tag": None,
+                "name": None, "observed_at": cls.STAMP, "rank": 1,
+                "symbol": symbol}
+
+    def test_six_buckets_partition_the_state(self):
+        symbols = ("000001", "000002", "000003", "000004", "000005",
+                   "000006", "000007")
+        state = {symbol: self.item(symbol) for symbol in symbols}
+        # the reference group's upserts are the two priced symbols; the
+        # correspondence maps to snapshot 0
+        confirmed = (1, self.STAMP, state, {"000005", "000006"})
+        snapshots = [{"000005": 100, "000006": 100}]
+        ma20 = {"000004": 9999, "000005": 2000, "000006": 3000}
+        day_counts = {"000002": 0, "000003": 19, "000004": 20,
+                      "000005": 20, "000006": 20, "000007": 19}
+        # 000001 failed and never affirmed; 000007 failed but a later
+        # affirming response exists, so it is NOT capture_failed
+        capture_failed = {"000001", "000007"}
+        affirmed = {"000002", "000003", "000004", "000005", "000006",
+                    "000007"}
+        rising, falling, coverage = serve.opening_market_top10(
+            "opening_ma20", confirmed, snapshots, ma20, day_counts,
+            capture_failed, affirmed)
+        self.assertEqual(coverage["candidate_count"], 7)
+        self.assertEqual(coverage["capture_failed_count"], 1)  # 000001
+        self.assertEqual(coverage["no_record_count"], 1)       # 000002
+        self.assertEqual(coverage["history_short_count"], 2)   # 000003/7
+        self.assertEqual(coverage["no_price_count"], 1)        # 000004
+        self.assertEqual(coverage["flat_count"], 1)            # 000005
+        self.assertEqual(coverage["computable_count"], 1)      # 000006
+        self.assertEqual(
+            coverage["capture_failed_count"] + coverage["no_record_count"]
+            + coverage["history_short_count"] + coverage["no_price_count"]
+            + coverage["flat_count"] + coverage["computable_count"],
+            coverage["candidate_count"])
+        # the lists keep the existing honest exclusions: only the
+        # computable symbol is served (000006 is below its average)
+        self.assertEqual(rising, [])
+        self.assertEqual([item["symbol"] for item in falling], ["000006"])
+        self.assertEqual(coverage["rising_count"], 0)
+        self.assertEqual(coverage["falling_count"], 1)
+        # the status vocabulary is unchanged: fewer than ten per side
+        self.assertEqual(coverage["status"], "PARTIAL")
+
+    def test_no_evidence_is_no_record_so_the_partition_holds(self):
+        # a state symbol with neither a gap nor an affirming response
+        # is a recorded absence: no_record — the partition never leaks
+        # a symbol into no bucket
+        state = {"000001": self.item("000001")}
+        confirmed = (1, self.STAMP, state, {"000001"})
+        _, _, coverage = serve.opening_market_top10(
+            "opening_ma20", confirmed, [{"000001": 100}], {},
+            {symbol: 0 for symbol in state}, set(), set())
+        self.assertEqual(coverage["no_record_count"], 1)
+        self.assertEqual(coverage["computable_count"], 0)
+        self.assertEqual(
+            coverage["capture_failed_count"] + coverage["no_record_count"]
+            + coverage["history_short_count"] + coverage["no_price_count"]
+            + coverage["flat_count"] + coverage["computable_count"],
+            coverage["candidate_count"])
 
 
 class MarketFoldSuite(unittest.TestCase):
@@ -3251,6 +3578,63 @@ class MarketFoldSuite(unittest.TestCase):
             with self.assertRaises(serve.DataFault):
                 serve.fold_market_projection(path, bad)
 
+    # -- gaps and the input snapshot ---------------------------------------
+
+    def test_fold_indexes_capture_failed_gaps(self):
+        # the fold's only gap contribution: a daily_capture_failed gap's
+        # symbol. Every other gap kind contributes nothing, and an
+        # affirming ka10081 response marks its symbol as captured.
+        path = self.write_input(
+            daily_capture_failed_gap(1, "002420"),
+            {"kind": "gap", "raw": {"detail": "truncated",
+                                    "symbol": None,
+                                    "t": "2026-11-10T09:21:00+09:00",
+                                    "what": "rest_truncated"}, "seq": 2},
+            ka10081_record(3, "005930", 70000))
+        state = serve._fold_market_projection_inc(path, "2026-11-10")
+        self.assertEqual(state.gaps, {"002420"})
+        self.assertEqual(state.affirmed, {"005930"})
+        self.assertEqual(state.bars, {"005930": [set(om_dts(20)),
+                                                 1400000, 20]})
+        with open(path, "rb") as f:
+            data = f.read()
+        self.assertEqual(state.offset, len(data))
+        self.assertEqual(state.sha.hexdigest(), sha(data))
+
+    def test_fold_malformed_gap_envelope_is_data_fault(self):
+        for label, record in (
+                ("raw", {"kind": "gap", "raw": "not-an-object", "seq": 1}),
+                ("what", {"kind": "gap", "raw": {"symbol": "005930"},
+                          "seq": 1}),
+                ("symbol", {"kind": "gap",
+                            "raw": {"symbol": None,
+                                    "what": "daily_capture_failed"},
+                            "seq": 1})):
+            path = self.write_input(record)
+            with self.assertRaises(serve.DataFault, msg=label):
+                serve.fold_market_projection(path, "2026-11-10")
+
+    def test_fold_input_snapshot_is_the_committed_prefix(self):
+        # the snapshot hashes exactly the committed bytes: a torn tail is
+        # not hashed and not counted in size
+        committed = (canonical(om_chain(
+            2, "1", om_rows(("005930", 75000)))) + b"\n")
+        torn = canonical(om_chain(3, "3", om_rows(("006660", 45000))))
+        path = self.write_input()
+        with open(path, "wb") as f:
+            f.write(committed + torn[:20])
+        state = serve._fold_market_projection_inc(path, "2026-11-10")
+        self.assertEqual(state.offset, len(committed))
+        self.assertEqual(state.sha.hexdigest(), sha(committed))
+        # the incremental resume continues the same prefix hash
+        with open(path, "ab") as f:
+            f.write(torn[20:] + b"\n")
+        state2 = serve._fold_market_projection_inc(
+            path, "2026-11-10", state)
+        self.assertEqual(state2.offset, len(committed + torn) + 1)
+        self.assertEqual(state2.sha.hexdigest(),
+                         sha(committed + torn + b"\n"))
+
     # -- memoization -------------------------------------------------------
 
     def test_fold_cache_hit_and_invalidation(self):
@@ -3345,6 +3729,97 @@ class MarketFoldSuite(unittest.TestCase):
         self.assertEqual(
             projector._market_projection(path, "2026-11-09")[0],
             {"006660": "LG전자"})
+
+
+class ReadHeadConfigSuite(unittest.TestCase):
+    """The config/calendar head reader (README §3.7 적격 판정): a file
+    within MARKET_CONFIG_HEAD_BYTES is read whole — the 2027 calendar
+    snapshot's 49,460-byte first record is past the old 16 KiB window
+    and must still parse; a larger file is read only through the cap,
+    and a committed config record that is not inside it is a DataFault
+    (never a silent None that drops the run). Unit-level over
+    read_head_config; the endpoint's eligibility uses this reader."""
+
+    CALENDAR_2027_BYTES = 49460
+
+    def setUp(self):
+        self.box = Sandbox()
+        self.addCleanup(self.box.cleanup)
+
+    def write_input(self, data, name="market-2027-01-04"):
+        run_dir = self.box.session_dir(name)
+        path = os.path.join(run_dir, "input.hcj.jsonl")
+        self.box.write(path, data)
+        return path
+
+    def test_2027_calendar_record_is_read(self):
+        # the measured 2027 KRX calendar snapshot's first record alone
+        # exceeds the old 16 KiB head window; the whole small file is
+        # read, so the config record is found and the run is eligible
+        calendar = market_calendar("2027-01-04")
+        calendar["raw"]["pad"] = ""
+        calendar["raw"]["pad"] = "x" * (
+            self.CALENDAR_2027_BYTES - len(canonical(calendar)))
+        self.assertEqual(len(canonical(calendar)),
+                         self.CALENDAR_2027_BYTES)
+        self.assertGreater(len(canonical(calendar)), 16384)
+        config = {"environment": "demo", "run_id": "market-2027-01-04",
+                  "session_date": "2027-01-04"}
+        path = self.write_input(jsonl(
+            calendar, {"kind": "config", "raw": config, "seq": 2}))
+        self.assertEqual(serve.read_head_config(path), config)
+
+    def test_config_inside_a_growing_file_head_is_read(self):
+        # the production shape: the input grows all day, but the config
+        # record sits near the head — a file larger than the cap whose
+        # config is inside it still resolves (the cap bounds the read,
+        # not the file)
+        config = {"environment": "demo", "session_date": "2026-11-09"}
+        big = {"kind": "ws_frame",
+               "raw": {"blob": "x" * serve.MARKET_CONFIG_HEAD_BYTES},
+               "seq": 3}
+        path = self.write_input(jsonl(
+            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1},
+            {"kind": "config", "raw": config, "seq": 2}, big))
+        self.assertGreater(os.path.getsize(path),
+                           serve.MARKET_CONFIG_HEAD_BYTES)
+        self.assertEqual(serve.read_head_config(path), config)
+
+    def test_over_cap_head_with_no_committed_line_raises(self):
+        # a committed first line larger than the cap leaves no LF inside
+        # the head: nothing can be proven, so the reader faults
+        big = {"kind": "ws_frame",
+               "raw": {"blob": "x" * serve.MARKET_CONFIG_HEAD_BYTES},
+               "seq": 1}
+        path = self.write_input(jsonl(
+            big, {"kind": "config", "raw": {"environment": "demo",
+                                            "session_date": "2026-11-09"},
+                  "seq": 2}))
+        with self.assertRaises(serve.DataFault):
+            serve.read_head_config(path)
+
+    def test_over_cap_head_that_hides_the_config_raises(self):
+        # committed lines fill the head exactly and the config follows
+        # beyond it: the truncated head cannot prove absence -> DataFault
+        filler = {"kind": "ws_frame", "raw": {"blob": ""}, "seq": 1}
+        base = len(canonical(filler)) + 1  # the terminating LF
+        filler["raw"]["blob"] = "x" * (
+            serve.MARKET_CONFIG_HEAD_BYTES - base)
+        first = canonical(filler) + b"\n"
+        self.assertEqual(len(first), serve.MARKET_CONFIG_HEAD_BYTES)
+        path = self.write_input(first + jsonl(
+            {"kind": "config", "raw": {"environment": "demo",
+                                       "session_date": "2026-11-09"},
+             "seq": 2}))
+        with self.assertRaises(serve.DataFault):
+            serve.read_head_config(path)
+
+    def test_small_file_without_a_config_record_is_absence(self):
+        # within the cap, a file with no config record is still the
+        # documented absence (None) — only an over-cap head faults
+        path = self.write_input(jsonl(
+            {"kind": "calendar", "raw": {"market": "KRX"}, "seq": 1}))
+        self.assertIsNone(serve.read_head_config(path))
 
 
 class MarketEventsLinesSuite(unittest.TestCase):
