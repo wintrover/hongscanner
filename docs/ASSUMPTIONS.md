@@ -371,6 +371,46 @@ still requires G2 credentials.
   multi-device addressing — neither performs tray grouping. Observed on
   the 2026-11-11 device as the `ranker_group` group key and a
   "texts are empty" heads-up reject for the auto summary.
+- FCM Android notification slot (Firebase REST v1 `AndroidNotification`,
+  checked 2026-11-19 via Context7 `/websites/firebase_google` and the
+  Admin SDK source `/firebase/firebase-android-sdk`): the shade slot is
+  `message.android.notification.tag` (string), "Identifier used to
+  replace existing notifications in the notification drawer"; "If
+  specified and a notification with the same tag is already being shown,
+  the new notification replaces the existing one". A send response is
+  not delivery: "When an app server posts a message to FCM and receives a
+  message ID back, it doesn't mean that the message was already delivered
+  to the device. Instead, it means that it was accepted for delivery."
+  Notification messages "are always collapsible", so an undelivered
+  message may be replaced server-side. The SDK's background display path
+  uses the payload tag verbatim (`CommonNotificationBuilder.getTag()`,
+  id=0); foreground messages "are handled by a callback function", and
+  this app's foreground re-post uses `notify(null, id, …)` — the tag is
+  lost on that path only.
+- Android notification identity (AOSP `android12-release`, checked
+  2026-11-19): `NotificationManager.notify` replaces only when **both**
+  tag and id match; "The pair (tag, id) must be unique". `dumpsys
+  notification` prints `NotificationRecord(... pkg=%s user=%s id=%d
+  tag=%s ... key=%s ...)`; `key()` is `user|pkg|id|tag|uid`, so a tag
+  containing `|` makes key-splitting unsafe — read `id=`/`tag=` from the
+  header instead. Notification history is a system-wide ring buffer with
+  `HISTORY_RETENTION_DAYS = 1` and `NOTIFICATION_HISTORY_ENABLED` default
+  0; `disableHistory()` deletes the file. `postTime` may differ from
+  `Notification.when`, so `when` is not the post time.
+- systemd (freedesktop man pages, systemd 255, checked 2026-11-19): "When
+  a calendar timer elapses while the system is sleeping it will not be
+  acted on immediately, but once the system is later resumed it will
+  catch up and process all timers that triggered while the system was
+  sleeping." `Persistent=` only covers the period while the timer unit
+  itself is inactive (boot / user-manager start), so it does not prevent
+  a post-resume firing. `RuntimeMaxSec=` "does not have any effect on
+  `Type=oneshot` services". For a `Type=simple` service the unit is
+  considered started before exec, so an exec failure is reported as
+  success (`Type=exec` fixes that). Inhibitor locks: `logind.conf`
+  `LidSwitchIgnoreInhibited=` defaults to "yes", i.e. "the lid switch
+  does not respect suspend blockers by default", and
+  `systemd-inhibit --what=` includes `handle-lid-switch`; a `sleep` lock
+  alone therefore does not stop a lid-close suspend.
 
 ## Trust boundary
 
