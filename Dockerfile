@@ -81,6 +81,7 @@ COPY tools/notify/notify_clock.py /opt/hongscanner/tools/notify/notify_clock.py
 COPY tools/notify/notify_config.py /opt/hongscanner/tools/notify/notify_config.py
 COPY tools/notify/notify_fcm.py /opt/hongscanner/tools/notify/notify_fcm.py
 COPY tools/notify/notify_ledger.py /opt/hongscanner/tools/notify/notify_ledger.py
+COPY tools/notify/group_tag.py /opt/hongscanner/tools/notify/group_tag.py
 
 # PR-4 runtime supervisor (tools/container/README.md §7): the container
 # process. Standard library only — nothing is installed for it, ever.

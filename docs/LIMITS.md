@@ -113,8 +113,12 @@ What the VS-1 result does **not** prove. Each line names who owns the proof.
 세션과 분리된 systemd **user** 타이머
 `tools/systemd/hongscanner-observe.timer`가 맡는다.
 
-- 체크포인트(평일, KST): `08:45` · `08:55` · `09:55` · `10:05` · `10:15` ·
-  `10:25` · `10:31` · `15:45`
+- 체크포인트는 런 달력의 `open`에서 계산한다(`tools/observe_schedule.py`):
+  고정 `08:45` · `08:55` · `15:45` + open−5/+5/+15/+25/+35분. 10:00 개장일이면
+  `08:45` · `08:55` · `09:55` · `10:05` · `10:15` · `10:25` · `10:35` · `15:45`,
+  09:00 개장일이면 `08:45` · `08:55` · `09:05` · `09:15` · `09:25` · `09:35` ·
+  `15:45`다. 달력 open을 읽지 못하면 10:00 기준 LEGACY 목록으로 후퇴하며,
+  그 목록은 다른 개장 시각의 피크를 증명하지 않는다.
 - 증거 파일: `~/.local/share/hongscanner/observe/observe-<KST session_date>.hcj.jsonl`
   — 실행마다 한 줄 JSON을 append한다(덮어쓰지 않는다).
 - **이 타이머는 세션과 독립이다** — 세션 서비스가 죽거나 끝나도 체크포인트는

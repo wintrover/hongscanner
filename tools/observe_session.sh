@@ -15,7 +15,23 @@
 ## FAILURE POLICY: every check is independent. A failing check records
 ## null + an `errors` entry and the script still exits 0 — a red checkpoint
 ## must never kill the timer. The `error` field is the honest summary.
+##
+## --scheduled: the timer invocation. The checkpoint times come from the
+## run's own calendar snapshot (tools/observe_schedule.py); a fire that
+## is not a checkpoint exits without writing, before the ledger scan.
+## Without the flag (manual run) a line is always recorded.
 set -u
+
+scheduled=0
+for arg in "$@"; do
+  case "$arg" in
+    --scheduled) scheduled=1 ;;
+    *)
+      printf 'observe_session.sh: unknown argument: %s\n' "$arg" >&2
+      exit 2
+      ;;
+  esac
+done
 
 export TZ=Asia/Seoul
 
@@ -30,7 +46,7 @@ OUT_FILE="${OUT_DIR}/observe-${SESSION_DATE}.hcj.jsonl"
 
 mkdir -p "$OUT_DIR" 2>/dev/null || true
 
-python3 - "$OUT_FILE" "$SESSION_DATE" "$NOW_ISO" "$NOW_KST" "$REPO_ROOT" <<'PY'
+python3 - "$OUT_FILE" "$SESSION_DATE" "$NOW_ISO" "$NOW_KST" "$REPO_ROOT" "$scheduled" <<'PY'
 import collections
 import datetime as dt
 import glob
@@ -42,10 +58,13 @@ import time
 import urllib.error
 import urllib.request
 
-(out_file, session_date, at, kst, repo_root) = sys.argv[1:6]
+(out_file, session_date, at, kst, repo_root, scheduled) = sys.argv[1:7]
+scheduled = scheduled == "1"
 
-CHECKPOINTS = ("08:45", "08:55", "09:55", "10:05",
-               "10:15", "10:25", "10:31", "15:45")
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(repo_root, "tools"))
+from observe_schedule import schedule  # noqa: E402
+
 SESSION_UNIT = "hongscanner-session.service"
 SESSION_TIMER = "hongscanner-session.timer"
 OBSERVE_TIMER = "hongscanner-observe.timer"
@@ -71,13 +90,14 @@ def run_cmd(args, timeout=10):
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
-def checkpoint_name():
+def checkpoint_name(calendar_open):
     hm = at[11:16]
-    if hm in CHECKPOINTS:
+    names = schedule(calendar_open)
+    if hm in names:
         return hm
     minutes = int(hm[:2]) * 60 + int(hm[3:])
     best = None
-    for name in CHECKPOINTS:
+    for name in names:
         delta = abs(minutes - (int(name[:2]) * 60 + int(name[3:])))
         if delta <= 3 and (best is None or delta < best[0]):
             best = (delta, name)
@@ -115,7 +135,7 @@ def load_run_dir():
 record = {
     "at": at,
     "kst": kst,
-    "checkpoint": checkpoint_name(),
+    "checkpoint": None,
     "timer_next": None,
     "timer_unit": SESSION_TIMER,
     "observer_timer_next": None,
@@ -201,6 +221,14 @@ if run_dir is not None:
     except Exception as exc:  # noqa: BLE001
         fail("calendar_open", exc)
 
+# ---- checkpoint schedule from the recorded opening ----------------------
+# The timer fires on a 5-minute grid; a fire that is not a checkpoint
+# exits here, before the ledger scan, and writes nothing.
+record["checkpoint"] = checkpoint_name(record["calendar_open"])
+if scheduled and record["checkpoint"].startswith("manual-"):
+    sys.exit(0)
+
+if run_dir is not None:
     # run.json is the declared session identity; live collector runs do not
     # write it yet, so the input config record (seq 2) is the fallback the
     # API itself uses.

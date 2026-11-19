@@ -491,7 +491,7 @@ jobs:
           cp tools/collector/requirements.txt \
              "$ctx/tools/collector/requirements.txt"
           for f in notify_dispatcher.py notify_clock.py notify_config.py \
-                   notify_fcm.py notify_ledger.py; do
+                   notify_fcm.py notify_ledger.py group_tag.py; do
             cp "tools/notify/$f" "$ctx/tools/notify/$f"
           done
           # The staged binaries ARE the attested CI_BUILD_OUT binaries:

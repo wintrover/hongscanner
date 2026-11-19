@@ -1,9 +1,10 @@
 # VS-3 Event Ledger + Notification Dispatcher — 운영 기록 계약 (PR-5)
 
 이 문서는 `tools/notify/`의 **커밋되는 계약**이다. Python 모듈
-(`notify_ledger.py`·`notify_fcm.py`·`notify_dispatcher.py`·
-`notify_register.py`·`notify_config.py`)은 이 문서의 상태·파일·오류
-의미를 그대로 구현하며, 구현이 이 문서와 어긋나면 구현이 틀린 것이다.
+(`group_tag.py`·`notify_ledger.py`·`notify_fcm.py`·
+`notify_dispatcher.py`·`notify_register.py`·`notify_config.py`)은 이
+문서의 상태·파일·오류 의미를 그대로 구현하며, 구현이 이 문서와
+어긋나면 구현이 틀린 것이다.
 
 - 상위 계약: docs/REPLAY_CONTRACT.md §13 (이벤트 계약),
   contracts/events/event.schema.json (불변 이벤트 팩트),
@@ -345,6 +346,15 @@ Python register 프로세스 (notify_register.py)
   previous_rank만 있으면 `<prev>위→후보 제외`, 둘 다 없으면 순위
   문안 없음 — single과 같은 정직성 규칙, 발명 금지) + ` 외 N건`,
   priority **"normal"**·channel `market_rank_digest`.
+- **사운드 유닛은 그룹 태그를 싣는다**: single·summary 메시지는
+  `android.notification.tag = "hs-g|<observed_at>|<device_id>"`를
+  싣는다(`tools/notify/group_tag.py`; 유닛의 첫 사건 `observed_at`과
+  유닛 `device_id`). 같은 관측 그룹은 같은 태그, 다른 그룹은 다른
+  태그이므로, 독립적인 ADB 관측자는 기기 알림을 서버 delivery 행의
+  `(observed_at, device_id)`와 정확히 결합할 수 있다. 태그는 **슬롯
+  정체성일 뿐 중복 제거 기제가 아니며**, 사운드 여부의 어드미션은
+  여전히 서버가 유일한 권위다. **무음 digest는 예외다** — 아래 단일
+  슬롯 `market_rank_digest`를 그대로 쓴다.
 - **무음 digest는 알림 shade의 단일 슬롯이다**: digest 메시지는
   `android.notification.tag = "market_rank_digest"`를 싣고, background
   에서는 Firebase Messaging의 `DisplayNotification`이

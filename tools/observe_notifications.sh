@@ -23,11 +23,21 @@
 ## shade uses (FCM tags are per message; the digest slot is replaced in place,
 ## so a new `when` marks a new post). The file is append-only.
 ##
+## WINDOW COVERAGE: with --window START/END the observer has to prove that the
+## whole acceptance window was sampled, not merely that some notifications were
+## seen. It refuses to start outside the window (exit 2, one error line), emits
+## a heartbeat for every 60 s of loop time, and closes with one observer_end
+## when it reaches END. A laptop that wakes at 09:10 therefore cannot produce a
+## clean-looking 09:10-09:35 run: the missing heartbeats and observer_end make
+## the gap visible. Heartbeats and observer_end are coverage metadata, never
+## notification evidence.
+##
 ## FAILURE POLICY: adb absence, a missing device or an unrecognized dump
 ## records one line with an `error` field and the script still exits 0 — an
 ## observer with no target must not kill the caller (same policy as
 ## observe_session.sh). In loop mode a failing poll is one error line and the
-## loop continues. A bad invocation (unknown option, interval < 5) exits 2.
+## loop continues. A bad invocation (unknown option, interval < 5, --window
+## without --interval) and a start outside the window exit 2.
 set -u
 
 export TZ=Asia/Seoul
@@ -37,15 +47,30 @@ OUT_DIR="${HOME}/.local/share/hongscanner/observe"
 INTERVAL=0
 SERIAL=""
 ADB="${ADB:-adb}"
+WINDOW=""
+PACKAGE="com.hongscanner.hongscanner"
+
+# Provenance travels with every line so a record can be traced to the observer
+# that wrote it. Both values may be "unknown" (not a git checkout, no
+# sha256sum); recording that is better than refusing to observe.
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+REPO_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+OBSERVER_GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)"
+OBSERVER_SHA256="$(sha256sum "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f1)"
+[ -n "$OBSERVER_GIT_COMMIT" ] || OBSERVER_GIT_COMMIT="unknown"
+[ -n "$OBSERVER_SHA256" ] || OBSERVER_SHA256="unknown"
 
 usage() {
   cat <<'EOF'
 usage: observe_notifications.sh [--once] [--interval SECONDS] [--serial SERIAL]
-                                [--out-dir DIR] [--adb PATH]
+                                [--window START/END] [--out-dir DIR] [--adb PATH]
 
   --once              capture one dump and exit (default)
-  --interval N        capture every N seconds (N >= 5) until SIGTERM
+  --interval N        capture every N seconds (N >= 5) until SIGTERM or window END
   --serial SERIAL     adb -s SERIAL; default: first device in `adb devices`
+  --window START/END  only run inside the ISO-8601 window, e.g.
+                      2026-11-20T08:58:00+09:00/2026-11-20T09:35:00+09:00
+                      (requires --interval; a single snapshot cannot cover a window)
   --out-dir DIR       output directory (default ~/.local/share/hongscanner/observe)
   --adb PATH          adb executable (default: adb on PATH)
 EOF
@@ -83,6 +108,14 @@ while [ "$#" -gt 0 ]; do
       SERIAL="$2"
       shift 2
       ;;
+    --window)
+      if [ "$#" -lt 2 ]; then
+        echo "observe_notifications: --window needs a value" >&2
+        exit 2
+      fi
+      WINDOW="$2"
+      shift 2
+      ;;
     --out-dir)
       if [ "$#" -lt 2 ]; then
         echo "observe_notifications: --out-dir needs a value" >&2
@@ -118,6 +151,38 @@ case "$INTERVAL" in
     ;;
 esac
 
+if [ -n "$WINDOW" ]; then
+  if [ "$INTERVAL" -eq 0 ]; then
+    echo "observe_notifications: --window requires --interval (a single snapshot cannot cover a window)" >&2
+    exit 2
+  fi
+  case "$WINDOW" in
+    */*) ;;
+    *)
+      echo "observe_notifications: --window must be START/END" >&2
+      exit 2
+      ;;
+  esac
+  WINDOW_START="${WINDOW%%/*}"
+  WINDOW_END="${WINDOW#*/}"
+  START_EPOCH=""
+  END_EPOCH=""
+  if [ -n "$WINDOW_START" ] && [ -n "$WINDOW_END" ]; then
+    START_EPOCH="$(date -d "$WINDOW_START" +%s 2>/dev/null)"
+    END_EPOCH="$(date -d "$WINDOW_END" +%s 2>/dev/null)"
+  fi
+  case "${START_EPOCH}:${END_EPOCH}" in
+    :*|*:|*[!0-9:]*)
+      echo "observe_notifications: --window needs two ISO-8601 timestamps with offset" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$START_EPOCH" -ge "$END_EPOCH" ]; then
+    echo "observe_notifications: --window START must be before END" >&2
+    exit 2
+  fi
+fi
+
 mkdir -p "$OUT_DIR" 2>/dev/null || true
 
 # Resolve the serial once so every evidence line names the device. Without
@@ -137,7 +202,7 @@ capture_once() {
   ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/hs-observe-notifications-err.XXXXXX")" || ERR_FILE=""
 
   if [ -z "$DUMP_FILE" ] || [ -z "$ERR_FILE" ]; then
-    printf '%s\n' "{\"captured_at\":\"${NOW_ISO}\",\"device_serial\":null,\"error\":\"mktemp failed\",\"errors\":{\"observer\":\"mktemp failed\"},\"kst\":\"${NOW_KST}\",\"package\":\"com.hongscanner.hongscanner\"}" >> "$OUT_FILE" 2>/dev/null || true
+    printf '%s\n' "{\"captured_at\":\"${NOW_ISO}\",\"device_serial\":null,\"error\":\"mktemp failed\",\"errors\":{\"observer\":\"mktemp failed\"},\"kst\":\"${NOW_KST}\",\"observer_git_commit\":\"${OBSERVER_GIT_COMMIT}\",\"observer_sha256\":\"${OBSERVER_SHA256}\",\"package\":\"${PACKAGE}\"}" >> "$OUT_FILE" 2>/dev/null || true
     return 0
   fi
 
@@ -151,7 +216,7 @@ capture_once() {
   ADB_RC=$?
 
   python3 - "$OUT_FILE" "$NOW_ISO" "$NOW_KST" "$SERIAL" "$ADB_RC" \
-    "$DUMP_FILE" "$ERR_FILE" <<'PY'
+    "$DUMP_FILE" "$ERR_FILE" "$OBSERVER_GIT_COMMIT" "$OBSERVER_SHA256" <<'PY'
 import datetime as dt
 import json
 import os
@@ -161,7 +226,8 @@ import sys
 PACKAGE = "com.hongscanner.hongscanner"
 KST = dt.timezone(dt.timedelta(hours=9))
 
-(out_file, at, kst, serial, adb_rc, dump_path, err_path) = sys.argv[1:8]
+(out_file, at, kst, serial, adb_rc, dump_path, err_path,
+ git_commit, script_sha256) = sys.argv[1:10]
 adb_rc = int(adb_rc)
 
 
@@ -193,6 +259,8 @@ def error_line(message):
         "error": message,
         "errors": {"adb": message},
         "kst": kst,
+        "observer_git_commit": git_commit,
+        "observer_sha256": script_sha256,
         "package": PACKAGE,
     })
 
@@ -294,6 +362,9 @@ def parse_block(lines):
         "title": title,
         "text": text_value,
         "package": PACKAGE,
+        "snapshot_status": "OBSERVED_ACTIVE",
+        "observer_git_commit": git_commit,
+        "observer_sha256": script_sha256,
     }
 
 
@@ -325,10 +396,50 @@ PY
   if [ "$PY_RC" -ne 0 ]; then
     # Last resort: the observer itself failed. Record that honestly and
     # keep the timer/caller alive.
-    printf '%s\n' "{\"captured_at\":\"${NOW_ISO}\",\"device_serial\":null,\"error\":\"observer python failed rc=${PY_RC}\",\"errors\":{\"observer\":\"python failed rc=${PY_RC}\"},\"kst\":\"${NOW_KST}\",\"package\":\"com.hongscanner.hongscanner\"}" >> "$OUT_FILE" 2>/dev/null || true
+    printf '%s\n' "{\"captured_at\":\"${NOW_ISO}\",\"device_serial\":null,\"error\":\"observer python failed rc=${PY_RC}\",\"errors\":{\"observer\":\"python failed rc=${PY_RC}\"},\"kst\":\"${NOW_KST}\",\"observer_git_commit\":\"${OBSERVER_GIT_COMMIT}\",\"observer_sha256\":\"${OBSERVER_SHA256}\",\"package\":\"${PACKAGE}\"}" >> "$OUT_FILE" 2>/dev/null || true
   fi
 
   rm -f "$DUMP_FILE" "$ERR_FILE" 2>/dev/null || true
+}
+
+append_line() {
+  LINE_FILE="${OUT_DIR}/notifications-$(date +%F).hcj.jsonl"
+  if [ -s "$LINE_FILE" ] && [ -n "$(tail -c 1 "$LINE_FILE" 2>/dev/null)" ]; then
+    printf '\n' >> "$LINE_FILE"
+  fi
+  printf '%s\n' "$1" >> "$LINE_FILE"
+}
+
+json_string_or_null() {
+  if [ -z "$1" ]; then
+    printf 'null'
+  else
+    printf '"%s"' "$1"
+  fi
+}
+
+append_heartbeat() {
+  append_line "{\"kind\":\"heartbeat\",\"captured_at\":\"$(date +%Y-%m-%dT%H:%M:%S%:z)\",\"device_serial\":$(json_string_or_null "$SERIAL"),\"polls\":${POLLS},\"package\":\"${PACKAGE}\",\"observer_git_commit\":\"${OBSERVER_GIT_COMMIT}\",\"observer_sha256\":\"${OBSERVER_SHA256}\"}"
+  LAST_HEARTBEAT_EPOCH="$(date +%s)"
+}
+
+# Chunked so a long --interval still yields a heartbeat every 60 s of loop
+# time; the total sleep is unchanged, so the poll cadence is not.
+sleep_with_heartbeats() {
+  SLEEP_LEFT="$1"
+  while [ "$SLEEP_LEFT" -gt 0 ]; do
+    SLEEP_CHUNK=60
+    if [ "$SLEEP_LEFT" -lt "$SLEEP_CHUNK" ]; then
+      SLEEP_CHUNK="$SLEEP_LEFT"
+    fi
+    sleep "$SLEEP_CHUNK" &
+    wait $!
+    SLEEP_LEFT=$((SLEEP_LEFT - SLEEP_CHUNK))
+    NOW_EPOCH="$(date +%s)"
+    if [ $((NOW_EPOCH - LAST_HEARTBEAT_EPOCH)) -ge 60 ]; then
+      append_heartbeat
+    fi
+  done
 }
 
 trap 'exit 0' TERM INT
@@ -338,8 +449,45 @@ if [ "$INTERVAL" -eq 0 ]; then
   exit 0
 fi
 
+if [ -z "$WINDOW" ]; then
+  while :; do
+    capture_once
+    sleep "$INTERVAL" &
+    wait $!
+  done
+fi
+
+NOW_EPOCH="$(date +%s)"
+NOW_ISO="$(date +%Y-%m-%dT%H:%M:%S%:z)"
+NOW_KST="$(date '+%Y-%m-%d %H:%M:%S KST')"
+if [ "$NOW_EPOCH" -lt "$START_EPOCH" ] || [ "$NOW_EPOCH" -gt "$END_EPOCH" ]; then
+  WINDOW_ERROR="observer started outside window: ${NOW_ISO}"
+  append_line "{\"captured_at\":\"${NOW_ISO}\",\"device_serial\":$(json_string_or_null "$SERIAL"),\"error\":\"${WINDOW_ERROR}\",\"errors\":{\"window\":\"${WINDOW_ERROR}\"},\"kst\":\"${NOW_KST}\",\"observer_git_commit\":\"${OBSERVER_GIT_COMMIT}\",\"observer_sha256\":\"${OBSERVER_SHA256}\",\"package\":\"${PACKAGE}\"}"
+  exit 2
+fi
+
+STARTED_AT="$(date +%Y-%m-%dT%H:%M:%S%:z)"
+LAST_HEARTBEAT_EPOCH="$(date +%s)"
+POLLS=0
+
 while :; do
+  NOW_EPOCH="$(date +%s)"
+  if [ "$NOW_EPOCH" -ge "$END_EPOCH" ]; then
+    break
+  fi
   capture_once
-  sleep "$INTERVAL" &
-  wait $!
+  POLLS=$((POLLS + 1))
+  NOW_EPOCH="$(date +%s)"
+  if [ $((NOW_EPOCH - LAST_HEARTBEAT_EPOCH)) -ge 60 ]; then
+    append_heartbeat
+  fi
+  SLEEP_FOR="$INTERVAL"
+  REMAINING=$((END_EPOCH - NOW_EPOCH))
+  if [ "$REMAINING" -lt "$SLEEP_FOR" ]; then
+    SLEEP_FOR="$REMAINING"
+  fi
+  sleep_with_heartbeats "$SLEEP_FOR"
 done
+
+append_line "{\"kind\":\"observer_end\",\"started_at\":\"${STARTED_AT}\",\"ended_at\":\"$(date +%Y-%m-%dT%H:%M:%S%:z)\",\"window_start\":\"${WINDOW_START}\",\"window_end\":\"${WINDOW_END}\",\"polls\":${POLLS},\"exit\":\"ok\",\"device_serial\":$(json_string_or_null "$SERIAL"),\"package\":\"${PACKAGE}\",\"observer_git_commit\":\"${OBSERVER_GIT_COMMIT}\",\"observer_sha256\":\"${OBSERVER_SHA256}\"}"
+exit 0

@@ -34,6 +34,11 @@
 ##   (e) the collector dies before creating the dir -> the wait aborts
 ##       around the collector's death instead of running the full bound.
 ##
+## Every scenario also asserts the launcher's RUN_PROVENANCE line — the
+## launcher's own execution identity (session date, repo HEAD, launcher
+## sha256, dirty flag, start time). Scenario (a) passes
+## --session-date=2026-11-20; the others assert session_date=unknown.
+##
 ## Run: bash tests/test_launcher_worker_order.sh
 set -euo pipefail
 
@@ -90,6 +95,22 @@ assert_no_file() { # desc path
   fi
 }
 
+assert_nonempty() { # desc value
+  if [ -n "$2" ]; then
+    echo "ok   $1"; PASS=$((PASS + 1))
+  else
+    echo "FAIL $1: value is empty"; FAILED=$((FAILED + 1))
+  fi
+}
+
+assert_match() { # desc value extended-regex
+  if printf '%s' "$2" | grep -Eq -- "$3"; then
+    echo "ok   $1"; PASS=$((PASS + 1))
+  else
+    echo "FAIL $1: [$2] does not match [$3]"; FAILED=$((FAILED + 1))
+  fi
+}
+
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/hs-launcher-order.XXXXXX")"
 cleanup() { [ -n "$SANDBOX" ] && rm -rf "$SANDBOX"; }
 trap cleanup EXIT
@@ -97,6 +118,46 @@ trap cleanup EXIT
 RUN_SESSION="$REPO_ROOT/tools/run_session.sh"
 
 file_text() { cat "$1" 2>/dev/null || true; }
+
+# field_value <line> <key> — the value of key= in a space-separated line.
+field_value() {
+  local kv
+  for kv in $1; do
+    case "$kv" in
+      "$2="*) printf '%s' "${kv#"$2="}" ;;
+    esac
+  done
+}
+
+# assert_provenance <scenario> <log> [expected session_date]
+assert_provenance() {
+  local desc="$1" log="$2" want_date="${3:-}"
+  local line count key
+  count="$(printf '%s\n' "$log" | grep -c '^RUN_PROVENANCE ' || true)"
+  assert_eq "$desc: exactly one RUN_PROVENANCE line" 1 "$count"
+  line="$(printf '%s\n' "$log" | grep '^RUN_PROVENANCE ' | head -n 1 || true)"
+  for key in run_id session_date git_commit launcher_sha256 git_dirty started_at; do
+    assert_nonempty "$desc: RUN_PROVENANCE $key" "$(field_value "$line" "$key")"
+  done
+  assert_eq "$desc: git_commit is the repo HEAD" \
+    "$(git -C "$REPO_ROOT" rev-parse HEAD)" \
+    "$(field_value "$line" git_commit)"
+  assert_eq "$desc: launcher_sha256 is the launcher file's hash" \
+    "$(sha256sum "$REPO_ROOT/tools/run_session.sh" | cut -d' ' -f1)" \
+    "$(field_value "$line" launcher_sha256)"
+  assert_match "$desc: git_dirty is 0 or 1" \
+    "$(field_value "$line" git_dirty)" '^[01]$'
+  assert_match "$desc: started_at is ISO-8601 with a local offset" \
+    "$(field_value "$line" started_at)" \
+    '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$'
+  if [ -n "$want_date" ]; then
+    assert_eq "$desc: session_date is the passed --session-date" \
+      "$want_date" "$(field_value "$line" session_date)"
+  else
+    assert_eq "$desc: session_date is unknown without --session-date" \
+      "unknown" "$(field_value "$line" session_date)"
+  fi
+}
 
 # new_env <name> — fresh fake bin/ + notify config + collectors under
 # $W. Nothing outside the sandbox is read or written.
@@ -186,10 +247,16 @@ EOF
     "$W/collector-nodir" "$W/collector-dead"
 }
 
-# run_launcher <session> <collector> [VAR=VAL...] — sets RC.
+# run_launcher <session> <collector> [--session-date=DATE] [VAR=VAL...]
+# — sets RC. A leading --session-date= goes to the launcher itself; every
+# remaining extra argument goes through env.
 run_launcher() {
   local name="$1" collector="$2"
   shift 2
+  local date_arg=""
+  case "${1:-}" in
+    --session-date=*) date_arg="$1"; shift ;;
+  esac
   RC=0
   env PATH="$W/bin:$PATH" \
     HSNOTIFY_CONFIG="$W/notify-config.json" \
@@ -202,15 +269,17 @@ run_launcher() {
     DIR_CREATED_LOG="$W/dir-created.log" \
     PY_LOG="$W/py.log" \
     "$@" \
-    bash "$RUN_SESSION" --out="$W/out/$name" >/dev/null 2>&1 || RC=$?
+    bash "$RUN_SESSION" --out="$W/out/$name" ${date_arg:+"$date_arg"} \
+    >/dev/null 2>&1 || RC=$?
 }
 
 # ============================================ (a) run dir appears late
 
 echo "--- (a) run dir created 1s after the collector starts"
 new_env a
-run_launcher sess-a collector-late
+run_launcher sess-a collector-late --session-date=2026-11-20
 LOG_A="$(file_text "$W/out/sess-a.launcher.log")"
+assert_provenance "a" "$LOG_A" 2026-11-20
 assert_eq "a: session exits with the collector's exit code" 0 "$RC"
 assert_contains "a: worker start is the systemd one" "$LOG_A" \
   "WORKER_START systemd unit=hsnotify-sess-a"
@@ -237,6 +306,7 @@ new_env b
 run_launcher sess-b collector-now STUB_SYSTEMD_RUN_RC=1 STUB_IS_FAILED=1
 LOG_B="$(file_text "$W/out/sess-b.launcher.log")"
 SYSCTL_B="$(file_text "$W/systemctl.log")"
+assert_provenance "b" "$LOG_B"
 assert_eq "b: session exits with the collector's exit code" 0 "$RC"
 assert_contains "b: fallback line recorded" "$LOG_B" \
   "WORKER_START background FALLBACK"
@@ -259,6 +329,7 @@ echo "--- (c) run dir never appears: bounded wait, worker skipped"
 new_env c
 run_launcher sess-c collector-nodir HS_WORKER_RUN_DIR_WAIT_SECONDS=1
 LOG_C="$(file_text "$W/out/sess-c.launcher.log")"
+assert_provenance "c" "$LOG_C"
 assert_eq "c: session still exits with the collector's exit code" 0 "$RC"
 assert_contains "c: the skip line records the bound" "$LOG_C" \
   "WORKER_SKIPPED run_dir_missing seconds=1"
@@ -276,6 +347,7 @@ new_env d
 mkdir -p "$W/out/sess-d"
 run_launcher sess-d collector-now HS_WORKER_RUN_DIR_WAIT_SECONDS=0
 LOG_D="$(file_text "$W/out/sess-d.launcher.log")"
+assert_provenance "d" "$LOG_D"
 assert_eq "d: session exits with the collector's exit code" 0 "$RC"
 assert_contains "d: worker started via systemd" "$LOG_D" \
   "WORKER_START systemd unit=hsnotify-sess-d"
@@ -291,6 +363,7 @@ T0="$(date +%s)"
 run_launcher sess-e collector-dead
 T1="$(date +%s)"
 LOG_E="$(file_text "$W/out/sess-e.launcher.log")"
+assert_provenance "e" "$LOG_E"
 assert_eq "e: session exits with the collector's 4" 4 "$RC"
 assert_contains "e: the skip line records the dead collector" "$LOG_E" \
   "WORKER_SKIPPED run_dir_missing seconds=0 collector_dead=1"
