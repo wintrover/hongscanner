@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools" / "notify"))
 sys.dont_write_bytecode = True
 
 from group_tag import group_tag  # noqa: E402
+from notify_fcm import DIGEST_TAG  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "attest_notifications", TOOL_PATH)
@@ -515,6 +516,217 @@ class AttestationTests(unittest.TestCase):
         code, report = self.case.run(write=False)
         self.assertEqual(code, 1)
         self.assertEqual(report["verdict"], "UNKNOWN_INPUT")
+
+
+PEER_DEVICE = "wuyoni-sm-s938n"
+PEER_TAG_A = group_tag(AT_A, PEER_DEVICE)
+PEER_TAG_B = group_tag(AT_B, PEER_DEVICE)
+
+
+def peer_observer(tags=None, heartbeats=None, end=None):
+    tags = [PEER_TAG_A, PEER_TAG_B] if tags is None else tags
+    heartbeats = default_heartbeats() if heartbeats is None else heartbeats
+    return heartbeats + [notification(tag, "2026-11-19T09:05:30+09:00")
+                         for tag in tags] + [end or observer_end()]
+
+
+class SilentSlotTests(unittest.TestCase):
+    """digest 고정 슬롯은 전달 주장이 있을 때만 면제된다."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.case = Case(self._tmp.name)
+
+    def observe_digest_slot(self):
+        self.case.observer.insert(
+            -1, notification(DIGEST_TAG, "2026-11-19T09:20:00+09:00"))
+
+    def test_accepted_digest_accounts_for_the_fixed_slot(self):
+        self.observe_digest_slot()
+        self.case.deliveries.append(
+            delivery(EVENT_A, "digest",
+                     updated_at="2026-11-19T09:20:01+09:00"))
+        code, report = self.case.run()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["verdict"], "ACCEPTED")
+        self.assertEqual(report["silent_slots"], [DIGEST_TAG])
+        self.assertEqual(report["unaccounted"], [])
+        self.assertEqual(report["coverage"], 1.0)
+
+    def test_observed_digest_without_delivery_is_unaccounted(self):
+        self.observe_digest_slot()
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "COVERAGE_INCOMPLETE")
+        self.assertEqual(report["silent_slots"], [])
+        self.assertEqual(report["unaccounted"], [DIGEST_TAG])
+
+    def test_digest_delivery_for_another_device_does_not_exempt_the_slot(self):
+        self.observe_digest_slot()
+        self.case.deliveries.append(
+            delivery(EVENT_A, "digest", device=PEER_DEVICE,
+                     updated_at="2026-11-19T09:20:01+09:00"))
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "COVERAGE_INCOMPLETE")
+        self.assertEqual(report["unaccounted"], [DIGEST_TAG])
+
+
+class CrossDeviceTests(unittest.TestCase):
+    """두 기기의 논리 그룹 집합이 같아야 수용이다."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.case = Case(self._tmp.name)
+        self.second = self.case.root / "observed-second.hcj.jsonl"
+        self.case.extra_args = [
+            "--observed-second", str(self.second),
+            "--device-id-second", PEER_DEVICE,
+        ]
+
+    def write_second(self, records):
+        write_jsonl(self.second, records)
+
+    def test_same_groups_on_both_devices_are_accepted(self):
+        self.case.deliveries = [
+            delivery(EVENT_A, "single"),
+            delivery(EVENT_B, "summary"),
+            delivery(EVENT_A, "single", device=PEER_DEVICE),
+            delivery(EVENT_B, "summary", device=PEER_DEVICE,
+                     updated_at="2026-11-19T09:05:01+09:00"),
+        ]
+        self.write_second(peer_observer())
+        code, report = self.case.run()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["verdict"], "ACCEPTED")
+        self.assertTrue(report["cross_device"]["ok"])
+        self.assertEqual(report["cross_device"]["group_count"], 2)
+        self.assertEqual(report["cross_device"]["only_a"], [])
+        self.assertEqual(report["cross_device"]["only_b"], [])
+        self.assertEqual([d["device_id"] for d in report["devices"]],
+                         [DEVICE, PEER_DEVICE])
+        self.assertEqual(report["peer"]["coverage"], 1.0)
+        self.assertEqual(report["inputs"]["observed_second"]["sha256"],
+                         hashlib.sha256(self.second.read_bytes()).hexdigest())
+
+    def test_each_device_complete_but_different_groups_is_mismatch(self):
+        # 두 기기 모두 자기 기준으로는 완전하지만 받은 그룹이 다르다.
+        # 개별 ACCEPTED 두 개로는 이 상태를 잡을 수 없다.
+        self.case.deliveries.append(
+            delivery(EVENT_A, "single", device=PEER_DEVICE))
+        self.case.deliveries.append(
+            delivery(EVENT_B, "summary", device=PEER_DEVICE,
+                     updated_at="2026-11-19T09:05:01+09:00"))
+        # B 기기는 A 그룹 대신 다른 슬롯만 본다 → B의 missing 발생을 피하려면
+        # B의 expected도 맞춰야 하므로, B의 원장 주장을 A와 같게 두고
+        # 관측만 다르게 한다.
+        self.case.deliveries = [
+            delivery(EVENT_A, "single"),
+            delivery(EVENT_B, "summary"),
+            delivery(EVENT_A, "single", device=PEER_DEVICE),
+            delivery(EVENT_B, "summary", device=PEER_DEVICE),
+        ]
+        foreign_extra = group_tag("2026-11-19T09:12:00+09:00", PEER_DEVICE)
+        self.write_second(peer_observer(tags=[PEER_TAG_A, foreign_extra]))
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "COVERAGE_INCOMPLETE")
+
+    def test_group_set_difference_is_cross_device_mismatch(self):
+        # B의 expected를 비켜 주기 위해 B에게만 추가 그룹을 발송한 상황:
+        # 양쪽 coverage는 각자 1.0이지만 그룹 집합이 다르다.
+        self.case.deliveries = [
+            delivery(EVENT_A, "single"),
+            delivery(EVENT_B, "summary"),
+            delivery(EVENT_A, "single", device=PEER_DEVICE),
+        ]
+        extra_event = hashlib.sha256(b"event-only-peer").hexdigest()
+        at_extra = "2026-11-19T09:20:00+09:00"
+        self.case.events.append(event(extra_event, at_extra))
+        self.case.deliveries.append(
+            delivery(extra_event, "single", device=PEER_DEVICE,
+                     updated_at="2026-11-19T09:20:01+09:00"))
+        self.write_second(peer_observer(
+            tags=[PEER_TAG_A, group_tag(at_extra, PEER_DEVICE)]))
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "CROSS_DEVICE_MISMATCH")
+        self.assertFalse(report["cross_device"]["ok"])
+        self.assertEqual(report["cross_device"]["only_b"], [at_extra])
+        self.assertEqual(report["cross_device"]["only_a"], [AT_B])
+
+    def test_expected_asymmetry_without_observation_difference_is_mismatch(self):
+        # 서버가 A에게만 발송했다: A의 그룹 집합에만 그룹이 생긴다.
+        self.case.deliveries = [
+            delivery(EVENT_A, "single"),
+            delivery(EVENT_B, "summary"),
+            delivery(EVENT_A, "single", device=PEER_DEVICE),
+        ]
+        # B는 A와 동일한 슬롯을 관측했다고 주장해도(관측 집합 동일),
+        # 서버 주장 집합이 다르므로 동등성이 아니다.
+        self.write_second(peer_observer())
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"],
+                         "COVERAGE_INCOMPLETE")
+
+    def test_second_device_incomplete_observation_is_incomplete(self):
+        self.write_second(peer_observer(
+            heartbeats=[heartbeat(stamp) for stamp in
+                        times("2026-11-19T09:10:00+09:00", WINDOW_END)],
+            end=observer_end(polls=41)))
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "OBSERVATION_INCOMPLETE")
+        self.assertFalse(report["peer"]["completeness_ok"])
+
+    def test_second_observer_window_must_match_first(self):
+        narrowed = observer_end()
+        narrowed["window_start"] = "2026-11-19T09:05:00+09:00"
+        self.write_second(peer_observer(end=narrowed))
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "OBSERVATION_INCOMPLETE")
+        self.assertFalse(report["peer"]["completeness_ok"])
+
+    def test_digest_slot_must_match_on_both_devices(self):
+        self.case.deliveries = [
+            delivery(EVENT_A, "single"),
+            delivery(EVENT_B, "summary"),
+            delivery(EVENT_A, "single", device=PEER_DEVICE),
+            delivery(EVENT_B, "summary", device=PEER_DEVICE,
+                     updated_at="2026-11-19T09:05:01+09:00"),
+            delivery(EVENT_A, "digest",
+                     updated_at="2026-11-19T09:20:01+09:00"),
+            delivery(EVENT_A, "digest", device=PEER_DEVICE,
+                     updated_at="2026-11-19T09:20:01+09:00"),
+        ]
+        self.case.observer.insert(
+            -1, notification(DIGEST_TAG, "2026-11-19T09:20:00+09:00"))
+        self.write_second(peer_observer())
+        code, report = self.case.run()
+        self.assertEqual(code, 1)
+        self.assertEqual(report["verdict"], "CROSS_DEVICE_MISMATCH")
+        self.assertEqual(report["cross_device"]["slots_only_a"], [DIGEST_TAG])
+
+    def test_pair_argument_without_pointer_is_rejected(self):
+        self.write_second(peer_observer())
+        self.case.extra_args = ["--device-id-second", PEER_DEVICE]
+        with self.assertRaises(SystemExit) as raised:
+            self.case.run()
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_identical_device_ids_are_rejected(self):
+        self.write_second(peer_observer())
+        self.case.extra_args = [
+            "--observed-second", str(self.second),
+            "--device-id-second", DEVICE,
+        ]
+        with self.assertRaises(SystemExit) as raised:
+            self.case.run()
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

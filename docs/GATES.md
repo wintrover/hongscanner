@@ -1184,3 +1184,38 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 | main attest | 런 [44486088307](https://github.com/wintrover/hongscanner/actions/runs/44486088307) success |
 
 **경계**: 11/20 09:00 피크 수용은 아직 미실시다. 관측기는 이제 늦은 시작을 스스로 거부하고 adb 정지에 멈추지 않지만, 이것은 도구의 준비이지 수용 판정이 아니다. 소리 발생은 사람 확인 증거다.
+
+### Evidence log (2026-11-19, 밤) — 2기기 동등 수용 준비: 정책 철회·토큰 분리·교차 판정·digest 슬롯
+
+**지배 지시**: "S25도 S10과 똑같은 결과물을 받아야지. 두 기기에 차별을 두지 마. 그건 내가 정책으로 지시한 적 없어." — `disabled_devices`는 정책이 아니라 11/18 임시 조치였고, 아래대로 철회했다. 기존 행은 삭제하지 않고 이 절로 정정한다.
+
+| 항목 | 실측 |
+|---|---|
+| S25 차별 철회 | 서버 `notify_config.json`의 `disabled_devices: ["wuyoni-sm-s938n"]` 제거(백업 `notify_config.json.bak-20261119`, chmod 600). 읽기 전용 재판독: `registry_active=['wuyoni-sm-g977n','wuyoni-sm-s938n']`, `disabled=[]`, `send_targets` 2대. dispatcher는 시작 시 config를 1회 로드하므로 **11/20 08:50 새 세션이 새 정책을 읽는다** — 11/19 세션 종료 상태에서는 재시작이 필요 없다 |
+| APK 동일성 | 로컬 `mobile/build/.../app-debug.apk` sha256 `61427e25…` = S10 `R3CM60B9AQJ` 설치본 = S25 `192.168.0.16:5555` 설치본. 두 기기 `versionName=1.0.0`, `stopped=false` |
+| 시계 | 호스트 19:18:01 / S10 19:18:04 / S25 19:18:02 KST — 오차 3초 이내 |
+| 트레이 | 양 기기 `pkg=com.hongscanner.hongscanner` 레코드 **0건**(S25의 11-18 잔여 9건은 앱 교체로 소멸) |
+| **복제 FID 결함(신규)** | S25의 `no_backup/PersistedInstallation.….json` `Fid`가 S10의 **11-16 토큰과 동일**(`f9W8…`, fingerprint `sha256:f9W8` 계열)이었다 — Smart Switch류 앱 데이터 복제로 설치 ID가 복제된 상태. 같은 FID를 가진 두 설치는 FCM 주소가 하나로 겹쳐 "양 기기 동일 수신"을 보장할 수 없다 |
+| FID 재발급 | S25만 `PersistedInstallation.*.json`·`FirebaseHeartBeat*.preferences_pb`·`com.google.firebase.messaging.xml`·`io.flutter.plugins.firebase.messaging.xml` 삭제 후 재기동 → 앱 로그 `[HS-OPS] fcm registration id: eiCZ…`. `tools/notify/notify_register.py --device-id wuyoni-sm-s938n --token-file -`로 등록 → 레지스트리 활성 2대·**distinct_tokens=2** (S10 `sha256:bd9ff33fcba92ade`, S25 `sha256:78b869c8c90b04c0`). S10의 FID는 그대로 |
+| FCM 드라이런 | 생산 페이로드(실원장 TOP10 이벤트) + `{"validate_only": true}`로 두 토큰 각각 `kind=accepted http=200`. **이것은 "FCM이 지금 이 전송을 받아들인다"는 검증이며 전달·게시·소리의 증거가 아니다** |
+| 관측자 2기기 | `hongscanner-notify-observe-s25.{service,timer}` 추가(S10과 동일 창 08:58~09:45, `--serial 192.168.0.16:5555`, `--out-dir ~/.local/share/hongscanner/observe-s25`). `list-timers` 실측: 두 타이머 모두 NEXT `2026-11-20 08:58:00 KST` |
+| 사전점검 2기기 | 08:45 사전점검을 S10+S25로 확장(트레이 0건·stopped=false·타이머·절전차단, S25는 필요 시 `adb connect` 1회). 19:38 실행 `ok:true` — S10 `device/false/pid15186/tray0`, S25 `device/false/pid none/tray0`, inhibitor `active` |
+
+**판정 계약 변경 (`tools/attest_notifications.py`)**
+
+| 변경 | 이유와 동작 |
+|---|---|
+| digest 고정 슬롯 면제 | 무음 digest는 `notify_fcm.DIGEST_TAG` 한 슬롯을 쓰므로 가청 그룹과 달리 미계상으로 남았다 — 피크 중 digest가 한 번이라도 게시되면 수용이 실패했다. 이제 해당 기기의 **ACCEPTED digest 전달이 있을 때만** `silent_slots`로 면제하고, 전달 주장 없이 슬롯만 관측되면 그대로 `unaccounted`(fail-closed). `aggregation_started`는 슬롯 계약이 없어 면제하지 않는다 |
+| 교차 기기 동등성 | `--observed-second` + `--device-id-second`(짝 필수, 동일 ID 거부)로 두 기기를 각각 판정하고, device_id를 뗀 논리 그룹(`observed_at`)과 고정 슬롯 집합을 비교한다. 두 번째 관측은 첫 기기의 창으로 강제하며 자기 창 선언이 다르면 `OBSERVATION_INCOMPLETE`. 새 판정 `CROSS_DEVICE_MISMATCH`(개별 coverage가 각각 1.0이어도 기기 간 집합이 다르면 실패) |
+| 보고서 필드 | `device_id`·`silent_slots`·`devices[]`·`peer`·`cross_device{only_a,only_b,slots_only_*,foreign_tags_*,expected_only_*}`. 입력 해시에 `observed_second` 추가 |
+
+**검증**
+
+| 항목 | 관측 |
+|---|---|
+| 로컬 게이트 | `bash tools/run_tests.sh` exit 0, `ALL CONTRACT SUITES PASSED` 1회 |
+| attest 테스트 | `python3 tests/test_attest_notifications.py` → 37 tests OK (기존 25 + digest 3·교차 9) |
+| 사전점검 | 위 표의 19:38 실행 `ok:true` (2기기) |
+| 타이머 | `systemctl --user list-timers` 2건 NEXT 2026-11-20 08:58 |
+
+**경계**: 이 절은 준비와 계약의 증거다. 11/20 09:00 피크의 게시·소리 수용은 아직 미실시이며, 두 기기의 **실제 소리**는 사람 확인 증거다. S25는 19:40 현재 PIN 잠금으로 음량·ringer 설정을 원격 조작할 수 없다(아래 한계).
