@@ -291,11 +291,19 @@ which the app supports as follows:
 - **후보 (tab 0)** — the rising/falling top 10 cards of the single
   `GET /mobile/market-view` projection. Row titles are the recorded
   stock name (`name`), falling back to the symbol when the ledger has no
-  name record; ranks render in the server's ascending order. The server
-  projection is authoritative: the app never recomputes ranks or filters
-  events into candidates, and `runs_present:false` / `run:null` renders
-  as "기록 없음" — never zero-filled rows. Market prices are not served by
+  name record; rows render in the server's order and each title names its
+  rank verbatim (`(전체 N위)`) — the vendor's full-market rank, not the
+  row's position in this projection. The server projection is
+  authoritative: the app never recomputes ranks or filters events into
+  candidates, and `runs_present:false` / `run:null` renders as
+  "기록 없음" — never zero-filled rows. Market prices are not served by
   the API and are not shown.
+- **Staleness banner** — the mode banner's delay (`· N분 지연`, at 60s or
+  more) and the data date (`MM-DD` before the data clock when the
+  payload's `data_as_of` falls on a different date than `mode_as_of`)
+  are derived only from those two payload timestamps, never the device
+  clock; a missing or unparseable timestamp drops the annotation rather
+  than guessing.
 - **Opening MA20 mode** — when the projection's `mode` is
   `opening_ma20` (the recorded observation window 09:00–09:30, price vs
   the 20-day moving average), both lists get the disambiguating headers
@@ -323,7 +331,11 @@ which the app supports as follows:
   the route to the tab shell.
 
 Loading (skeleton), "기록 없음", and offline/error states are rendered
-as distinct UI states — the app never renders absence as success.
+as distinct UI states — the app never renders absence as success. The
+skeleton is the very first attempt only: a poll over an already-loaded
+projection keeps the rows visible (banner `· 갱신 중`), and a failed
+refresh keeps the last successful projection with the offline/error card
+(`마지막 데이터를 표시 중 · …`) beside it instead of blanking the list.
 
 ## Resync policy
 
