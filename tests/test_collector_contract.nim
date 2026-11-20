@@ -42,14 +42,14 @@ proc calRaw(): HcjValue =
   hObj(("days", hObj(
     ("2026-10-29", day("09:00:00+09:00", "15:30:00+09:00")))))
 
-proc newCollector(dailyScope = ""): Collector =
+proc newCollector(dailyScope = ""; pageCap = defaultPageCap): Collector =
   startCollector(initCollectorConfig(
     "2026-10-29", "demo", "demo-profile",
     "000", "0000", "0", "0", "1", "0", "0", "1",
     Params(warmupBars: 0, lookbackBars: 3, trendMinBp: 50,
            countermoveMinBp: 50, directionalTriggerBp: 30,
            holdOnDegraded: true),
-    calRaw(), dailyScope = dailyScope))
+    calRaw(), dailyScope = dailyScope, pageCap = pageCap))
 
 proc newCfg(tokenSource: string): CollectorConfig =
   ## The same approved config with an explicit init-line token_source
@@ -223,6 +223,50 @@ block config:
   check("the marker never enters the sidecar init line (the judgment " &
         "re-derives from the preserved records, never from the marker)",
         "events_contract" notin newCollector().cfg.initLine())
+
+  block declaredPageCap:
+    ## REPLAY_CONTRACT §12.1: the page cap is a scanner-side declaration.
+    ## 2026-11-20 live: the down leg was still cont-yn=Y at page 10, so
+    ## every poll round was a cap-closed truncated subset and the event
+    ## layer (correctly) judged no poll generation — the session showed no
+    ## ranking for the whole morning. A declared larger cap makes a
+    ## complete KRX ranking fit inside the chain; truncation stays the
+    ## fail-closed path for anything that still exceeds it.
+    check("the declared page cap defaults to the PH-1 value and is recorded",
+          "\"page_cap\":10" in newCollector().cfg.initLine())
+    check("a session may declare a larger page cap (recorded verbatim)",
+          "\"page_cap\":40" in newCollector(pageCap = 40).cfg.initLine() and
+          "\"page_cap\":40" in canonical(newCollector(pageCap = 40)
+                                          .cfg.preambleRecords()[1].raw))
+    coreErr("a page cap below 1 is refused", "page_cap must be 1..200",
+            proc () = discard newCollector(pageCap = 0))
+    coreErr("a page cap above the declared bound is refused",
+            "page_cap must be 1..200",
+            proc () = discard newCollector(pageCap = 201))
+    proc codeRange(base, n: int): seq[string] =
+      for i in 0 ..< n: result.add($(base + i))
+    let downs = codeRange(300000, 110)
+    var c = newCollector(pageCap = 40)
+    discard c.step(ev("ready", ts))
+    discard c.step(ev("conn", ts, ("conn", hInt(1)), ("state", hStr("open"))))
+    discard c.step(evWs(1, ackPayload()))
+    discard c.step(evRest("up", 1, 200, "N", "",
+                          restBody(codeRange(100000, 3))))
+    var recs: seq[RecOut]
+    var dirs: seq[Directive]
+    for page in 1 .. 12:
+      let lo = (page - 1) * 10
+      let hi = min(page * 10, downs.len)
+      (recs, dirs) = c.step(evRest("down", page, 200,
+                                   (if page < 12: "Y" else: "N"),
+                                   (if page < 12: "k" & $page else: ""),
+                                   restBody(downs[lo ..< hi])))
+    check("a chain inside the declared cap completes: no rest_truncated, " &
+          "the pair derives and registers",
+          recs.kinds() == @["rest_resp", "gap", "sub"] and
+          recs[1].raw.get("what").strVal == "subscription_truncated" and
+          dirs.dirKinds() == @["reg", "daily_req"] and
+          dirs[0].data[0].codes == codeRange(100000, 3) & downs[0 ..< 100])
   proc cfgWithRunId(runId: string): CollectorConfig =
     initCollectorConfig(
       "2026-10-29", "demo", "demo-profile",

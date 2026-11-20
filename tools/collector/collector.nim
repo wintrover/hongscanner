@@ -21,7 +21,8 @@
 ##                [--mrkt-tp=000] ... (declared query
 ##                scope, approved PH-1 values by default).
 import std/[os, osproc, strutils, posix, times, streams]
-import hs/[hcj, records, calendars, engine, collector, recorder, event_gen]
+import hs/[hcj, records, calendars, engine, collector, recorder, event_gen,
+          vendor_input]
 
 const usageText = """collector — the VS-2 live collector (demo|real)
 
@@ -30,6 +31,7 @@ const usageText = """collector — the VS-2 live collector (demo|real)
             [--environment=demo]
             [--token-source=kiwoomcli]
             [--daily-scope=single-page-initial-pair|accumulate-v2]
+            [--page-cap=10]
             [--mrkt-tp=000 --trde-qty-cnd=0000 --stk-cnd=0 --crd-cnd=0
              --updown-incls=1 --pric-cnd=0 --trde-prica-cnd=0 --stex-tp=1]
             [--lookback-bars=3 --warmup-bars=0 --trend-min-bp=50
@@ -56,6 +58,13 @@ refuses to start on demo variables, and vice versa.
 "single-page-initial-pair" (the same legacy scope declared explicitly)
 or "accumulate-v2" (the FIFO universe: each later poll round appends its
 new symbols and the sweep resumes). Any other value is refused.
+
+--page-cap declares the scanner-side page upper limit (REPLAY_CONTRACT
+§12.1); the default is 10, the PH-1 value. A live KRX ranking can exceed
+ten pages: on 2026-11-20 the down leg still had cont-yn=Y at page 10, so
+every poll round closed as a truncated subset and no poll generation was
+judged. The cap is recorded in the config record and the event layer
+judges truncation by it; 1..200 is accepted.
 
 Exit codes: 0 normal, 2 usage/contract, 4 INCOMPLETE (unsealed, preserved).
 """
@@ -297,7 +306,9 @@ proc main(): int =
       readDocFile(calendarPath),
       tokenSource,
       lastPathPart(outDir),
-      dailyScope = dailyScope)
+      dailyScope = dailyScope,
+      pageCap = argValue(args, "page-cap").defaultInt(defaultPageCap,
+        "page-cap"))
   except CollectorError as e:
     fail(2, "COLLECTOR CONFIG: " & e.msg)
   except CoverageError as e:
