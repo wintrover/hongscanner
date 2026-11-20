@@ -217,11 +217,15 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
                           params: Params; calendar: HcjValue;
                           tokenSource = "kiwoomcli";
                           runId = "";
-                          dailyScope = ""): CollectorConfig =
+                          dailyScope = "";
+                          pageCap = defaultPageCap): CollectorConfig =
   ## Build and validate the collector configuration. The approved PH-1
   ## values are pinned here (README §5/§6.1): environment-derived
-  ## endpoints, page cap 10, repoll 300 s, drain 10 s, ack timeout 10 s,
-  ## watchdog 15:40 KST. A different value is refused, never silently run.
+  ## endpoints, page cap 10 (the declared default; a session may declare
+  ## a larger cap — REPLAY_CONTRACT §12.1 "the cap is a scanner-side
+  ## declaration" — and the recorded config carries it), repoll 300 s,
+  ## drain 10 s, ack timeout 10 s, watchdog 15:40 KST. A different value
+  ## is refused, never silently run.
   if environment != "demo" and environment != "real":
     raise cerr("environment must be demo or real: " & environment)
   if sessionDate.len != 10 or sessionDate[4] != '-' or sessionDate[7] != '-':
@@ -256,6 +260,14 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
      dailyScope != dailyScopeAccumulate:
     raise cerr("daily_scope must be \"\", " & dailyScopeLegacy & " or " &
                dailyScopeAccumulate & ": " & dailyScope)
+  # The declared page cap (REPLAY_CONTRACT §12.1: "the cap is a
+  # scanner-side declaration"). The PH-1 default 10 was measured against
+  # a ranking that fits ten pages; 2026-11-20 measured a down leg still
+  # cont-yn=Y at page 10, so every poll round closed as a truncated
+  # subset and no poll generation was ever judged. A session may declare
+  # a larger cap; an implausible one is refused, never silently run.
+  if pageCap < 1 or pageCap > 200:
+    raise cerr("page_cap must be 1..200: " & $pageCap)
   # The declared query scope must be inside the documented enums for both
   # directions before anything is recorded or sent.
   discard initKa10027Query(dirUp, mrktTp, trdeQtyCnd, stkCnd, crdCnd,
@@ -274,7 +286,7 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     mrktTp: mrktTp, trdeQtyCnd: trdeQtyCnd, stkCnd: stkCnd, crdCnd: crdCnd,
     updownIncls: updownIncls, pricCnd: pricCnd,
     trdePricaCnd: trdePricaCnd, stexTp: stexTp,
-    pageCap: defaultPageCap,
+    pageCap: pageCap,
     repollSeconds: 300,
     drainSeconds: 10,
     ackTimeoutSeconds: 10,

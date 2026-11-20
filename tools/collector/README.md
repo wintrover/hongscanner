@@ -103,7 +103,13 @@ Nim collector-core (src/hs/collector.nim + tools/collector/collector.nim)
   `rest_domain`(demo `https://mockapi.kiwoom.com`, real
   `https://api.kiwoom.com`)과 함께 — **선택된 환경의 정확한 값이
   아니면** sidecar는 시작을 거부한다.
-- `page_cap`=10(공식 예제 MAX_PAGES), `repoll_seconds`=300(§5 승인값),
+- `page_cap`=10(공식 예제 MAX_PAGES, 기본값) 또는 `--page-cap=N`으로 선언한
+  값(1..200). 2026-11-20 실측: 하락 체인이 page 10에서도 `cont-yn=Y`여서
+  모든 poll 라운드가 cap-closed 절단 부분집합이 됐고, 계약 §12.1대로 이벤트
+  계층이 부분 유니버스를 판정하지 않아 **오전 내내 후보 갱신·랭킹이 0건**
+  이었다. 실전 세션은 `--page-cap=40`(최대 8,000행)을 선언한다 — cap은
+  스캐너측 선언이며 config 레코드에 그대로 남는다. cap을 넘는 목록은
+  여전히 절단으로 기록되고 판정되지 않는다(fail-closed). `repoll_seconds`=300(§5 승인값),
   `drain_seconds`=10(§5), `ack_timeout_seconds`=10(승인된 drain 값과 같은
   "프로토콜 1단계 정적 한계"로 선언, §5 표에 명시된 값에서 유도 —
   config 레코드에 그 사실과 함께 기록), `watchdog`=15:40 KST(스캐너 시계,
