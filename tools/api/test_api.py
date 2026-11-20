@@ -664,7 +664,8 @@ def daily_capture_failed_gap(seq, symbol):
             "seq": seq}
 
 
-def om_winner_input(variant, pre_empty_pairs=0, failed_symbol=None):
+def om_winner_input(variant, pre_empty_pairs=0, failed_symbol=None,
+                    omit_ma20=(), start_seq=3):
     """The winner's recorded rest_resp sequence. `variant` moves the
     reference group's upsert symbols between chain-pair snapshots:
     "0" keeps both in snapshot 2 (offset 0, the measured default),
@@ -675,7 +676,10 @@ def om_winner_input(variant, pre_empty_pairs=0, failed_symbol=None):
     pre-open shape): an empty pair contributes no snapshot and must
     not drift the snapshot index against the candidate-group index.
     `failed_symbol` appends one daily_capture_failed gap for that
-    symbol — the coverage capture_failed evidence."""
+    symbol — the coverage capture_failed evidence. `omit_ma20` drops
+    those symbols' ka10081 records (the seeded-block branch: the record
+    arrives before the sweep instead); `start_seq` numbers the first
+    record (the default keeps the legacy bytes)."""
     s1_falling = om_rows(("011060", 90000))
     if variant == "-1":
         s1_falling += om_rows(("006660", 30000))
@@ -686,7 +690,7 @@ def om_winner_input(variant, pre_empty_pairs=0, failed_symbol=None):
     if variant == "+1":
         s3_falling += om_rows(("011060", 99000))
     records = []
-    seq = 3
+    seq = start_seq
     for _ in range(pre_empty_pairs):
         records.append(om_chain(seq, "1", []))
         records.append(om_chain(seq + 1, "3", []))
@@ -710,28 +714,56 @@ def om_winner_input(variant, pre_empty_pairs=0, failed_symbol=None):
                                 cont_yn=cont_yn))
         seq += 1
     for symbol in sorted(OM_MA20_CLOSES):
+        if symbol in omit_ma20:
+            continue
         records.append(ka10081_record(seq, symbol, OM_MA20_CLOSES[symbol]))
         seq += 1
-    records.append(ka10081_record(seq, "005490", 10000, completed=19))
-    seq += 1
+    if "005490" not in omit_ma20:
+        records.append(ka10081_record(seq, "005490", 10000, completed=19))
+        seq += 1
     if failed_symbol is not None:
         records.append(daily_capture_failed_gap(seq, failed_symbol))
     return records
 
 
+def om_preopen_seed(failed=(), symbol_count=None, **overrides):
+    """A valid §12.10.2 config.preopen_seed block for the opening
+    fixture. The hashes are recorded declarations — the API validates
+    their shape only and never recomputes them. `symbol_count` defaults
+    to the failed count (a zero-record block); overrides replace fields
+    verbatim so the invalid-shape tests can state their own cases."""
+    seed = {"source_run_id": OM_WINNER + "-preopen",
+            "session_date": OM_SESSION_DATE,
+            "seed_sha256": sha(b"om-seed"),
+            "symbol_count": (len(failed) if symbol_count is None
+                             else symbol_count),
+            "failed": list(failed),
+            "manifest_sha256": sha(b"om-seed-manifest")}
+    seed.update(overrides)
+    return seed
+
+
 def om_input_bytes(variant="0", pre_empty_pairs=0,
-                   open_text="09:00:00+09:00", failed_symbol=None):
+                   open_text="09:00:00+09:00", failed_symbol=None,
+                   preopen_seed=None, seed_records=(), omit_ma20=()):
     """The opening winner's exact input.hcj.jsonl bytes: the calendar
     snapshot, the config identity and the recorded captures — the §3.7
     input snapshot's fixture (and the same bytes every sandbox builder
-    writes)."""
+    writes). `preopen_seed` adds the §12.10.2 block to the config;
+    `seed_records` are the block's ka10081 records (before the sweep,
+    which then starts after them); `omit_ma20` drops the named sweep
+    records — the seeded-success branch. Every default reproduces the
+    legacy bytes exactly."""
+    config = {"environment": "demo", "run_id": OM_WINNER,
+              "session_date": OM_SESSION_DATE}
+    if preopen_seed is not None:
+        config["preopen_seed"] = preopen_seed
     return jsonl(
         market_calendar(OM_SESSION_DATE, open_text),
-        {"kind": "config", "raw": {"environment": "demo",
-                                   "run_id": OM_WINNER,
-                                   "session_date": OM_SESSION_DATE},
-         "seq": 2},
-        *om_winner_input(variant, pre_empty_pairs, failed_symbol))
+        {"kind": "config", "raw": config, "seq": 2},
+        *seed_records,
+        *om_winner_input(variant, pre_empty_pairs, failed_symbol,
+                         omit_ma20, start_seq=3 + len(seed_records)))
 
 
 def om_item(ev, ma20_tag):
@@ -861,18 +893,21 @@ def market_calendar(session_date, open_text="09:00:00+09:00"):
 def build_opening_sandbox(ref_stamp=OM_REF_STAMP, variant="0",
                           pre_empty_pairs=0,
                           open_text="09:00:00+09:00",
-                          failed_symbol=None):
+                          failed_symbol=None, preopen_seed=None,
+                          seed_records=(), omit_ma20=()):
     """The §3.7 opening-mode fixture tree: the eligible winner run
     whose calendar snapshot opens at `open_text` (the mode window's
     recorded evidence) and one smoke-like ineligible directory
     (runs_present stays true while selection has exactly one eligible
     run). `failed_symbol` plants one daily_capture_failed gap for that
-    symbol."""
+    symbol; `preopen_seed`, `seed_records` and `omit_ma20` are the
+    §12.10.2 seeded-run branches (defaults keep the legacy tree)."""
     box = Sandbox()
     run_dir = box.session_dir(OM_WINNER)
     box.write(os.path.join(run_dir, "input.hcj.jsonl"),
               om_input_bytes(variant, pre_empty_pairs, open_text,
-                             failed_symbol))
+                             failed_symbol, preopen_seed, seed_records,
+                             omit_ma20))
     box.write(os.path.join(run_dir, "events.hcj.jsonl"),
               jsonl(*om_winner_events(ref_stamp)))
     smoke = box.session_dir("smoke-like-2026-11-10")
@@ -2376,9 +2411,11 @@ class MarketViewOpeningSuite(unittest.TestCase):
     def opening_server(self, ref_stamp=OM_REF_STAMP, variant="0",
                        pre_empty_pairs=0,
                        open_text="09:00:00+09:00",
-                       failed_symbol=None):
+                       failed_symbol=None, preopen_seed=None,
+                       seed_records=(), omit_ma20=()):
         box = build_opening_sandbox(ref_stamp, variant, pre_empty_pairs,
-                                    open_text, failed_symbol)
+                                    open_text, failed_symbol, preopen_seed,
+                                    seed_records, omit_ma20)
         self.addCleanup(box.cleanup)
         server = ServerProc(box, with_delivery=False)
         self.addCleanup(self._reap, server)
@@ -2543,6 +2580,131 @@ class MarketViewOpeningSuite(unittest.TestCase):
                   + body["falling_top10"]}
         self.assertNotIn("002420", served)
         self.assertLessEqual(len(raw), 65536)
+
+    # -- §12.10.2 preopen_seed coverage evidence ----------------------------
+
+    def test_preopen_seed_failed_is_capture_failed(self):
+        # a seeded failure is capture_failed evidence even with no gap:
+        # 002420 has no ka10081 record and no daily_capture_failed gap,
+        # so its bucket can only come from the seed block.
+        seed = om_preopen_seed(["002420"], symbol_count=1)
+        server = self.opening_server(preopen_seed=seed)
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        coverage = body["coverage"]
+        self.assertEqual(coverage["capture_failed_count"], 1)
+        self.assertEqual(coverage["no_record_count"], 0)
+        self.assertEqual(coverage["computable_count"], 8)
+        self.assertEqual(
+            coverage["capture_failed_count"] + coverage["no_record_count"]
+            + coverage["history_short_count"] + coverage["no_price_count"]
+            + coverage["flat_count"] + coverage["computable_count"],
+            coverage["candidate_count"])
+        served = {i["symbol"] for i in body["rising_top10"]
+                  + body["falling_top10"]}
+        self.assertNotIn("002420", served)
+        # the seeded config changes only the identity the fold consumed
+        self.assertEqual(
+            body["input_snapshot"],
+            snapshot_of(om_input_bytes(preopen_seed=seed)))
+        self.assertLessEqual(len(raw), 65536)
+
+    def test_preopen_seed_success_is_classified_by_existing_rules(self):
+        # a seeded success is the ka10081 record in the seed block:
+        # 000660's record moves from the sweep into the block and the
+        # symbol stays computable (rising) — the seed adds no bucket.
+        seed = om_preopen_seed([], symbol_count=1)
+        seed_record = ka10081_record(3, "000660", OM_MA20_CLOSES["000660"])
+        server = self.opening_server(preopen_seed=seed,
+                                     seed_records=(seed_record,),
+                                     omit_ma20=("000660",))
+        status, body, raw, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        coverage = body["coverage"]
+        self.assertEqual(coverage["capture_failed_count"], 0)
+        self.assertEqual(coverage["computable_count"], 8)
+        self.assertEqual(coverage["no_record_count"], 1)
+        self.assertEqual(
+            coverage["capture_failed_count"] + coverage["no_record_count"]
+            + coverage["history_short_count"] + coverage["no_price_count"]
+            + coverage["flat_count"] + coverage["computable_count"],
+            coverage["candidate_count"])
+        self.assertIn("000660",
+                      [i["symbol"] for i in body["rising_top10"]])
+        self.assertLessEqual(len(raw), 65536)
+
+    def test_preopen_seed_failed_unions_with_gap_without_double_count(self):
+        # the gap (002420) and the seed's failed list overlap: the union
+        # counts the symbol once, never twice; 005490 is seed-only
+        # evidence (its ka10081 record is omitted, so it is not
+        # affirmed).
+        seed = om_preopen_seed(["002420", "005490"], symbol_count=2)
+        server = self.opening_server(failed_symbol="002420",
+                                     preopen_seed=seed,
+                                     omit_ma20=("005490",))
+        status, body, _, _ = server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        coverage = body["coverage"]
+        self.assertEqual(coverage["capture_failed_count"], 2)
+        self.assertEqual(coverage["no_record_count"], 0)
+        self.assertEqual(coverage["history_short_count"], 0)
+        self.assertEqual(coverage["computable_count"], 8)
+        self.assertEqual(
+            coverage["capture_failed_count"] + coverage["no_record_count"]
+            + coverage["history_short_count"] + coverage["no_price_count"]
+            + coverage["flat_count"] + coverage["computable_count"],
+            coverage["candidate_count"])
+        self.assertEqual(coverage["candidate_count"], 12)
+
+    def test_invalid_preopen_seed_is_data_fault(self):
+        # fail-closed: every malformed block is a DataFault — never a
+        # silent legacy fallback (the events_contract treatment).
+        cases = (
+            ("not-object", "seed"),
+            ("failed-not-list",
+             dict(om_preopen_seed(["002420"]), failed="002420")),
+            ("failed-non-string", om_preopen_seed([17])),
+            ("failed-duplicate", om_preopen_seed(["002420", "002420"])),
+            ("session-date", om_preopen_seed(
+                ["002420"], session_date="2026-11-11")),
+            ("seed-sha", om_preopen_seed(["002420"], seed_sha256="x")),
+            ("manifest-sha", om_preopen_seed(
+                ["002420"], manifest_sha256=17)),
+            ("symbol-count", om_preopen_seed(
+                ["002420"], symbol_count=True)),
+            ("count-below-failed", om_preopen_seed(
+                ["002420"], symbol_count=0)),
+        )
+        for label, seed in cases:
+            server = self.opening_server(preopen_seed=seed)
+            status, _, raw, _ = server.get_json("/mobile/market-view")
+            self.assertEqual(status, 500, label)
+            self.assertIn(b"data_fault", raw, label)
+            self._reap(server)
+
+    def test_preopen_seed_failed_with_affirming_record_is_data_fault(self):
+        # §12.10.2: a failed symbol that also has an affirming ka10081
+        # record is a recorded contradiction — REJECT, never a silent
+        # capture_failed or computable classification.
+        server = self.opening_server(
+            preopen_seed=om_preopen_seed(["000660"], symbol_count=1))
+        status, _, raw, _ = server.get_json("/mobile/market-view")
+        self.assertEqual(status, 500)
+        self.assertIn(b"data_fault", raw)
+
+    def test_legacy_config_without_preopen_seed_is_unchanged(self):
+        # the absent key is the legacy branch: the frozen opening body
+        # and bytes are served exactly as before the seed existed.
+        self.assertNotIn(b"preopen_seed", om_input_bytes())
+        expected, _, _ = om_expected_bodies(OM_REF_STAMP)
+        status, body, raw, _ = self.server.get_json(
+            "/mobile/market-view?as_of=" + OM_REF_STAMP)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, expected)
+        self.assertEqual(raw, canonical(expected) + b"\n")
 
     def test_opening_mode_input_snapshot_stable(self):
         # the §3.7 input snapshot is the committed prefix the fold
