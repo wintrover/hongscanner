@@ -40,22 +40,32 @@ assert_contains() { # desc haystack needle
   fi
 }
 
+## Resolution order is websockets-capability first: CI sets
+## HSCOLLECTOR_PYTHON=python3 globally, and test_sidecar.sh (which runs
+## before this suite) bootstraps tools/collector/.venv when that system
+## python lacks websockets. A bare HSCOLLECTOR_PYTHON must not win over
+## an importable interpreter.
 PY=""
-if [ -n "${HSCOLLECTOR_PYTHON:-}" ]; then
-  PY="$HSCOLLECTOR_PYTHON"
-elif [ -x tools/collector/.venv/bin/python ]; then
-  PY="$REPO_ROOT/tools/collector/.venv/bin/python"
-elif command -v python3.13 >/dev/null 2>&1; then
-  PY="python3.13"
-elif command -v uv >/dev/null 2>&1; then
-  PY="$(uv python find 3.13)"
+for cand in \
+  "$REPO_ROOT/tools/collector/.venv/bin/python" \
+  "${HSCOLLECTOR_PYTHON:-}" \
+  python3.13; do
+  [ -n "$cand" ] || continue
+  if command -v "$cand" >/dev/null 2>&1 && \
+     "$cand" -c 'import websockets' >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
+done
+if [ -z "$PY" ] && command -v uv >/dev/null 2>&1; then
+  PY="$(uv python find 3.13)" || PY=""
+  if [ -n "$PY" ] && \
+     ! "$PY" -c 'import websockets' >/dev/null 2>&1; then
+    PY=""
+  fi
 fi
 if [ -z "$PY" ]; then
-  echo "test_collector_sidecar_init.sh: no Python 3.13 interpreter" >&2
-  exit 1
-fi
-if ! "$PY" -c 'import websockets' >/dev/null 2>&1; then
-  echo "test_collector_sidecar_init.sh: $PY lacks websockets;" \
+  echo "test_collector_sidecar_init.sh: no interpreter with websockets;" \
        "run bash tools/collector/test_sidecar.sh first" >&2
   exit 1
 fi
