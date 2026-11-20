@@ -16,6 +16,7 @@ tests/test_recorder_contract
 tests/test_rest_failure_contract
 tests/test_rest_resp_contract
 tests/test_preopen_seed_contract
+tests/test_preopen_capture_contract
 tests/test_preopen_inject_contract
 tests/test_vendor_input
 tests/test_sub_input_contract

@@ -55,6 +55,16 @@
 ##     MAX_PAGES = 10.
 ##   row encoding: the official example accepts both object rows and
 ##     positional array rows in the documented field order.
+##   ka10099 주식목록조회 — POST /api/dostk/stkinfo, JSON. Official spec
+##   JSON (fetched 2026-11-20): request body mrkt_tp (String, one market
+##   per request); response body return_code, return_msg, list (LIST) of
+##   rows with 14 String fields (code name listCount auditInfo regDay
+##   lastPrice state marketCode marketName upName upSizeName orderWarning
+##   companyClassName nxtEnable); the symbol field is `code`. The market
+##   vocabulary is a declared config value — this layer requires only a
+##   non-empty string, the value authority is the P-run
+##   config/collector. Continuation: the same cont-yn/next-key header
+##   pair, one chain per market (REPLAY_CONTRACT §12.10.1).
 ##
 ## Contract of this module:
 ##   - PRESERVE: RawHttpResp.body and RawWsPayload.payload keep the original
@@ -203,6 +213,13 @@ type
     baseDt*: string
     updStkpcTp*: string
 
+  Ka10099Query* = object
+    ## The declared request scope of one ka10099 market-list query: one
+    ## market per request. mrkt_tp is required and non-empty; its vendor
+    ## value is a P-run config/collector declaration (this layer pins no
+    ## market enum, REPLAY_CONTRACT §12.10.1).
+    mrktTp*: string
+
   PageChain* = object
     ## Ordered pages answering one ka10027 query. Physical order is the
     ## authority; the cont-yn chain is validated, never trusted.
@@ -274,6 +291,16 @@ const
     "low_pric", "pred_pre", "pred_pre_sig", "trde_tern_rt", "upd_stkpc_tp",
     "upd_rt"]
 
+  ka10099ApiId* = "ka10099"
+  ka10099Path* = "/api/dostk/stkinfo"
+  ka10099ListKey* = "list"
+  ka10099RowFields* = [
+    "code", "name", "listCount", "auditInfo", "regDay", "lastPrice",
+    "state", "marketCode", "marketName", "upName", "upSizeName",
+    "orderWarning", "companyClassName", "nxtEnable"]
+  ## The ka10099 row field carrying the symbol (the universe input).
+  ka10099SymbolField* = "code"
+
   ## Request enums, verbatim from the official ka10080 field descriptions.
   ka10080TicScopeValues* = ["1", "3", "5", "10", "15", "30", "45", "60"]
   ka10080UpdStkpcTpValues* = ["0", "1"]
@@ -320,7 +347,7 @@ const
 
   ## The explicit subset of TRs this module declares paginated: repeat and
   ## the page cap apply to these only, never to vendor input as a whole.
-  paginatedTrs* = ["ka10027", "ka10080"]
+  paginatedTrs* = ["ka10027", "ka10080", "ka10099"]
 
   ## Header names that must never pass through this layer.
   secretHeaderNames* = [
@@ -356,6 +383,17 @@ let
     listKey: ka10081ListKey,
     rowFields: @ka10081RowFields,
     extraBodyKeys: @ka10081BodyEchoKeys)
+
+  ## ka10099 is declared paginated: one market (mrkt_tp) is one
+  ## cont-yn/next-key page chain (REPLAY_CONTRACT §12.10.1). Its rows are
+  ## the P-run universe input and carry the symbol in `code` (unlike
+  ## ka10027's stk_cd).
+  ka10099Spec* = TrSpec(
+    apiId: ka10099ApiId,
+    path: ka10099Path,
+    paginated: true,
+    listKey: ka10099ListKey,
+    rowFields: @ka10099RowFields)
 
 proc verr(f: VendorFailure; msg: string): ref VendorInputError =
   let e = newException(VendorInputError, msg)
@@ -555,6 +593,24 @@ proc ka10081RequestBody*(q: Ka10081Query): HcjValue =
     ("base_dt", hStr(q.baseDt)),
     ("stk_cd", hStr(q.stkCd)),
     ("upd_stkpc_tp", hStr(q.updStkpcTp)))
+
+proc validateKa10099Query*(q: Ka10099Query) =
+  ## The declared ka10099 scope: mrkt_tp is required and non-empty. The
+  ## vendor's market vocabulary is a P-run config/collector declaration —
+  ## this layer pins no value, so only emptiness is a schema failure
+  ## (REPLAY_CONTRACT §12.10.1).
+  if q.mrktTp.len == 0:
+    raise verr(vfContract, "ka10099 mrkt_tp must not be empty")
+
+proc initKa10099Query*(mrktTp: string): Ka10099Query =
+  result = Ka10099Query(mrktTp: mrktTp)
+  validateKa10099Query(result)
+
+proc ka10099RequestBody*(q: Ka10099Query): HcjValue =
+  ## The one documented request body field. No authorization header is
+  ## produced here: authentication is out of scope for this module.
+  validateKa10099Query(q)
+  hObj(("mrkt_tp", hStr(q.mrktTp)))
 
 proc continuationHeaders*(prev: RawHttpResp): tuple[contYn, nextKey: string] =
   ## cont-yn/next-key values for the next request, per spec: set both only
@@ -817,6 +873,27 @@ proc chainSymbols*(spec: TrSpec; chain: PageChain;
   ## consumes a cap-closed chain as a declared truncated subset.
   for r in chainRows(spec, chain, pageCap, truncatedOk):
     result.add(r.code)
+
+proc ka10099ChainSymbols*(pages: seq[RawHttpResp];
+                          pageCap: int = defaultPageCap;
+                          truncatedOk = false): seq[string] =
+  ## The `code` of every ka10099 row of one market's declared chain, in
+  ## page then row order. The same fail-closed path as chainSymbols: the
+  ## cont-yn/page-cap chain rules and every page's success affirmation are
+  ## validated, and a row without a non-empty string `code` rejects the
+  ## whole chain — a symbol row that cannot name its symbol cannot enter
+  ## the P-run universe (REPLAY_CONTRACT §12.10.1). truncatedOk consumes a
+  ## cap-closed chain as a declared truncated subset (the P-run manifest
+  ## then carries universe.truncated=true).
+  validateChainPages(ka10099Spec, pages, pageCap, truncatedOk)
+  for resp in pages:
+    for row in parsePageRows(ka10099Spec, resp):
+      let cd = row.getOpt(ka10099SymbolField)
+      if cd.isNone or cd.get.kind != hkStr or cd.get.strVal.len == 0:
+        raise verr(vfContract,
+          "ka10099 row without a non-empty string code cannot enter the " &
+          "P-run universe (fail-closed)")
+      result.add(cd.get.strVal)
 
 proc interleaveUniverse*(upCodes, downCodes: seq[string]): seq[string] =
   ## The §12.9 daily-sweep universe of one up/down pair: the union of the

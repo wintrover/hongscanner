@@ -19,6 +19,17 @@ type
     failed*: seq[string]
     manifestSha256*: string
 
+  PreopenUniverse* = object
+    ## The optional config.preopen_universe declaration (REPLAY_CONTRACT
+    ## §12.10.1): the P-run's universe source. Present = the stream is a
+    ## P-run (REST-only capture, manifest last, no ws_frame/session_end);
+    ## absent = legacy or S-run. Fail-closed: a malformed shape is REJECT,
+    ## never a silent default.
+    source*: string              ## "ka10099" or "explicit"
+    marketCodes*: seq[string]    ## ka10099: declared market order
+    symbols*: seq[string]        ## explicit: declared symbols
+    pageCap*: int                ## ka10099: declared chain page cap
+
   Config* = object
     sessionDate*: string
     params*: Params
@@ -40,6 +51,10 @@ type
     dailyScope*: string
     ## Optional config.preopen_seed (REPLAY_CONTRACT §12.10.2).
     preopenSeed*: Option[PreopenSeed]
+    ## Optional config.preopen_universe (REPLAY_CONTRACT §12.10.1): the
+    ## P-run declaration. Mutually exclusive with preopen_seed (a stream
+    ## is an S-run or a P-run, never both).
+    preopenUniverse*: Option[PreopenUniverse]
 
   RunStatus* = enum
     rsOk, rsIncomplete, rsUnreliableFlag
@@ -99,6 +114,27 @@ const
   ## every field is required and nothing else is admitted.
   preopenSeedFields = ["failed", "manifest_sha256", "seed_sha256",
                        "session_date", "source_run_id", "symbol_count"]
+
+  ## The two declared config.preopen_universe shapes (§12.10.1). Present,
+  ## exactly one shape is admitted, every field is required and nothing
+  ## else is allowed.
+  preopenUniverseKa10099 = "ka10099"
+  preopenUniverseExplicit = "explicit"
+  preopenUniverseFieldsKa10099 = ["market_codes", "page_cap", "source"]
+  preopenUniverseFieldsExplicit = ["source", "symbols"]
+
+  ## The 12th kind's exact shape in a P-run (§12.10.1). The manifest has
+  ## no `failed` array: a failed capture is the daily_capture_failed gap
+  ## record (this is the collector's §12.9 vocabulary), so the declared
+  ## failed set is re-derived from the stream itself.
+  preopenManifestFields = [
+    "binary_sha256", "capture_failed_count", "capture_window",
+    "captured_count", "config_sha256", "history_short_count", "seed_sha256",
+    "session_date", "source_run_id", "universe"]
+  preopenManifestUniverseFields = [
+    "market_codes", "source", "symbol_count", "truncated", "universe_sha256"]
+  preopenManifestWindowFields = ["ended_at", "started_at"]
+  dailyCaptureFailedWhat = "daily_capture_failed"
 
 proc isSha256Hex(s: string): bool =
   ## The declared hash form: 64 lowercase hex digits (the digest.sha256Hex
@@ -179,6 +215,85 @@ proc parsePreopenSeed(raw: HcjValue; sessionDate: string): PreopenSeed =
       " is below |failed| " & $result.failed.len &
       " (symbol_count == K + |failed|, §12.10.2)")
 
+proc requireExactFields(raw: HcjValue; fields: openArray[string];
+                        what: string) =
+  ## Exact-shape check: an object with every declared field and nothing
+  ## else. Used by the P-run declarations, where a producer typo must be a
+  ## REJECT rather than a silently ignored field (§12.10.1).
+  if raw.kind != hkObj:
+    raise newException(RecordError, what & " is not an object: " & kindName(raw))
+  for p in raw.pairs:
+    if p.k notin fields:
+      raise newException(RecordError,
+        what & " has an unknown field: " & p.k & " (the declared shape is " &
+        "exactly " & fields.join(", ") & ")")
+  for f in fields:
+    if not raw.has(f):
+      raise newException(RecordError, what & " is missing field: " & f)
+
+proc strList(v: HcjValue; what: string; requireNonEmpty: bool): seq[string] =
+  ## A declared list of non-empty strings. Duplicates are preserved here;
+  ## the caller owns whether they are deduped or rejected.
+  if v.kind != hkArr:
+    raise newException(RecordError, what & " is not an array: " & kindName(v))
+  if requireNonEmpty and v.items.len == 0:
+    raise newException(RecordError, what & " must not be empty")
+  for item in v.items:
+    if item.kind != hkStr:
+      raise newException(RecordError,
+        what & " element is not a string: " & kindName(item))
+    if item.strVal.len == 0:
+      raise newException(RecordError, what & " carries an empty string")
+    result.add(item.strVal)
+
+proc parsePreopenUniverse(raw: HcjValue): PreopenUniverse =
+  ## The optional P-run universe declaration (§12.10.1): exactly
+  ## {"source":"ka10099","market_codes":[...],"page_cap":N} or
+  ## {"source":"explicit","symbols":[...]}. Unknown/missing fields, empty
+  ## lists and a bad page cap are REJECT — a P-run whose universe cannot
+  ## be derived is not a capture.
+  if raw.kind != hkObj:
+    raise newException(RecordError,
+      "config.preopen_universe is not an object: " & kindName(raw))
+  if not raw.has("source"):
+    raise newException(RecordError,
+      "config.preopen_universe is missing field: source")
+  let src = raw.get("source")
+  if src.kind != hkStr:
+    raise newException(RecordError,
+      "config.preopen_universe.source is not a string: " & kindName(src))
+  result.source = src.strVal
+  case result.source
+  of preopenUniverseKa10099:
+    requireExactFields(raw, preopenUniverseFieldsKa10099,
+                       "config.preopen_universe")
+    result.marketCodes = strList(raw.get("market_codes"),
+      "config.preopen_universe.market_codes", requireNonEmpty = true)
+    for i, m in result.marketCodes:
+      for j in 0 ..< i:
+        if result.marketCodes[j] == m:
+          raise newException(RecordError,
+            "config.preopen_universe.market_codes repeats market: " & m &
+            " (declared market order is the universe authority)")
+    let pc = raw.get("page_cap")
+    if pc.kind != hkInt:
+      raise newException(RecordError,
+        "config.preopen_universe.page_cap is not an integer: " & kindName(pc))
+    if pc.ival < 1:
+      raise newException(RecordError,
+        "config.preopen_universe.page_cap must be >= 1: " & $pc.ival)
+    result.pageCap = int(pc.ival)
+  of preopenUniverseExplicit:
+    requireExactFields(raw, preopenUniverseFieldsExplicit,
+                       "config.preopen_universe")
+    result.symbols = strList(raw.get("symbols"),
+      "config.preopen_universe.symbols", requireNonEmpty = true)
+    result.pageCap = 0
+  else:
+    raise newException(RecordError,
+      "config.preopen_universe.source must be \"" & preopenUniverseKa10099 &
+      "\" or \"" & preopenUniverseExplicit & "\": " & result.source)
+
 proc parseConfig*(raw: HcjValue): Config =
   if raw.kind != hkObj:
     raise newException(RecordError, "config raw is not an object")
@@ -244,6 +359,18 @@ proc parseConfig*(raw: HcjValue): Config =
   if raw.has("preopen_seed"):
     result.preopenSeed = some(
       parsePreopenSeed(raw.get("preopen_seed"), result.sessionDate))
+  # config.preopen_universe (REPLAY_CONTRACT §12.10.1): optional and
+  # mutually exclusive with preopen_seed. Present = a P-run: its records
+  # are audited against the declared universe source and its last record
+  # is the manifest. Absent = legacy/S-run, every byte unchanged.
+  if raw.has("preopen_universe"):
+    result.preopenUniverse = some(
+      parsePreopenUniverse(raw.get("preopen_universe")))
+  if result.preopenSeed.isSome and result.preopenUniverse.isSome:
+    raise newException(RecordError,
+      "config declares both preopen_seed and preopen_universe: a stream is " &
+      "an S-run (seed entry) or a P-run (universe capture), never both " &
+      "(REPLAY_CONTRACT §12.10.1/§12.10.2)")
   # Symmetric judgment params (P23/§6). Each field is optional with a
   # declared default meaning "pre-contract" (P24 pattern): an absent or
   # legacy-named field (`lookback`, `pullback_min_bp`, ...) falls back to the
@@ -468,11 +595,363 @@ proc seedDeclaredSymbols(seed: PreopenSeed; recs: seq[Record];
     if sym notin result:
       result.add(sym)
 
+proc universeHash*(symbols: seq[string]): string =
+  ## The declared universe_sha256 framing (REPLAY_CONTRACT §12.10.1):
+  ## sha256 over each deduped symbol in universe order, each followed by
+  ## LF. The empty input hashes the empty byte string; a P-run never
+  ## declares an empty universe (it is REJECT before this is compared).
+  var text = ""
+  for sym in symbols:
+    text.add(sym)
+    text.add("\n")
+  sha256Hex(text)
+
+proc preopenUniverseOf*(uni: PreopenUniverse;
+                        attempts: seq[RestRespAttempt]):
+                        tuple[symbols: seq[string], truncated: bool] =
+  ## Derive the P-run universe from the preserved chains (§12.10.1):
+  ## explicit = the declared symbols deduped in order; ka10099 = declared
+  ## market order, then page order, then row order, taking each row's
+  ## `code` and deduping at first appearance. Every declared ka10099
+  ## market must have its own 1..N chain, and a ka10099 market outside the
+  ## declaration is REJECT — the universe is exactly what the P-run
+  ## declared. Each chain is re-validated by ka10099ChainSymbols (the same
+  ## affirmation/cont-yn/cap rules verifyAttempts audits); a cap-closed
+  ## chain sets truncated. An empty derived universe is REJECT: a P-run
+  ## that captured no symbol is not a capture.
+  if uni.source == preopenUniverseExplicit:
+    for a in attempts:
+      if a.api == raKa10099:
+        raise newException(RecordError,
+          "ka10099 capture at seq " & $a.seqNo & " is outside the explicit " &
+          "preopen_universe: an explicit universe declares its symbols and " &
+          "has no market-list source (REPLAY_CONTRACT §12.10.1)")
+    for sym in uni.symbols:
+      if sym notin result.symbols:
+        result.symbols.add(sym)
+  else:
+    for a in attempts:
+      if a.api == raKa10099 and a.scope99.mrktTp notin uni.marketCodes:
+        raise newException(RecordError,
+          "ka10099 market " & a.scope99.mrktTp & " at seq " & $a.seqNo &
+          " is outside the declared preopen_universe.market_codes: an " &
+          "undeclared market capture is not part of this P-run universe " &
+          "(REPLAY_CONTRACT §12.10.1)")
+    for m in uni.marketCodes:
+      var chain: seq[RestRespAttempt]
+      for a in attempts:
+        if a.api == raKa10099 and a.scope99.mrktTp == m:
+          chain.add(a)
+      if chain.len == 0:
+        raise newException(RecordError,
+          "declared ka10099 market " & m & " has no page chain in the " &
+          "P-run: every declared market is captured (REPLAY_CONTRACT §12.10.1)")
+      for i, a in chain:
+        if a.page != i + 1:
+          raise newException(RecordError,
+            "ka10099 market " & m & " page chain is not 1..N in stream " &
+            "order (page " & $a.page & " at position " & $(i + 1) &
+            ", seq " & $a.seqNo & "); rejected fail-closed")
+      var pages: seq[RawHttpResp]
+      for a in chain: pages.add(a.resp)
+      let truncated = chain[^1].resp.contYn == "Y" and chain.len >= uni.pageCap
+      var codes: seq[string]
+      try:
+        codes = ka10099ChainSymbols(pages, uni.pageCap, truncated)
+      except VendorInputError as e:
+        raise newException(RecordError,
+          "ka10099 market " & m & " chain is rejected: " & e.msg)
+      for cd in codes:
+        if cd notin result.symbols:
+          result.symbols.add(cd)
+      if truncated:
+        result.truncated = true
+  if result.symbols.len == 0:
+    raise newException(RecordError,
+      "preopen_universe derives an empty symbol universe: a P-run that " &
+      "captured no symbol is not a capture (REPLAY_CONTRACT §12.10.1)")
+
+proc preopenFailedOf*(recs: seq[Record]): seq[string] =
+  ## The declared failed captures of a P-run, re-derived from the stream:
+  ## the manifest has no `failed` array, so every daily_capture_failed gap
+  ## (§12.9) is the failure evidence. A symbol-less or repeated
+  ## daily_capture_failed gap is REJECT — one symbol is one logical
+  ## capture task, and a failure must name the symbol it excluded.
+  for r in recs:
+    if r.kind != kGap: continue
+    let raw = r.raw
+    if raw.kind != hkObj or not raw.has("what"): continue
+    let w = raw.get("what")
+    if w.kind != hkStr or w.strVal != dailyCaptureFailedWhat: continue
+    let sym = raw.get("symbol")
+    if sym.kind != hkStr or sym.strVal.len == 0:
+      raise newException(RecordError,
+        "P-run daily_capture_failed gap at seq " & $r.seq & " does not " &
+        "carry its symbol: a failed capture must name the symbol it " &
+        "excluded (§12.9/§12.10.1)")
+    if sym.strVal in result:
+      raise newException(RecordError,
+        "P-run daily_capture_failed repeats symbol " & sym.strVal &
+        " at seq " & $r.seq &
+        ": one symbol is one logical capture task (§12.9)")
+    result.add(sym.strVal)
+
+proc fieldStr(raw: HcjValue; what, key: string): string =
+  ## A required non-empty string field of an exact-shaped object.
+  let v = raw.get(key)
+  if v.kind != hkStr:
+    raise newException(RecordError,
+      what & "." & key & " is not a string: " & kindName(v))
+  if v.strVal.len == 0:
+    raise newException(RecordError, what & "." & key & " must not be empty")
+  v.strVal
+
+proc fieldInt(raw: HcjValue; what, key: string): int =
+  ## A required non-negative integer field of an exact-shaped object.
+  let v = raw.get(key)
+  if v.kind != hkInt:
+    raise newException(RecordError,
+      what & "." & key & " is not an integer: " & kindName(v))
+  if v.ival < 0:
+    raise newException(RecordError,
+      what & "." & key & " must be >= 0: " & $v.ival)
+  int(v.ival)
+
+proc fieldHash(raw: HcjValue; what, key: string): string =
+  ## A required 64-lowercase-hex sha256 field.
+  let s = fieldStr(raw, what, key)
+  if not isSha256Hex(s):
+    raise newException(RecordError,
+      what & "." & key & " is not a 64-digit lowercase sha256: " & s)
+  s
+
+proc captureStamp(s: string; what: string): tuple[date: string, sec: int] =
+  ## Exactly "YYYY-MM-DDTHH:MM:SS+09:00": the declared KST capture-window
+  ## form (§12.10.1). A pure format/range check plus calendars.hmsToSec —
+  ## a comparison of two recorded values, never a clock input. The offset
+  ## must be exactly +09:00 (KST); any other zone is outside the
+  ## declaration.
+  if s.len != 25 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or
+     s[13] != ':' or s[16] != ':' or s[19] != '+' or s[22] != ':' or
+     s[20] != '0' or s[21] != '9' or s[23] != '0' or s[24] != '0':
+    raise newException(RecordError,
+      what & " is not YYYY-MM-DDTHH:MM:SS+09:00: " & s)
+  for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]:
+    if s[i] notin {'0' .. '9'}:
+      raise newException(RecordError,
+        what & " is not YYYY-MM-DDTHH:MM:SS+09:00: " & s)
+  let mon = (ord(s[5]) - ord('0')) * 10 + (ord(s[6]) - ord('0'))
+  let day = (ord(s[8]) - ord('0')) * 10 + (ord(s[9]) - ord('0'))
+  if mon < 1 or mon > 12 or day < 1 or day > 31:
+    raise newException(RecordError, what & " has an impossible date: " & s)
+  var sec = 0
+  try:
+    sec = hmsToSec(s[11 .. ^1])
+  except CoverageError as e:
+    raise newException(RecordError, what & ": " & e.msg)
+  result = (s[0 .. 9], sec)
+
+proc validatePreopenManifest*(manifest: HcjValue; uni: PreopenUniverse;
+                              sessionDate: string; openSec: int;
+                              attempts: seq[RestRespAttempt];
+                              recs: seq[Record]; universe: seq[string];
+                              truncated: bool; failed: seq[string]) =
+  ## Audit the P-run seal against the stream it closes (§12.10.1): the
+  ## exact manifest shape, the universe declaration/derivation (source,
+  ## market order, count, hash, truncation), the ka10081 capture set and
+  ## its seed hash, the failed set, and the capture window. Every
+  ## violation is REJECT. `attempts` are the verified rest_resp attempts
+  ## (the ka10081 subset is the captured set); `recs` supplies the
+  ## canonical raw lines the seed hash binds; `universe`/`truncated`/
+  ## `failed` are the values replay derived from the records themselves.
+  requireExactFields(manifest, preopenManifestFields, "daily_seed_manifest")
+  discard fieldStr(manifest, "daily_seed_manifest", "source_run_id")
+  let sd = fieldStr(manifest, "daily_seed_manifest", "session_date")
+  if sd != sessionDate:
+    raise newException(RecordError,
+      "daily_seed_manifest.session_date " & sd & " does not equal " &
+      "config.session_date " & sessionDate)
+  # universe{source, market_codes, symbol_count, universe_sha256, truncated}
+  let uv = manifest.get("universe")
+  requireExactFields(uv, preopenManifestUniverseFields,
+                     "daily_seed_manifest.universe")
+  let uSource = fieldStr(uv, "daily_seed_manifest.universe", "source")
+  if uSource != uni.source:
+    raise newException(RecordError,
+      "daily_seed_manifest.universe.source " & uSource & " does not equal " &
+      "config.preopen_universe.source " & uni.source)
+  let mc = uv.get("market_codes")
+  if mc.kind != hkArr:
+    raise newException(RecordError,
+      "daily_seed_manifest.universe.market_codes is not an array: " &
+      kindName(mc))
+  var mCodes: seq[string]
+  for item in mc.items:
+    if item.kind != hkStr:
+      raise newException(RecordError,
+        "daily_seed_manifest.universe.market_codes element is not a string: " &
+        kindName(item))
+    mCodes.add(item.strVal)
+  if uni.source == preopenUniverseExplicit:
+    if mCodes.len != 0:
+      raise newException(RecordError,
+        "daily_seed_manifest.universe.market_codes must be empty for an " &
+        "explicit universe, got " & $mCodes.len & " entries")
+  else:
+    if mCodes != uni.marketCodes:
+      raise newException(RecordError,
+        "daily_seed_manifest.universe.market_codes does not equal the " &
+        "declared market order (" & mCodes.join(",") & " vs " &
+        uni.marketCodes.join(",") & ")")
+  let uCount = fieldInt(uv, "daily_seed_manifest.universe", "symbol_count")
+  if uCount != universe.len:
+    raise newException(RecordError,
+      "daily_seed_manifest.universe.symbol_count " & $uCount &
+      " does not equal the derived universe size " & $universe.len)
+  let uHash = fieldHash(uv, "daily_seed_manifest.universe", "universe_sha256")
+  let derivedUHash = universeHash(universe)
+  if uHash != derivedUHash:
+    raise newException(RecordError,
+      "daily_seed_manifest.universe.universe_sha256 mismatch: the derived " &
+      "universe hash is " & derivedUHash & ", declared " & uHash &
+      " (framing: each deduped symbol + LF, universe order, §12.10.1)")
+  let tr = uv.get("truncated")
+  if tr.kind != hkBool:
+    raise newException(RecordError,
+      "daily_seed_manifest.universe.truncated is not a boolean: " &
+      kindName(tr))
+  if tr.bval != truncated:
+    raise newException(RecordError,
+      "daily_seed_manifest.universe.truncated is " & $tr.bval &
+      " but the derived chains say " & $truncated &
+      " (any chain closed at the declared cap while cont-yn=Y is a " &
+      "declared truncated subset, §12.10.1)")
+  # The captured set: every verified ka10081 record, in stream order, and
+  # its canonical raw-line hash (the §12.10.1 seed framing).
+  var captured: seq[string]
+  var seedText = ""
+  for a in attempts:
+    if a.api != raKa10081: continue
+    let sym = a.scope81.stkCd
+    if sym in captured:
+      raise newException(RecordError,
+        "P-run ka10081 scope repeats symbol " & sym &
+        ": one symbol is one logical capture task (§12.9)")
+    captured.add(sym)
+    seedText.add(canonical(recs[a.seqNo - 1].raw))
+    seedText.add("\n")
+  let seedHash = sha256Hex(seedText)
+  let declaredSeed = fieldHash(manifest, "daily_seed_manifest", "seed_sha256")
+  if declaredSeed != seedHash:
+    raise newException(RecordError,
+      "daily_seed_manifest.seed_sha256 mismatch: the ka10081 canonical " &
+      "raw-line hash is " & seedHash & ", declared " & declaredSeed &
+      " (framing: canonical(raw) + LF per record, stream order, seq excluded)")
+  let capturedCount = fieldInt(manifest, "daily_seed_manifest", "captured_count")
+  if capturedCount != captured.len:
+    raise newException(RecordError,
+      "daily_seed_manifest.captured_count " & $capturedCount &
+      " does not equal the ka10081 record count " & $captured.len)
+  let failedCount = fieldInt(manifest, "daily_seed_manifest",
+                             "capture_failed_count")
+  if failedCount != failed.len:
+    raise newException(RecordError,
+      "daily_seed_manifest.capture_failed_count " & $failedCount &
+      " does not equal the derived failed set size " & $failed.len)
+  let shortCount = fieldInt(manifest, "daily_seed_manifest",
+                            "history_short_count")
+  if shortCount > captured.len:
+    raise newException(RecordError,
+      "daily_seed_manifest.history_short_count " & $shortCount &
+      " exceeds captured_count " & $captured.len)
+  if captured.len + failed.len != universe.len:
+    raise newException(RecordError,
+      "captured " & $captured.len & " + failed " & $failed.len &
+      " does not equal the universe size " & $universe.len &
+      " (symbol_count == captured_count + capture_failed_count, §12.10.1)")
+  for sym in captured:
+    if sym notin universe:
+      raise newException(RecordError,
+        "captured symbol " & sym & " is outside the derived universe")
+    if sym in failed:
+      raise newException(RecordError,
+        "symbol " & sym & " is both captured and failed: the sets must be " &
+        "disjoint (§12.10.1)")
+  for sym in failed:
+    if sym notin universe:
+      raise newException(RecordError,
+        "failed symbol " & sym & " is outside the derived universe")
+  for sym in universe:
+    if sym notin captured and sym notin failed:
+      raise newException(RecordError,
+        "universe symbol " & sym & " is neither captured nor failed: " &
+        "captured ∪ failed must equal the universe (§12.10.1)")
+  # capture_window{started_at, ended_at}: recorded KST values compared
+  # with the calendar's open for the session date, never a clock.
+  let cw = manifest.get("capture_window")
+  requireExactFields(cw, preopenManifestWindowFields,
+                     "daily_seed_manifest.capture_window")
+  let started = captureStamp(fieldStr(cw, "daily_seed_manifest.capture_window",
+                                      "started_at"),
+                             "daily_seed_manifest.capture_window.started_at")
+  let ended = captureStamp(fieldStr(cw, "daily_seed_manifest.capture_window",
+                                    "ended_at"),
+                           "daily_seed_manifest.capture_window.ended_at")
+  if started.date != sessionDate or ended.date != sessionDate:
+    raise newException(RecordError,
+      "daily_seed_manifest.capture_window dates " & started.date & ".." &
+      ended.date & " are not the session date " & sessionDate)
+  if started.sec > ended.sec:
+    raise newException(RecordError,
+      "daily_seed_manifest.capture_window.started_at is after ended_at: " &
+      "an impossible capture window")
+  if ended.sec >= openSec:
+    raise newException(RecordError,
+      "daily_seed_manifest.capture_window.ended_at is not strictly before " &
+      "the session open: a P-run must close before the market opens " &
+      "(REPLAY_CONTRACT §12.10.1)")
+  discard fieldHash(manifest, "daily_seed_manifest", "binary_sha256")
+  discard fieldHash(manifest, "daily_seed_manifest", "config_sha256")
+
 proc runCore*(recs: seq[Record]): CoreResult =
   validateRecords(recs)
   let cal = recs[0].raw
   result.config = parseConfig(recs[1].raw)
   result.spec = sessionFor(cal, result.config.sessionDate)
+  # A config.preopen_universe declaration makes this a P-run
+  # (REPLAY_CONTRACT §12.10.1): a REST-only pre-open capture whose seal is
+  # the daily_seed_manifest, exactly the last record. No ws_frame and no
+  # session_end belongs to it; anything after the manifest is outside the
+  # declared capture. These structural facts are checked before any
+  # consumption so a malformed P-run is REJECT, never a partial capture.
+  let pRun = result.config.preopenUniverse.isSome
+  if pRun:
+    if recs[^1].kind != kDailySeedManifest:
+      raise newException(RecordError,
+        "P-run seal is not the last record: the last record is " &
+        kindName(recs[^1].kind) & " at seq " & $recs[^1].seq & "; the " &
+        "daily_seed_manifest must close the stream " &
+        "(REPLAY_CONTRACT §12.10.1)")
+    var manifests = 0
+    for r in recs:
+      case r.kind
+      of kWsFrame:
+        raise newException(RecordError,
+          "P-run carries a ws_frame at seq " & $r.seq & ": the pre-open " &
+          "capture is REST-only, with no tick stream " &
+          "(REPLAY_CONTRACT §12.10.1)")
+      of kSessionEnd:
+        raise newException(RecordError,
+          "P-run carries a session_end at seq " & $r.seq & ": a P-run has " &
+          "no session seal; its seal is the daily_seed_manifest " &
+          "(REPLAY_CONTRACT §12.10.1)")
+      of kDailySeedManifest:
+        inc manifests
+      else: discard
+    if manifests != 1:
+      raise newException(RecordError,
+        "P-run must carry exactly one daily_seed_manifest as its last " &
+        "record, found " & $manifests & " (REPLAY_CONTRACT §12.10.1)")
   # The event facts (REPLAY_CONTRACT §13): one fold of the single
   # judgment function over the recorded stream, before the bars loop so
   # the judgment consumes exactly the recorded records in seq order
@@ -606,20 +1085,41 @@ proc runCore*(recs: seq[Record]): CoreResult =
   # audited (ka10027 candidate chains, ka10080 backfill chains).
   # config.preopen_seed (§12.10.2/§12.10.5), when present, first audits its
   # block and derives the declared ka10081 universe; the same audit then
-  # rejects any daily capture outside it. Absent, declaredSymbols stays
-  # empty and the audit is byte-identically the legacy one.
+  # rejects any daily capture outside it. config.preopen_universe
+  # (§12.10.1), when present, derives the P-run universe from the ka10099
+  # chains and uses it as the same declared universe. Absent, declaredSymbols
+  # stays empty and the audit is byte-identically the legacy one.
   var declaredSymbols: seq[string]
-  if result.config.preopenSeed.isSome:
+  var preopenTruncated = false
+  var preopenPageCap = 0
+  var preopenUni = PreopenUniverse()
+  if result.config.preopenUniverse.isSome:
+    preopenUni = result.config.preopenUniverse.get
+    (declaredSymbols, preopenTruncated) =
+      preopenUniverseOf(preopenUni, restAttempts)
+    preopenPageCap = preopenUni.pageCap
+  elif result.config.preopenSeed.isSome:
     declaredSymbols = seedDeclaredSymbols(result.config.preopenSeed.get,
       recs, restAttempts, result.config.pageCap,
       result.config.dailyScope == dailyScopeAccumulate)
   var verified: seq[RestRespAttempt]
   try:
     verified = verifyAttempts(restAttempts, result.config.pageCap,
-                              result.config.repollSeconds, declaredSymbols)
+                              result.config.repollSeconds, declaredSymbols,
+                              preopenPageCap)
   except RestRespError as e:
     raise newException(RecordError, restRejection(e.seqNo, e.msg))
   result.restVerified = verified.len
+  # The P-run seal (§12.10.1): the last record's manifest is audited
+  # against the stream it closes — the declared/derived universe, the
+  # verified ka10081 captures and their canonical raw-line hash, the
+  # failed gaps, the counts and the recorded capture window (strictly
+  # before the calendar open). A violation is REJECT; a P-run without a
+  # manifest never reaches this point (the structural check above).
+  if result.config.preopenUniverse.isSome:
+    validatePreopenManifest(recs[^1].raw, preopenUni,
+      result.config.sessionDate, result.spec.openSec, verified, recs,
+      declaredSymbols, preopenTruncated, preopenFailedOf(recs))
   # The ka10080 backfill bars (§12.8/P21): derived from the VERIFIED
   # preserved rows, origin:"BACKFILL", merged with the live bars at the
   # sealed output. A derivation failure (row schema, price sanity, session
