@@ -1,11 +1,24 @@
 ## Core: records -> bars -> signals. Pure; reads only the record sequence.
 ## No wall clock, no filesystem, no arguments: every input that changes a
 ## verdict is inside input.hcj.jsonl (plan §3.0/§3.1).
-import std/[strutils, algorithm]
+import std/[strutils, algorithm, options]
 import hcj, records, calendars, bars, engine, rest_resp, sub_input, vendor_input,
-       tickwire, subcheck, event_gen, backfill
+       tickwire, subcheck, event_gen, backfill, digest
 
 type
+  PreopenSeed* = object
+    ## The optional config.preopen_seed declaration (REPLAY_CONTRACT
+    ## §12.10.2): the S-run's binding to one P-run's ka10081 seed block.
+    ## Absent config.preopen_seed = legacy: no block, no declared universe,
+    ## every byte and verdict unchanged. Present, it is fail-closed: a
+    ## malformed shape is REJECT, never a silent default.
+    sourceRunId*: string
+    sessionDate*: string
+    seedSha256*: string
+    symbolCount*: int
+    failed*: seq[string]
+    manifestSha256*: string
+
   Config* = object
     sessionDate*: string
     params*: Params
@@ -20,6 +33,13 @@ type
     repollSeconds*: int
     ## The declared page cap (config.page_cap; defaultPageCap when absent).
     pageCap*: int
+    ## Optional config.daily_scope (REPLAY_CONTRACT §12.9): "" = legacy
+    ## scope. Read only to derive the pre-open sweep universe when
+    ## config.preopen_seed is present (§12.10.5); the collector records it
+    ## and this parser accepts the same vocabulary, fail-closed.
+    dailyScope*: string
+    ## Optional config.preopen_seed (REPLAY_CONTRACT §12.10.2).
+    preopenSeed*: Option[PreopenSeed]
 
   RunStatus* = enum
     rsOk, rsIncomplete, rsUnreliableFlag
@@ -74,6 +94,91 @@ proc boolOr(raw: HcjValue; key: string; dflt: bool): bool =
   else:
     dflt
 
+const
+  ## The exact declared shape of config.preopen_seed (§12.10.2). Present,
+  ## every field is required and nothing else is admitted.
+  preopenSeedFields = ["failed", "manifest_sha256", "seed_sha256",
+                       "session_date", "source_run_id", "symbol_count"]
+
+proc isSha256Hex(s: string): bool =
+  ## The declared hash form: 64 lowercase hex digits (the digest.sha256Hex
+  ## output). Anything else cannot be a recorded sha256 and is a shape
+  ## failure, never a value to compare loosely.
+  s.len == 64 and s.allCharsInSet({'0' .. '9', 'a' .. 'f'})
+
+proc seedStr(seed: HcjValue; key: string): string =
+  let v = seed.get(key)
+  if v.kind != hkStr:
+    raise newException(RecordError,
+      "config.preopen_seed." & key & " is not a string: " & kindName(v))
+  if v.strVal.len == 0:
+    raise newException(RecordError,
+      "config.preopen_seed." & key & " must not be empty")
+  v.strVal
+
+proc parsePreopenSeed(raw: HcjValue; sessionDate: string): PreopenSeed =
+  ## The optional seed declaration: absent = legacy (the caller never
+  ## reaches here); present = fail-closed. Unknown/missing fields, wrong
+  ## types, duplicate failed symbols and an impossible count are REJECT,
+  ## never silently defaulted (REPLAY_CONTRACT §12.10.2).
+  if raw.kind != hkObj:
+    raise newException(RecordError,
+      "config.preopen_seed is not an object: " & kindName(raw))
+  for p in raw.pairs:
+    if p.k notin preopenSeedFields:
+      raise newException(RecordError,
+        "config.preopen_seed has an unknown field: " & p.k &
+        " (the declared shape is exactly " & preopenSeedFields.join(", ") & ")")
+  for k in preopenSeedFields:
+    if not raw.has(k):
+      raise newException(RecordError,
+        "config.preopen_seed is missing field: " & k)
+  result.sourceRunId = seedStr(raw, "source_run_id")
+  result.sessionDate = seedStr(raw, "session_date")
+  if result.sessionDate != sessionDate:
+    raise newException(RecordError,
+      "config.preopen_seed.session_date " & result.sessionDate &
+      " does not equal config.session_date " & sessionDate)
+  result.seedSha256 = seedStr(raw, "seed_sha256")
+  if not isSha256Hex(result.seedSha256):
+    raise newException(RecordError,
+      "config.preopen_seed.seed_sha256 is not a 64-digit lowercase sha256: " &
+      result.seedSha256)
+  result.manifestSha256 = seedStr(raw, "manifest_sha256")
+  if not isSha256Hex(result.manifestSha256):
+    raise newException(RecordError,
+      "config.preopen_seed.manifest_sha256 is not a 64-digit lowercase " &
+      "sha256: " & result.manifestSha256)
+  let sc = raw.get("symbol_count")
+  if sc.kind != hkInt:
+    raise newException(RecordError,
+      "config.preopen_seed.symbol_count is not an integer: " & kindName(sc))
+  if sc.ival < 0:
+    raise newException(RecordError,
+      "config.preopen_seed.symbol_count must be >= 0: " & $sc.ival)
+  result.symbolCount = int(sc.ival)
+  let failed = raw.get("failed")
+  if failed.kind != hkArr:
+    raise newException(RecordError,
+      "config.preopen_seed.failed is not an array: " & kindName(failed))
+  for item in failed.items:
+    if item.kind != hkStr:
+      raise newException(RecordError,
+        "config.preopen_seed.failed element is not a string: " & kindName(item))
+    let sym = item.strVal
+    if sym.len == 0:
+      raise newException(RecordError,
+        "config.preopen_seed.failed carries an empty symbol")
+    if sym in result.failed:
+      raise newException(RecordError,
+        "config.preopen_seed.failed repeats symbol: " & sym)
+    result.failed.add(sym)
+  if result.symbolCount < result.failed.len:
+    raise newException(RecordError,
+      "config.preopen_seed.symbol_count " & $result.symbolCount &
+      " is below |failed| " & $result.failed.len &
+      " (symbol_count == K + |failed|, §12.10.2)")
+
 proc parseConfig*(raw: HcjValue): Config =
   if raw.kind != hkObj:
     raise newException(RecordError, "config raw is not an object")
@@ -115,6 +220,30 @@ proc parseConfig*(raw: HcjValue): Config =
     result.pageCap = int(pc.ival)
   else:
     result.pageCap = defaultPageCap
+  # config.daily_scope (REPLAY_CONTRACT §12.9): optional and absent/"" is
+  # the legacy scope. It is read only by the pre-open seed's sweep-universe
+  # derivation (§12.10.5); the collector's own vocabulary is reused
+  # (vendor_input.dailyScope*) so the two parsers cannot drift. A present
+  # value outside the declared vocabulary is fail-closed — never a silent
+  # reinterpretation.
+  if raw.has("daily_scope"):
+    let ds = raw.get("daily_scope")
+    if ds.kind != hkStr:
+      raise newException(RecordError,
+        "config.daily_scope is not a string: " & kindName(ds))
+    if ds.strVal.len > 0 and ds.strVal != dailyScopeLegacy and
+       ds.strVal != dailyScopeAccumulate:
+      raise newException(RecordError,
+        "config.daily_scope must be \"\", " & dailyScopeLegacy & " or " &
+        dailyScopeAccumulate & ": " & ds.strVal)
+    result.dailyScope = ds.strVal
+  # config.preopen_seed (REPLAY_CONTRACT §12.10.2): optional. Absent is the
+  # legacy S-run — no seed block and no declared universe, so every byte
+  # and verdict stays as before. Present, the whole block is parsed here
+  # (fail-closed shape) and audited against the records after the loop.
+  if raw.has("preopen_seed"):
+    result.preopenSeed = some(
+      parsePreopenSeed(raw.get("preopen_seed"), result.sessionDate))
   # Symmetric judgment params (P23/§6). Each field is optional with a
   # declared default meaning "pre-contract" (P24 pattern): an absent or
   # legacy-named field (`lookback`, `pullback_min_bp`, ...) falls back to the
@@ -224,6 +353,120 @@ proc schemaRejection(kindNameText: string; seqNo: int; detail: string): string =
   "record's (action, phase) combination; the live subscription wire " &
   "format is unverified by a measured producer (G2/G4), so any schema " &
   "doubt is a failure)"
+
+proc roundChain(round: seq[RestRespAttempt]): PageChain =
+  ## One audited page round as the vendor_input chain shape (the same
+  ## grouping verifyAttempts audits).
+  var pages: seq[RawHttpResp]
+  for a in round: pages.add(a.resp)
+  PageChain(query: round[0].scope, pages: pages)
+
+proc roundTruncated(round: seq[RestRespAttempt]; pageCap: int): bool =
+  ## The cap-closed declared-subset state verifyAttempts admits: the last
+  ## page still says cont-yn=Y at the declared cap. Never inferred below
+  ## the cap (a missing continuation stays a REJECT).
+  round.len > 0 and round[^1].resp.contYn == "Y" and round.len >= pageCap
+
+proc sweepUniverseOf(attempts: seq[RestRespAttempt]; pageCap: int;
+                     accumulate: bool): seq[string] =
+  ## The §12.9 sweep queue as replay derives it from the ka10027 chains:
+  ## the initial up/down pair's interleaved universe (the one definition,
+  ## vendor_input.interleaveUniverse, that the collector's dailyUniverseOf
+  ## uses), extended by each later complete poll pair's new symbols only
+  ## under accumulate-v2. Rounds split at each page-1 record exactly as
+  ## verifyAttempts audits them. Every round is re-validated by
+  ## chainSymbols (the same page/affirmation rules normalizeChain applies
+  ## in verifyAttempts), so a chain that would fail the audit contributes
+  ## no symbol — it rejects the run before any verification result exists.
+  var upRounds, downRounds: seq[seq[RestRespAttempt]]
+  for a in attempts:
+    if a.api != raKa10027: continue
+    if a.scope.direction == dirUp:
+      if a.page == 1 or upRounds.len == 0: upRounds.add(@[a])
+      else: upRounds[^1].add(a)
+    else:
+      if a.page == 1 or downRounds.len == 0: downRounds.add(@[a])
+      else: downRounds[^1].add(a)
+  let pairs = min(upRounds.len, downRounds.len)
+  let used = if accumulate: pairs else: min(pairs, 1)
+  for i in 0 ..< used:
+    let up = roundChain(upRounds[i])
+    let down = roundChain(downRounds[i])
+    let upCodes = chainSymbols(ka10027Spec, up, pageCap,
+                               roundTruncated(upRounds[i], pageCap))
+    let downCodes = chainSymbols(ka10027Spec, down, pageCap,
+                                 roundTruncated(downRounds[i], pageCap))
+    for sym in interleaveUniverse(upCodes, downCodes):
+      if sym notin result:
+        result.add(sym)
+
+proc seedDeclaredSymbols(seed: PreopenSeed; recs: seq[Record];
+                         attempts: seq[RestRespAttempt];
+                         pageCap: int; accumulate: bool): seq[string] =
+  ## Audit the §12.10.2 seed block against the recorded stream and return
+  ## the declared ka10081 universe for verifyAttempts (§12.10.5):
+  ## block symbols ∪ failed ∪ the replay-derived sweep queue. K is
+  ## symbol_count - |failed|; the block is the first K ka10081 rest_resp
+  ## records after record 2. Every condition is fail-closed: a missing
+  ## block, a hash mismatch, an overlap or a duplicate is a REJECT.
+  let k = seed.symbolCount - seed.failed.len
+  var daily: seq[RestRespAttempt]
+  for a in attempts:
+    if a.api == raKa10081: daily.add(a)
+  if daily.len < k:
+    raise newException(RecordError,
+      "preopen_seed block is missing: K = symbol_count " & $seed.symbolCount &
+      " - |failed| " & $seed.failed.len & " = " & $k & " ka10081 block " &
+      "records expected, " & $daily.len & " recorded (REPLAY_CONTRACT §12.10.2)")
+  var blockSymbols, affirming: seq[string]
+  for i, a in daily:
+    let sym = a.scope81.stkCd
+    if sym in affirming:
+      raise newException(RecordError,
+        "preopen_seed ka10081 scope repeats symbol " & sym & " at seq " &
+        $a.seqNo & ": one symbol is one logical capture task (§12.9/§12.10.2)")
+    affirming.add(sym)
+    if i < k: blockSymbols.add(sym)
+  # seed_sha256 = sha256 over the block's canonical raw lines in order,
+  # seq excluded: canonical(raw) followed by LF per record, exactly the
+  # line form the P-run manifest declares (§12.10.1/§12.10.2).
+  var blockText = ""
+  for i in 0 ..< k:
+    blockText.add(canonical(recs[daily[i].seqNo - 1].raw))
+    blockText.add("\n")
+  let blockHash = sha256Hex(blockText)
+  if blockHash != seed.seedSha256:
+    raise newException(RecordError,
+      "preopen_seed.seed_sha256 mismatch: the block's canonical raw-line " &
+      "hash is " & blockHash & ", declared " & seed.seedSha256 &
+      " (the block is the first " & $k & " ka10081 rest_resp records after " &
+      "record 2; REPLAY_CONTRACT §12.10.2)")
+  # Block and failed are disjoint and duplicate-free; a failed capture is
+  # not a rest_resp record, so a failed symbol with any affirming daily
+  # record is REJECT.
+  for sym in blockSymbols:
+    if sym in seed.failed:
+      raise newException(RecordError,
+        "preopen_seed.symbol " & sym & " is both a block capture and a " &
+        "declared failed capture (block and failed must be disjoint)")
+  for sym in seed.failed:
+    if sym in affirming:
+      raise newException(RecordError,
+        "preopen_seed.failed symbol " & sym & " also has an affirming " &
+        "ka10081 record: a failed capture is not a rest_resp record " &
+        "(REPLAY_CONTRACT §12.9/§12.10.2)")
+  result = blockSymbols
+  for sym in seed.failed:
+    result.add(sym)
+  var sweep: seq[string]
+  try:
+    sweep = sweepUniverseOf(attempts, pageCap, accumulate)
+  except VendorInputError as e:
+    raise newException(RecordError,
+      "preopen_seed sweep universe is rejected: " & e.msg)
+  for sym in sweep:
+    if sym notin result:
+      result.add(sym)
 
 proc runCore*(recs: seq[Record]): CoreResult =
   validateRecords(recs)
@@ -361,10 +604,19 @@ proc runCore*(recs: seq[Record]): CoreResult =
   # cadence and page cap come from the config record (README §6.1); with no
   # declared cadence the audit stays single-round. Both declared APIs are
   # audited (ka10027 candidate chains, ka10080 backfill chains).
+  # config.preopen_seed (§12.10.2/§12.10.5), when present, first audits its
+  # block and derives the declared ka10081 universe; the same audit then
+  # rejects any daily capture outside it. Absent, declaredSymbols stays
+  # empty and the audit is byte-identically the legacy one.
+  var declaredSymbols: seq[string]
+  if result.config.preopenSeed.isSome:
+    declaredSymbols = seedDeclaredSymbols(result.config.preopenSeed.get,
+      recs, restAttempts, result.config.pageCap,
+      result.config.dailyScope == dailyScopeAccumulate)
   var verified: seq[RestRespAttempt]
   try:
     verified = verifyAttempts(restAttempts, result.config.pageCap,
-                              result.config.repollSeconds)
+                              result.config.repollSeconds, declaredSymbols)
   except RestRespError as e:
     raise newException(RecordError, restRejection(e.seqNo, e.msg))
   result.restVerified = verified.len

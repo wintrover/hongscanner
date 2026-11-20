@@ -678,7 +678,7 @@ proc stepInto(s: var EventGenState; r: Record; events: var seq[EventFact]) =
   s.lastSeq = r.seq
   s.lastEvidence = contentHash(r)
   case r.kind
-  of kCalendar, kSub, kOutFrame, kPong:
+  of kCalendar, kSub, kOutFrame, kPong, kDailySeedManifest:
     discard
   of kConfig:
     consumeConfig(s, r)

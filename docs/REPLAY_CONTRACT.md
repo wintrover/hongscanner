@@ -29,7 +29,7 @@ One file, `input.hcj.jsonl`, one HCJ document per line.
 
 ## 3. Record kinds
 
-Exactly eleven kinds exist. Unknown kinds are rejected (exit 2).
+Exactly twelve kinds exist. Unknown kinds are rejected (exit 2).
 
 Consumed by Core (eight):
 
@@ -44,12 +44,16 @@ Consumed by Core (eight):
 | `gap` | `symbol` (string or null) — a period whose data cannot be trusted |
 | `session_end` | explicit normal close; `raw` is `null` |
 
-Ignored by Core (three, diagnostic only):
+Ignored by Core (four):
 
-`out_frame`, `ws_conn`, `pong`.
+`out_frame`, `ws_conn`, `pong`, `daily_seed_manifest`.
 
 `ws_conn` describes how a connection changed; `gap` describes which data is
 untrustworthy. They are recorded separately and only `gap` has authority.
+`daily_seed_manifest` is the P-run seal (§12.10.1): a P-run has no
+`ws_frame`/`session_end`, so Core ignores the manifest and never derives a
+P-run verdict from it. An S-run binds the seed through `config.preopen_seed`
+(§12.10.2), not through this record.
 
 Until a live producer is measured, `rest_resp`, `sub` and `ws_raw` follow a
 **validated acceptance path**: each record parses against its declared
@@ -588,10 +592,13 @@ contract on the same `rest_resp` envelope as §12.1/§12.8:
 
 ### 12.10 Pre-open daily seed (target contract)
 
-**Status: target.** No producer, record kind or audit parameter exists yet.
-This section fixes the intended semantics so the implementation (P3) can be
-written against it; until the 12th kind exists, a stream carrying it is
-rejected by §3 and nothing here changes today's replay.
+**Status: target, Core side implemented (P3).** No producer exists yet. The
+12th kind `daily_seed_manifest`, the optional `config.preopen_seed` parser
+and the `verifyAttempts` `declaredSymbols` audit exist (`src/hs/records.nim`,
+`src/hs/replay.nim`, `src/hs/rest_resp.nim`); a stream without
+`config.preopen_seed` replays exactly as before. The producer (P-run
+capture and S-run materialization) is not implemented, so a real seeded
+stream remains unproduced and the P12 approval boundary is untouched.
 
 **12.10.1 Pre-open capture run (P-run)**
 
@@ -640,7 +647,9 @@ rejected by §3 and nothing here changes today's replay.
   S-run's `seq`. Rule 3 diagnostic records may interleave; the block and
   hash are defined by the first K ka10081 records and do not change.
 - `seed_sha256` must equal the block's canonical `raw`-line hash
-  (REJECT otherwise). `symbol_count == K + |failed|`; block symbols and
+  (REJECT otherwise). The hash framing is §12.10.1's: `canonical(raw)`
+  followed by LF for each block record, in block order, `seq` excluded.
+  `symbol_count == K + |failed|`; block symbols and
   `failed` are disjoint, each duplicate-free.
 - A failed capture is **not** a `rest_resp` record (§12.9); its coverage
   evidence is `failed`. A seed stream with a missing block, with a ka10081

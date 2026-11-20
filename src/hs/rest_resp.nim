@@ -378,7 +378,8 @@ proc scopeKey*(scope: Ka10027Query): string =
 
 proc verifyAttempts*(attempts: seq[RestRespAttempt];
                      pageCap: int = defaultPageCap;
-                     pollSeconds: int = 0): seq[RestRespAttempt] =
+                     pollSeconds: int = 0;
+                     declaredSymbols: seq[string] = @[]): seq[RestRespAttempt] =
   ## Audit the declared page chains of a complete stream and return the
   ## verified attempts (confirmed success, in stream order). Chains are
   ## grouped per (api, declared scope): ka10027 and ka10080 chains are
@@ -388,6 +389,11 @@ proc verifyAttempts*(attempts: seq[RestRespAttempt];
   ## without gaps, duplicates or restarts, and the whole chain must pass
   ## the vendor_input affirmation -- the same success and cont-yn/page-cap
   ## rules as the vendor layer.
+  ## declaredSymbols is the optional declared universe of the ka10081
+  ## daily capture (REPLAY_CONTRACT §12.10.5: the pre-open seed block ∪
+  ## failed ∪ the replay-derived sweep queue): non-empty, every ka10081
+  ## stk_cd must belong to it or the stream is rejected; empty (the
+  ## legacy callers' default) leaves the audit byte-identically unchanged.
   ## A round that reaches the declared cap while cont-yn=Y is audited as a
   ## declared truncated subset (truncatedOk): the cap is a scanner-side
   ## declaration, the pages beyond it are "not fetched" (REPLAY_CONTRACT
@@ -471,6 +477,21 @@ proc verifyAttempts*(attempts: seq[RestRespAttempt];
       # cont-yn/page-cap) are therefore NOT applied to ka10081 at all:
       # cont-yn/next-key stay preserved response evidence, never a
       # ka10081 obligation.
+      # A declared universe (§12.10.5) admits only its own symbols: an
+      # out-of-universe daily capture is the producer reaching outside the
+      # declared seed/sweep scope, rejected fail-closed. Empty = legacy.
+      if declaredSymbols.len > 0:
+        var declared = false
+        for sym in declaredSymbols:
+          if sym == g[0].scope81.stkCd:
+            declared = true
+            break
+        if not declared:
+          raise rerr(g[0].seqNo, vfContract,
+                     "ka10081 stk_cd " & g[0].scope81.stkCd & " is outside " &
+                     "the declared daily universe (pre-open seed block, " &
+                     "failed list and the replay-derived sweep queue, " &
+                     "REPLAY_CONTRACT §12.10.5); rejected fail-closed")
       if g.len != 1:
         raise rerr(g[0].seqNo, vfContract,
                    "declared ka10081 scope carries " & $g.len & " attempts " &

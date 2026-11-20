@@ -183,12 +183,6 @@ const
   realRestDomain* = "https://api.kiwoom.com"
   realWsEndpoint* = "wss://api.kiwoom.com:10000/api/dostk/websocket"
   approvedWatchdog* = "15:40:00+09:00"
-  # The explicit legacy daily scope (REPLAY_CONTRACT §12.9): byte-identical
-  # to an absent config.daily_scope.
-  dailyScopeLegacy* = "single-page-initial-pair"
-  # The FIFO universe scope: later poll rounds append new symbols and the
-  # sweep resumes (REPLAY_CONTRACT §12.9).
-  dailyScopeAccumulate* = "accumulate-v2"
 
 proc restDomainFor*(environment: string): string =
   ## The REST domain derived from the selected environment — the official
@@ -676,13 +670,7 @@ proc dailyUniverseOf(c: Collector; upPages, downPages: seq[RawHttpResp];
   let upCodes = chainSymbols(ka10027Spec, upChain, c.cfg.pageCap, upTruncated)
   let downCodes = chainSymbols(ka10027Spec, downChain, c.cfg.pageCap,
                                downTruncated)
-  var i = 0
-  while i < upCodes.len or i < downCodes.len:
-    if i < upCodes.len and upCodes[i] notin result:
-      result.add(upCodes[i])
-    if i < downCodes.len and downCodes[i] notin result:
-      result.add(downCodes[i])
-    inc i
+  result = interleaveUniverse(upCodes, downCodes)
 
 proc extendDailyUniverse(c: var Collector; upPages, downPages: seq[RawHttpResp];
                          upTruncated, downTruncated: bool) =
