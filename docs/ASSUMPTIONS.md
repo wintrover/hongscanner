@@ -345,6 +345,20 @@ still requires G2 credentials.
   **mock** policy; the real 5/s figure is documented but UNMEASURED here
   (no real credentials), so no real-domain pacing change is licensed.
   Production-environment behavior: UNVERIFIED (G2/G4).
+- ka10099 종목정보 리스트 (official spec JSON,
+  `kiwoom-securities/kiwoom-rest-api`, fetched 2026-11-20): `POST
+  /api/dostk/stkinfo`; request body `{"mrkt_tp":"<code>"}` — `mrkt_tp`
+  is required. Response body top level: `return_code`, `return_msg`,
+  `list[]`. Each `list` row carries `code`, `name`, `listCount`,
+  `auditInfo`, `regDay`, `lastPrice`, `state`, `marketCode`,
+  `marketName`, `upName`, `upSizeName`, `orderWarning`,
+  `companyClassName`, `nxtEnable` — the symbol field is **`code`**
+  (not `stk_cd`). `mrkt_tp` vocabulary: 0 코스피, 10 코스닥, 30 K-OTC,
+  50 코넥스, 60 ETN, 70 손실제한 ETN, 80 금현물, 90 변동성 ETN,
+  2 인프라투융자, 3 ELW, 4 뮤추얼펀드, 5 신주인수권, 6 리츠종목,
+  7 신주인수권증서, 8 ETF, 9 하이일드펀드. The real-domain rate limit
+  remains UNKNOWN (unmeasured in this repository; the mock measured
+  ≈1/s).
 - FCM / Android notification behavior (official Firebase + FlutterFire
   docs and plugin source, collected 2026-11-11 — the basis of the market
   alert slice): notification messages on Android are **not displayed while

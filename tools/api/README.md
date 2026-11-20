@@ -761,8 +761,9 @@ data_quality, 후보 이벤트의 symbol·direction, ENTERED/UPDATED의 1
   `status`의 의미는 **바뀌지 않는다** — 두 목록이 각각 10개 이상인지를
   말할 뿐, 모든 후보가 계산 가능하다는 뜻이 아니다. 그 사실은 다음
   가산 카운트로 드러낸다(종목별 최종 결과 하나, 우선순위 순):
-  `capture_failed_count`(`daily_capture_failed` 갭이 있고 성공 응답이
-  없음) → `no_record_count`(성공 응답, 유효 완료일 0행) →
+  `capture_failed_count`(`daily_capture_failed` 갭 또는 선택된 런의
+  §12.10.2 `config.preopen_seed.failed`가 있고 성공 응답이 없음) →
+  `no_record_count`(성공 응답, 유효 완료일 0행) →
   `history_short_count`(성공 응답, 완료일 1~19) → `no_price_count`
   (완료일 ≥20이나 페어 스냅샷에 가격 없음) → `flat_count`(완료일 ≥20,
   `20·P == ΣC`) → `computable_count`(기존 값, `20·P != ΣC`).

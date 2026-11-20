@@ -156,6 +156,9 @@ OPS_ALERT_TIMEOUT_S = 10
 # these all-day-growing files is ever read.
 MARKET_ENVIRONMENTS = ("demo", "real")
 SESSION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The preopen_seed block's recorded hash fields (REPLAY_CONTRACT
+# §12.10.2): 64 lowercase hex digits each.
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 # The config/calendar head cap (README §3.7 적격 판정): a file within the
 # cap is read whole (the calendar snapshot's first record may be a large
 # approved calendar — the 2027 KRX snapshot is 49,460 bytes, well past
@@ -599,6 +602,66 @@ def read_head_config(path):
     return None
 
 
+def preopen_seed_failed(config, session_date):
+    """The §12.10.2 config.preopen_seed block's `failed` symbols — the
+    S-run seed's coverage capture_failed evidence.
+
+    Absence of the key is the legacy branch: no seed, nothing added. A
+    present block is validated against the recorded shape and any
+    deviation is a DataFault — a malformed seed is never guessed into
+    the unseeded coverage (fail-closed). `session_date` is the
+    selected run's own recorded session date; the block must name the
+    same day."""
+    if "preopen_seed" not in config:
+        return frozenset()
+    seed = config["preopen_seed"]
+    if not isinstance(seed, dict):
+        raise DataFault("%s config preopen_seed is not a JSON object"
+                        % INPUT_JSONL)
+    source_run_id = seed.get("source_run_id")
+    if not isinstance(source_run_id, str) or not source_run_id:
+        raise DataFault("%s config preopen_seed source_run_id is not a "
+                        "non-empty string" % INPUT_JSONL)
+    seed_date = seed.get("session_date")
+    if not isinstance(seed_date, str) \
+            or SESSION_DATE_RE.match(seed_date) is None:
+        raise DataFault("%s config preopen_seed session_date is not the "
+                        "recorded YYYY-MM-DD shape" % INPUT_JSONL)
+    if seed_date != session_date:
+        raise DataFault("%s config preopen_seed session_date %s does not "
+                        "match the run's session_date %s"
+                        % (INPUT_JSONL, seed_date, session_date))
+    for field in ("seed_sha256", "manifest_sha256"):
+        value = seed.get(field)
+        if not isinstance(value, str) \
+                or SHA256_HEX_RE.match(value) is None:
+            raise DataFault("%s config preopen_seed %s is not 64 lowercase "
+                            "hex" % (INPUT_JSONL, field))
+    symbol_count = seed.get("symbol_count")
+    if not isinstance(symbol_count, int) or isinstance(symbol_count, bool) \
+            or symbol_count < 0:
+        raise DataFault("%s config preopen_seed symbol_count is not a "
+                        "non-negative integer" % INPUT_JSONL)
+    failed = seed.get("failed")
+    if not isinstance(failed, list):
+        raise DataFault("%s config preopen_seed failed is not a list"
+                        % INPUT_JSONL)
+    symbols = set()
+    for symbol in failed:
+        if not isinstance(symbol, str) or not symbol:
+            raise DataFault("%s config preopen_seed failed holds a "
+                            "non-string symbol" % INPUT_JSONL)
+        if symbol in symbols:
+            raise DataFault("%s config preopen_seed failed lists %s more "
+                            "than once" % (INPUT_JSONL, symbol))
+        symbols.add(symbol)
+    if symbol_count < len(symbols):
+        raise DataFault("%s config preopen_seed symbol_count %d is below "
+                        "its failed count %d"
+                        % (INPUT_JSONL, symbol_count, len(symbols)))
+    return frozenset(symbols)
+
+
 def read_last_observed_at(path):
     """The observed_at of the LAST committed record of a JSONL file,
     read from a bounded tail window (MARKET_EVENTS_TAIL_BYTES from the
@@ -1011,12 +1074,14 @@ def opening_market_top10(mode, confirmed, snapshots, ma20, day_counts=None,
     `day_counts`, `capture_failed` and `affirmed` carry the fold's
     coverage evidence (README §3.7 개장 모드 수집 상태): the per-symbol
     count of valid completed ka10081 days, the symbols whose
-    daily_capture_failed gap is recorded, and the symbols with an
-    affirming ka10081 rest_resp. Every state symbol lands in exactly
-    one bucket, by the contract's precedence: capture_failed (a gap
-    and no affirming response) → no_record (an affirming response with
-    zero valid completed days; a symbol with neither a gap nor a
-    response is the same recorded absence) → history_short (1-19) →
+    daily_capture_failed gap is recorded (the market-view call site
+    unions in the selected run's §12.10.2 preopen_seed.failed), and the
+    symbols with an affirming ka10081 rest_resp. Every state symbol
+    lands in exactly one bucket, by the contract's precedence:
+    capture_failed (failed evidence and no affirming response) →
+    no_record (an affirming response with zero valid completed days; a
+    symbol with neither failure evidence nor a response is the same
+    recorded absence) → history_short (1-19) →
     no_price (≥20 days, no price in the mapped snapshot) → flat (≥20
     days and 20·P == ΣC) → computable (the two lists' contents). The
     six counts partition candidate_count.
@@ -1832,7 +1897,7 @@ class Projector:
             eligible.append((name, environment, session_date,
                              run_id if isinstance(run_id, str) else None,
                              read_last_observed_at(events_path),
-                             config.get("events_contract")))
+                             config.get("events_contract"), config))
         if not eligible:
             return {"as_of": None, "coverage": None, "data_as_of": None,
                     "history": [], "input_snapshot": None, "latest": None,
@@ -1842,8 +1907,9 @@ class Projector:
                     "status": None}
         # Selection (README §3.7): max session_date, then max last
         # committed observed_at (None ranks last), then max dirname.
-        session, environment, session_date, run_id, _, events_contract = \
-            max(eligible, key=lambda run: (run[2], run[4] or "", run[0]))
+        session, environment, session_date, run_id, _, events_contract, \
+            config = max(eligible, key=lambda run: (run[2], run[4] or "",
+                                                    run[0]))
         run_dir = os.path.join(self.runs_root, session)
         # The §3.7 mode decision: as_of (the caller's moment) against
         # the window opened by the selected run's RECORDED calendar
@@ -1861,9 +1927,22 @@ class Projector:
                 and events_contract != MARKET_EVENTS_CONTRACT:
             raise DataFault("%s config events_contract is not %s"
                             % (INPUT_JSONL, MARKET_EVENTS_CONTRACT))
+        # The §12.10.2 preopen_seed block: an absent key is the legacy
+        # branch, a present block is validated strictly — a malformed
+        # seed never silently degrades to the unseeded coverage.
+        seed_failed = preopen_seed_failed(config, session_date)
         fact_path = events_contract == MARKET_EVENTS_CONTRACT
         state = self._market_projection_state(
             os.path.join(run_dir, INPUT_JSONL), session_date)
+        # §12.10.4: a failed seed symbol is capture_failed evidence, but
+        # a failed symbol that ALSO has an affirming ka10081 record is a
+        # recorded contradiction — the contract's REJECT, never a
+        # silent classification.
+        overlap = seed_failed & state.affirmed
+        if overlap:
+            raise DataFault("%s config preopen_seed failed symbol %s also "
+                            "has an affirming ka10081 record"
+                            % (INPUT_JSONL, min(overlap)))
         stock_names, snapshots, ma20 = \
             state.names, state.snapshots, state.ma20
         # The §3.7 input snapshot: {size, sha256} over exactly the
@@ -2095,7 +2174,8 @@ class Projector:
                 mode, confirmed, snapshots, ma20,
                 day_counts={symbol: entry[2]
                             for symbol, entry in state.bars.items()},
-                capture_failed=state.gaps, affirmed=state.affirmed)
+                capture_failed=state.gaps | seed_failed,
+                affirmed=state.affirmed)
         if mode == "opening_ma20":
             rising, falling = opening_rising, opening_falling
         else:
