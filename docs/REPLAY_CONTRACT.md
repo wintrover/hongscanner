@@ -51,9 +51,10 @@ Ignored by Core (four):
 `ws_conn` describes how a connection changed; `gap` describes which data is
 untrustworthy. They are recorded separately and only `gap` has authority.
 `daily_seed_manifest` is the P-run seal (§12.10.1): a P-run has no
-`ws_frame`/`session_end`, so Core ignores the manifest and never derives a
-P-run verdict from it. An S-run binds the seed through `config.preopen_seed`
-(§12.10.2), not through this record.
+`ws_frame`/`session_end`, so the record layer ignores the manifest; when
+`config.preopen_universe` is present, replay audits the last record's
+manifest against the stream it closes. An S-run binds the seed through
+`config.preopen_seed` (§12.10.2), not through this record.
 
 Until a live producer is measured, `rest_resp`, `sub` and `ws_raw` follow a
 **validated acceptance path**: each record parses against its declared
@@ -345,6 +346,15 @@ auditable:
 - Each attempt is recorded as a `rest_resp` record that carries the
   declared request scope and the page index, so replay can audit what was
   asked for and what came back.
+- The `rest_resp` envelope is shared by every declared API (`api_id`,
+  `page`, `query`, `status`, `cont_yn`, `next_key`, `body_hex`); the
+  declared `query` shape selects the API: ka10027's nine fields above,
+  ka10080's chart scope (§12.8), ka10081's daily scope (§12.9), and
+  ka10099's exactly `{"mrkt_tp": <non-empty string>}` (§12.10.1).
+  Unknown or missing query fields, a non-string value and an undeclared
+  `api_id` are REJECT. Success affirmation is one shared path (HTTP 200,
+  integer `return_code` 0, the list key present); ka10099 additionally
+  requires a non-empty string `code` in every row of a universe chain.
 
 ### 12.2 Byte evidence (recorder scope)
 
@@ -592,52 +602,96 @@ contract on the same `rest_resp` envelope as §12.1/§12.8:
 
 ### 12.10 Pre-open daily seed (target contract)
 
-**Status: target, Core side and S-run materialization implemented (P3).**
+**Status: target, Core side and S-run materialization implemented (P3 + P-run).**
 The 12th kind `daily_seed_manifest`, the optional `config.preopen_seed`
-parser and the `verifyAttempts` `declaredSymbols` audit exist
-(`src/hs/records.nim`, `src/hs/replay.nim`, `src/hs/rest_resp.nim`); the
-S-run reads a P-run seal with `--daily-seed` (`tools/collector/preopen.nim`,
-`src/hs/collector.nim`) and a stream without `config.preopen_seed` replays
+parser, the `verifyAttempts` `declaredSymbols` audit, and the P-run side —
+`config.preopen_universe` parsing, the ka10099 `rest_resp` schema and
+per-market chain audit, the derived universe, and the manifest audit —
+exist (`src/hs/records.nim`, `src/hs/replay.nim`, `src/hs/rest_resp.nim`,
+`src/hs/vendor_input.nim`); the S-run reads a P-run seal with
+`--daily-seed` (`tools/collector/preopen.nim`, `src/hs/collector.nim`).
+A stream without `config.preopen_seed`/`config.preopen_universe` replays
 exactly as before. The P-run capture producer is not implemented yet, so
-a real seeded stream remains unproduced and the P12 approval boundary is
-untouched.
+a real seeded or captured stream remains unproduced and the P12 approval
+boundary is untouched.
 
 **12.10.1 Pre-open capture run (P-run)**
 
 - A P-run has its own run directory (`run_id` e.g. `<session_date>-preopen`,
   a namespace distinct from session runs) and records `calendar` and
-  `config` first (§2 Rule 2).
-- `config.preopen_universe` declares the universe source:
-  `{"source":"ka10099","market_codes":[...],"page_cap":N}` or
-  `{"source":"explicit","symbols":[...]}`. Any other shape is rejected
-  (exit 2).
-- ka10099 takes **one market per request** (`mrkt_tp`); each market is its
-  own cont-yn/next-key page chain. The response body is `list[]` with rows
-  carrying `code` (the symbol field), `name`, `marketCode`, `marketName`,
-  `state`, `auditInfo`, `orderWarning`, `companyClassName`, `nxtEnable`
-  (official spec JSON, fetched 2026-11-20). The universe is the deduped
-  `code` sequence in (declared market order, page order, row order). Pages
-  are preserved as `rest_resp` (api_id `ka10099`), so the derivation
-  replays.
-  A chain closed at the declared cap while cont-yn=Y is a declared
-  truncated subset: `universe.truncated=true`, and the run never claims
-  "all symbols".
-- Each universe symbol gets exactly one ka10081 page (§12.9). A second page
-  or a repeat of the same symbol's scope is REJECT.
-- The last record is `daily_seed_manifest` (the 12th kind; ignored by
-  Core). Fields: `source_run_id`, `session_date`, `seed_sha256`,
-  `universe{source, market_codes, symbol_count, universe_sha256,
-  truncated}`, `captured_count`, `capture_failed_count`,
-  `history_short_count`, `capture_window{started_at, ended_at}`,
-  `binary_sha256`, `config_sha256`.
-- `seed_sha256` is sha256 over the P-run's ka10081 `raw` canonical lines in
-  order (`seq` excluded — a record never hashes its own file).
-  `symbol_count == captured_count + capture_failed_count` and
-  `history_short_count <= captured_count`.
-- `capture_window.ended_at` must be strictly before the calendar day's
-  `open` (a comparison of two recorded values, never a clock input).
-- A P-run has no `ws_frame`/`session_end`; its `verify` is INCOMPLETE
-  (exit 4) and is not the seed's authority. The manifest plus 12.10.5 is.
+  `config` first (§2 Rule 2). The presence of `config.preopen_universe`
+  makes the stream a P-run.
+- `config.preopen_universe` declares the universe source. Exactly two
+  shapes are admitted, every field required, nothing extra, and it is
+  mutually exclusive with `config.preopen_seed` (both present = REJECT):
+  - `{"source":"ka10099","market_codes":[...],"page_cap":N}`:
+    `market_codes` is a non-empty array of unique non-empty strings in
+    declared market order; `page_cap` is an integer >= 1. The market
+    vocabulary is the config/collector's declaration — Core requires only
+    non-empty strings and pins no vendor enum value.
+  - `{"source":"explicit","symbols":[...]}`: a non-empty array of
+    non-empty strings; duplicates are deduped at first appearance.
+- ka10099 takes **one market per request** (`mrkt_tp`) and is preserved as
+  `rest_resp` (api_id `ka10099`) so the derivation replays. The record
+  `query` is exactly `{"mrkt_tp": <non-empty string>}`; the shared
+  envelope fields (`page`, `status`, `cont_yn`, `next_key`, `body_hex`)
+  are unchanged (§12.1). Request: `POST /api/dostk/stkinfo`. Response body:
+  `return_code`, `return_msg`, `list[]` with rows carrying the 14
+  documented string fields (`code name listCount auditInfo regDay
+  lastPrice state marketCode marketName upName upSizeName orderWarning
+  companyClassName nxtEnable`; official spec JSON, fetched 2026-11-20).
+  Success is the shared affirmation (HTTP 200, integer `return_code` 0,
+  `list` present) plus a non-empty string `code` in every row. A
+  numeric-string `return_code` is not success — the shared rule is integer
+  0 only.
+- Each market is its own cont-yn/next-key page chain, audited like the
+  other paginated TRs: pages 1..N contiguous, one chain per market, no
+  restart or duplicate (even under a declared re-poll cadence),
+  below-cap `cont_yn=Y` is REJECT. A chain closed at the declared
+  `page_cap` while `cont_yn=Y` is a declared truncated subset:
+  `universe.truncated=true`, and the run never claims "all symbols".
+  Every declared market must have its chain; an undeclared market record
+  is REJECT.
+- Universe: `explicit` = the declared symbols deduped in order; `ka10099`
+  = declared market order -> page order -> row order, taking each row's
+  `code`, deduped at first appearance. An empty derived universe is
+  REJECT. Each universe symbol gets exactly one ka10081 page (§12.9); a
+  second page, a repeat of the same symbol's scope, or a ka10081 `stk_cd`
+  outside the universe is REJECT (§12.10.5).
+- The last record is exactly one `daily_seed_manifest` (the 12th kind). A
+  P-run has no `ws_frame` and no `session_end`; a missing, duplicate or
+  non-last manifest is REJECT. Its exact shape is `source_run_id`,
+  `session_date`, `seed_sha256`, `universe{source, market_codes,
+  symbol_count, universe_sha256, truncated}`, `captured_count`,
+  `capture_failed_count`, `history_short_count`,
+  `capture_window{started_at, ended_at}`, `binary_sha256`,
+  `config_sha256` — nothing missing, nothing extra.
+- Manifest obligations, every violation REJECT:
+  - `source_run_id` is non-empty; `session_date` equals
+    `config.session_date`.
+  - `universe.source` equals the config source; `market_codes` equals the
+    declared market order (empty for `explicit`); `symbol_count` equals
+    the derived universe size; `truncated` equals the derived truncation
+    fact.
+  - `universe_sha256` = sha256 over each deduped symbol in universe order,
+    each followed by LF.
+  - `seed_sha256` = sha256 over each ka10081 `rest_resp` `raw`'s canonical
+    serialization followed by LF, in stream order (`seq` excluded — a
+    record never hashes its own file).
+  - `captured_count` equals the ka10081 record count. The failed set is
+    re-derived from the `daily_capture_failed` gap records (§12.9): each
+    must carry its symbol, with no duplicate; `capture_failed_count`
+    equals its size; `symbol_count == captured_count +
+    capture_failed_count`; `history_short_count <= captured_count`.
+  - Captured and failed are duplicate-free, disjoint, subsets of the
+    universe, and their union equals it.
+  - `capture_window.started_at`/`ended_at` are
+    `YYYY-MM-DDTHH:MM:SS+09:00` values on the session date with
+    `started_at <= ended_at`; `ended_at` is strictly before the calendar
+    day's `open` (a comparison of recorded values, never a clock input).
+  - `binary_sha256`/`config_sha256` are 64 lowercase hex digits.
+- A P-run's `verify` is INCOMPLETE (exit 4) and is not the seed's
+  authority. The manifest plus 12.10.5 is.
 
 **12.10.2 Seed entry into the session stream (S-run)**
 
@@ -705,7 +759,7 @@ untouched.
   derived by replay from the verified ka10027 chains (§12.9
   `dailyUniverseOf` rule). Outside is REJECT.
 - `verifyAttempts` gains a `declaredSymbols` parameter
-  (`src/hs/rest_resp.nim:379-381`; call `src/hs/replay.nim:364-367`).
+  (`src/hs/rest_resp.nim`; called from `runCore` in `src/hs/replay.nim`).
   Without a declaration (legacy) behavior is unchanged.
 
 **12.10.6 Acceptance**
@@ -729,12 +783,13 @@ untouched.
   CHECKSUMS; the unseeded stream differs only in events (12.10.3) and each
   stream matches its own replay.
 
-**UNKNOWN (kept explicit).** ka10099's response shape and `mrkt_tp` market
-vocabulary are unmeasured in this repository; the value is fixed on
-approval. ka10081's 600 rows are our measurement, not a vendor guarantee.
-The real-domain rate limit is UNKNOWN (the mock measured ≈1/s). The
-`capture_window` times are recorded declarations, not independently proven
-wall-clock facts.
+**UNKNOWN (kept explicit).** ka10099's response shape is taken from the
+official spec JSON (fetched 2026-11-20) but is unmeasured in this
+repository, and its `mrkt_tp` market vocabulary is a config/collector
+declaration fixed on approval. ka10081's 600 rows are our measurement, not
+a vendor guarantee. The real-domain rate limit is UNKNOWN (the mock
+measured ≈1/s). The `capture_window` times are recorded declarations, not
+independently proven wall-clock facts.
 
 ## 13. Events (VS-3 contract)
 

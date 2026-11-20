@@ -2,8 +2,9 @@
 ## Contract: plan §3.0 (kinds) and §3.1 (one counter, gauge semantics).
 ## VS-2 adds two consumed subscription-evidence kinds (sub, ws_raw,
 ## schemas in sub_input.nim). The 12th kind is the P-run seal
-## (daily_seed_manifest, REPLAY_CONTRACT §12.10): Core accepts and ignores
-## it, like the diagnostic kinds.
+## (daily_seed_manifest, REPLAY_CONTRACT §12.10): the record layer ignores
+## it like the diagnostic kinds; replay audits it when
+## config.preopen_universe declares a P-run.
 import std/strutils
 import hcj
 

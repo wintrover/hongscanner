@@ -28,6 +28,7 @@ run nim c -r --hints:off --warnings:off --path:src tests/test_bars_contract.nim
 run nim c -r --hints:off --warnings:off --path:src tests/test_rest_failure_contract.nim
 run nim c -r --hints:off --warnings:off --path:src tests/test_rest_resp_contract.nim
 run nim c -r --hints:off --warnings:off --path:src tests/test_preopen_seed_contract.nim
+run nim c -r --hints:off --warnings:off --path:src tests/test_preopen_capture_contract.nim
 run nim c -r --hints:off --warnings:off --path:src tests/test_preopen_inject_contract.nim
 run nim c -r --hints:off --warnings:off --path:src tests/test_backfill_contract.nim
 run nim c -r --hints:off --warnings:off --path:src tests/test_sub_input_contract.nim
