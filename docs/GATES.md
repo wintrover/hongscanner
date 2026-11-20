@@ -1297,3 +1297,41 @@ sha256 2e0afb582eed77c5279ed941b70c0f3f97ee48d126e6912cc51751525f7382b3
 - 오늘(11/19) 런의 `no_record 2426`은 버그가 아니라 레거시 스코프의 정직한 표시다. accumulate-v2의 첫 실전 적용은 **11/20 08:50 세션**이며, 그 런의 coverage에서 `no_record`가 실제 수집 결과로 대체되는지가 수용 판정이다.
 - real 키움 유량은 여전히 UNKNOWN(문서값 5/s, mock 1/s 실측). 2,400종목 mock 스윕 ≈60분으로 30분 창 완료를 주장하지 않는다.
 - watchdog 15:40과 달력 close(11/19 16:30) 불일치는 이번 슬라이스에서 변경하지 않았다 — "관측한 후보 전체"만 보장한다.
+
+### Evidence log (2026-11-20) — 랭킹 공백 사고와 page cap 40
+
+**사고**: 11/20 09:00 세션에서 오전 내내 랭킹·알림이 0건. 하락 체인이 page 10(2,000행)에서도 `cont-yn=Y`였고, REPLAY_CONTRACT §12.1대로 cap-closed 라운드는 이벤트 계층이 판정하지 않는다 — 모든 poll 라운드가 절단 부분집합이 되어 후보 세대가 하나도 생성되지 않았다.
+
+| 관측 | 값 |
+|---|---|
+| 이벤트 원장(09:32) | `CANDIDATE_ENTERED` 64(09:00:01 단일 그룹), `CANDIDATE_UPDATED` **0**, `CANDIDATE_EXITED` 0, `REST_TRUNCATED` 6, 마지막 이벤트 09:30:19 |
+| 입력 gap | `rest_truncated` 6, `daily_universe_waiting` 200, `cross_duplicate` 1, `daily_history_short` 1 |
+| API | `coverage=null`, `rising_top10=[]`, `falling_top10=[]` (mode `opening_ma20`) |
+| 체인 길이 비교 | 11/19 down 최대 9페이지(완료) vs 11/20 down 10페이지에서 `cont-yn=Y` |
+
+**수정**: 계약 의미는 그대로 두고 scanner-side 선언(§12.1)을 바로잡았다. collector `--page-cap`(1..200, 기본 10) 추가, 실전 세션은 40(8,000행) 선언. cap을 넘는 목록은 계속 절단·미판정(fail-closed).
+
+| gate | observed |
+|---|---|
+| P3 | 로컬 `bash tools/run_tests.sh` exit 0 + `ALL CONTRACT SUITES PASSED` 1회. PR [#144](https://github.com/wintrover/hongscanner/pull/144) ci 런 [44645355069](https://github.com/wintrover/hongscanner/actions/runs/44645355069) success, 로그 마커 **1**(실측). merge `faf350fdca644fc1971fe2e114a59e320761d221` |
+| 서버 체크아웃 | `03f1950c → faf350f` ff-only, dirty 0 |
+| 런처 | `--page-cap=40` + `HS_OUT_DIR` 오버라이드 추가(백업 `.bak-20261120`, pre sha `0ef19c29…`, post `94c89bf3…`, `bash -n` OK) |
+
+### Evidence log (2026-11-20) — accumulate-v2 수용 판정 (r3, a82c4f3)
+
+**전제 불일치**: 이 수용 프롬프트는 서버 체크아웃 `03f1950c` 고정을 전제했지만, 15:42 전환 지시로 체크아웃·current는 `a82c4f3`으로 이동했다(15:42 크론 실행). 08:50에 시작한 `session-2026-11-20`은 09:39 `exit=143`으로 중단돼 커밋 마커가 없고(`verify` → `VERDICT REJECT contract`, seq 694 `ws_raw` FID 10, exit 2), 완주한 런은 `session-2026-11-20r3`(10:44–15:30, f4ef10b 생성)다. 판정은 r3 원장에 대해 수행했다.
+
+| gate | observed |
+|---|---|
+| 실행 신원 | 서버 HEAD `a82c4f3`(clean), `current → versions/a82c4f3`; r3 config `daily_scope=accumulate-v2`, `page_cap=40`, `watchdog=15:40:00+09:00` |
+| C==Q | ka10027 rest_resp 812건의 `stk_cd` 합집합 C=2,659; ka10081 `query.stk_cd` ∪ `daily_capture_failed` Q=2,659; C−Q=0, Q−C=0; `daily_capture_failed` 0; `daily_universe_unfinished` 0건 |
+| coverage (as_of 09:10) | `mode=opening_ma20`, candidate 2,516 = computable 2,506 + flat 1 + history_short 8 + no_record 1 + no_price 0 + capture_failed 0 (합 2,516); `status=COMPLETE`; `input_snapshot.sha256=0e3d32ea…`, size 2,531,536,135 |
+| 신규 종목 | 초기 페어 399종목 밖에서 유효 완료 일봉 ≥20을 확보한 종목 2,245개가 최종 이벤트 상태에 존재(예: `000020` 599일, `000150` 599일, 둘 다 15:24:02 `CANDIDATE_UPDATED` DOWN). 전체 flat이 1건뿐이므로 이들이 computable 2,506에 반영됐다 |
+| 결정론 | 동일 `as_of` 2회 호출 byte-identical(sha256 `24c4efce…`), `input_snapshot` 동일 |
+| verify | `session-2026-11-20`: `VERDICT REJECT contract` exit 2; `session-2026-11-20r3`: `VERDICT INVALID` — `LATE_TICK_INTO_CLOSED_BAR symbol=271160 bar=34 closed=34`, exit 5 |
+
+**판정**: coverage·C==Q·신규 종목·결정론은 통과. replay 검증은 불통과(08:50 런 중단, r3는 늦은 틱으로 M4 위반) — 이 런을 "검증된 수용"으로 승격하지 않는다.
+
+**후속**: (1) `LATE_TICK_INTO_CLOSED_BAR` 원인·수정. (2) preopen 타이머는 실측 유니버스 4,332종목 × 1.5s ≈ 112분과 30분 타임아웃/07:00 시작이 모순 — 설치 유닛을 06:00·150min으로 핫픽스(리포 파일은 07:00/30min, PR 동기화 필요). (3) `no_record` 1/2,516 — 11/19 레거시 스코프의 2,426/2,433 표시와 대비해 accumulate-v2에서 실제 수집으로 대체됨.
+
+**남은 한계**: real 키움 유량은 UNKNOWN(mock 1.5s에서 429 0건은 real 증거가 아니다). 30분 창 완료를 주장하지 않는다. watchdog 15:40과 달력 close 불일치는 이번 슬라이스에서 변경하지 않아 "전체 거래 세션" 보장이 아니다 — 관측한 후보 전체만 보장한다.
