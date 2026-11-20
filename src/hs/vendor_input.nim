@@ -310,6 +310,14 @@ const
 
   defaultPageCap* = 10   ## MAX_PAGES of the official ka10027 example
 
+  ## config.daily_scope vocabulary (REPLAY_CONTRACT §12.9): the collector
+  ## records it; Core reads it only to derive the pre-open sweep universe
+  ## (§12.10.5). Absent/"" is the legacy scope (byte-identical streams);
+  ## the explicit legacy name and the FIFO accumulate-v2 scope are the
+  ## only other declared values.
+  dailyScopeLegacy* = "single-page-initial-pair"
+  dailyScopeAccumulate* = "accumulate-v2"
+
   ## The explicit subset of TRs this module declares paginated: repeat and
   ## the page cap apply to these only, never to vendor input as a whole.
   paginatedTrs* = ["ka10027", "ka10080"]
@@ -809,6 +817,20 @@ proc chainSymbols*(spec: TrSpec; chain: PageChain;
   ## consumes a cap-closed chain as a declared truncated subset.
   for r in chainRows(spec, chain, pageCap, truncatedOk):
     result.add(r.code)
+
+proc interleaveUniverse*(upCodes, downCodes: seq[string]): seq[string] =
+  ## The §12.9 daily-sweep universe of one up/down pair: the union of the
+  ## legs' row stk_cds, interleaved by vendor appearance order (up #1,
+  ## down #1, up #2, ...) and deduped at first appearance. One definition,
+  ## shared by the collector's initial-pair seed (dailyUniverseOf) and
+  ## replay's verified-chain derivation (REPLAY_CONTRACT §12.10.5).
+  var i = 0
+  while i < upCodes.len or i < downCodes.len:
+    if i < upCodes.len and upCodes[i] notin result:
+      result.add(upCodes[i])
+    if i < downCodes.len and downCodes[i] notin result:
+      result.add(downCodes[i])
+    inc i
 
 proc isCandidateCode*(cd: string): bool =
   ## The candidate universe's code shape: exactly 6 digits. The official

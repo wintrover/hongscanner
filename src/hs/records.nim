@@ -1,14 +1,16 @@
 ## Record envelope, kind classification and the single-seq contract.
 ## Contract: plan §3.0 (kinds) and §3.1 (one counter, gauge semantics).
 ## VS-2 adds two consumed subscription-evidence kinds (sub, ws_raw,
-## schemas in sub_input.nim); the ignored set is unchanged.
+## schemas in sub_input.nim). The 12th kind is the P-run seal
+## (daily_seed_manifest, REPLAY_CONTRACT §12.10): Core accepts and ignores
+## it, like the diagnostic kinds.
 import std/strutils
 import hcj
 
 type
   Kind* = enum
     kCalendar, kConfig, kWsFrame, kRestResp, kGap, kSessionEnd, kSub, kWsRaw,
-    kOutFrame, kWsConn, kPong
+    kOutFrame, kWsConn, kPong, kDailySeedManifest
 
   Record* = object
     seq*: int
@@ -20,7 +22,7 @@ type
 const
   consumedKinds* = {kCalendar, kConfig, kWsFrame, kRestResp, kGap, kSessionEnd,
                     kSub, kWsRaw}
-  ignoredKinds* = {kOutFrame, kWsConn, kPong}
+  ignoredKinds* = {kOutFrame, kWsConn, kPong, kDailySeedManifest}
 
 proc rerr(msg: string): ref RecordError = newException(RecordError, msg)
 
@@ -37,6 +39,7 @@ proc kindName*(k: Kind): string =
   of kOutFrame: "out_frame"
   of kWsConn: "ws_conn"
   of kPong: "pong"
+  of kDailySeedManifest: "daily_seed_manifest"
 
 proc parseKind*(s: string): Kind =
   case s
@@ -51,6 +54,7 @@ proc parseKind*(s: string): Kind =
   of "out_frame": kOutFrame
   of "ws_conn": kWsConn
   of "pong": kPong
+  of "daily_seed_manifest": kDailySeedManifest
   else: raise rerr("unknown kind: " & s)
 
 proc makeRecordLine*(seqNo: int; kind: Kind; raw: HcjValue): string =
