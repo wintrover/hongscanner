@@ -602,7 +602,8 @@ contract on the same `rest_resp` envelope as §12.1/§12.8:
 
 ### 12.10 Pre-open daily seed (target contract)
 
-**Status: target, Core side and S-run materialization implemented (P3 + P-run).**
+**Status: target, Core side, P-run producer and S-run materialization
+implemented (P3 + P-run + P3c).**
 The 12th kind `daily_seed_manifest`, the optional `config.preopen_seed`
 parser, the `verifyAttempts` `declaredSymbols` audit, and the P-run side —
 `config.preopen_universe` parsing, the ka10099 `rest_resp` schema and
@@ -610,10 +611,13 @@ per-market chain audit, the derived universe, and the manifest audit —
 exist (`src/hs/records.nim`, `src/hs/replay.nim`, `src/hs/rest_resp.nim`,
 `src/hs/vendor_input.nim`); the S-run reads a P-run seal with
 `--daily-seed` (`tools/collector/preopen.nim`, `src/hs/collector.nim`).
-A stream without `config.preopen_seed`/`config.preopen_universe` replays
-exactly as before. The P-run capture producer is not implemented yet, so
-a real seeded or captured stream remains unproduced and the P12 approval
-boundary is untouched.
+The producer is the collector binary's `--preopen` mode
+(`tools/collector/preopen_capture.nim`, launcher `tools/run_preopen.sh`,
+systemd timer `tools/systemd/hongscanner-preopen.timer`); it derives and
+re-audits the universe with the same Core helpers before appending the
+seal. A stream without `config.preopen_seed`/`config.preopen_universe`
+replays exactly as before. A real captured-and-seeded operational stream
+has not been measured yet, so the P12 approval boundary is untouched.
 
 **12.10.1 Pre-open capture run (P-run)**
 

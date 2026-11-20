@@ -28,16 +28,8 @@ type
     seed*: PreopenSeedDecl
     blockRaws*: seq[HcjValue]
 
-  ListPage = object
-    mrktTp: string
-    page: int
-    contYn: string
-    codes: seq[string]
-
 const
   pRunInputFile = "input.hcj.jsonl"
-  ka10099ApiId = "ka10099"
-  ka10099ListKey = "list"
   manifestFields = [
     "binary_sha256", "capture_failed_count", "capture_window",
     "captured_count", "config_sha256", "history_short_count",
@@ -134,82 +126,26 @@ proc hasExactKeys(obj: HcjValue; keys: openArray[string]; what: string) =
     if not obj.has(k):
       raise sde(what & " is missing field: " & k)
 
-proc parseListPage(r: Record; markets: seq[string]): ListPage =
-  ## One preserved ka10099 page: the P-run's own record shape, parsed at
-  ## this adapter boundary because Core's rest_resp acceptance path does
-  ## not declare ka10099 (§12.10.1 keeps the pages as rest_resp evidence
-  ## so the derivation replays).
-  let raw = r.raw
-  let where = "P-run ka10099 rest_resp at seq " & $r.seq
-  if raw.kind != hkObj:
-    raise sde(where & " is not an object")
-  let api = strOf(raw, "api_id", where)
-  if api != ka10099ApiId:
-    raise sde(where & " api_id is not " & ka10099ApiId & ": " & api)
-  result.page = intOf(raw, "page", where)
-  if result.page < 1:
-    raise sde(where & " page index must be >= 1: " & $result.page)
-  result.contYn = strOf(raw, "cont_yn", where)
-  if result.contYn notin ["", "Y", "N"]:
-    raise sde(where & " cont_yn is not Y|N|\"\": " & result.contYn)
-  discard strOf(raw, "next_key", where)
-  let status = intOf(raw, "status", where)
-  if status != 200:
-    raise sde(where & " is not an HTTP 200 page: " & $status)
-  let q = objOf(raw, "query", where)
-  result.mrktTp = strOf(q, "mrkt_tp", where & ".query")
-  if result.mrktTp notin markets:
-    raise sde(where & " names market " & result.mrktTp &
-              " outside the declared market_codes")
-  var body: seq[byte]
-  try:
-    body = bytesFromHex(strOf(raw, "body_hex", where))
-  except RestRespError as e:
-    raise sde(where & " body_hex is rejected: " & e.msg)
-  var doc: HcjValue
-  try:
-    doc = parseDoc(bytesText(body))
-  except HcjError as e:
-    raise sde(where & " body is not valid HCJ JSON: " & e.msg)
-  if doc.kind != hkObj:
-    raise sde(where & " body is not a JSON object: " & kindName(doc))
-  let rc = doc.getOpt("return_code")
-  if rc.isNone or rc.get.kind != hkInt:
-    raise sde(where & " body has no integer return_code")
-  if rc.get.ival != 0:
-    raise sde(where & " body does not affirm success: return_code " &
-              $rc.get.ival)
-  let lst = doc.getOpt(ka10099ListKey)
-  if lst.isNone or lst.get.kind != hkArr:
-    raise sde(where & " body has no " & ka10099ListKey & " array")
-  for item in lst.get.items:
-    if item.kind != hkObj:
-      raise sde(where & " " & ka10099ListKey & " row is not an object: " &
-                kindName(item))
-    let code = strOf(item, "code", where & " " & ka10099ListKey & " row")
-    if code.len == 0:
-      raise sde(where & " " & ka10099ListKey & " row carries an empty code")
-    result.codes.add(code)
-
-proc deriveKa10099(pages: seq[ListPage]; markets: seq[string];
+proc deriveKa10099(pages: seq[RestRespAttempt]; markets: seq[string];
                    pageCap: int; truncated: var bool): seq[string] =
   ## The declared universe is the deduped `code` sequence in (declared
-  ## market order, page order, row order) (§12.10.1). Each market is its
-  ## own cont-yn/next-key chain: pages run 1..N, a chain ends on N/"" or
-  ## closes at the declared cap while cont-yn=Y (a declared truncated
-  ## subset); a missing continuation below the cap and a page behind a
-  ## terminal page are both refused.
+  ## market order, page order, row order) (§12.10.1). The chain structure
+  ## (1..N order, terminal page, cap closure) is checked here with this
+  ## adapter's messages; each page's success affirmation and row schema
+  ## come from Core's `ka10099ChainSymbols` — the same path replay/verify
+  ## use — so a row means one thing on both sides of the seed.
   if markets.len == 0:
     raise sde("ka10099 universe declares no market_codes")
-  var byMarket = newSeq[seq[ListPage]](markets.len)
+  var byMarket = newSeq[seq[RestRespAttempt]](markets.len)
   for p in pages:
     var idx = -1
     for i, m in markets:
-      if m == p.mrktTp:
+      if m == p.scope99.mrktTp:
         idx = i
         break
     if idx < 0:
-      raise sde("ka10099 page names an undeclared market: " & p.mrktTp)
+      raise sde("ka10099 page names an undeclared market: " &
+                p.scope99.mrktTp)
     byMarket[idx].add(p)
   var seen = initHashSet[string]()
   for i, m in markets:
@@ -223,20 +159,29 @@ proc deriveKa10099(pages: seq[ListPage]; markets: seq[string];
       if p.page != j + 1:
         raise sde("ka10099 market " & m & " page index " & $p.page &
                   " leaves a gap (expected " & $(j + 1) & ")")
-      if j + 1 < chain.len and p.contYn != "Y":
+      if j + 1 < chain.len and p.resp.contYn != "Y":
         raise sde("ka10099 market " & m & " continues past a page whose " &
                   "cont_yn is not Y (page " & $p.page & ")")
-      for code in p.codes:
-        if code notin seen:
-          seen.incl(code)
-          result.add(code)
-    let last = chain[^1]
-    if last.contYn == "Y":
+    var chainTruncated = false
+    if chain[^1].resp.contYn == "Y":
       if chain.len < pageCap:
         raise sde("ka10099 market " & m & " has cont-yn=Y at page " &
                   $chain.len & " below the declared page_cap " & $pageCap &
                   ": a declared continuation is missing")
+      chainTruncated = true
       truncated = true
+    var resps: seq[RawHttpResp]
+    for p in chain:
+      resps.add(p.resp)
+    var codes: seq[string]
+    try:
+      codes = ka10099ChainSymbols(resps, pageCap, chainTruncated)
+    except VendorInputError as e:
+      raise sde("ka10099 market " & m & " chain is rejected: " & e.msg)
+    for code in codes:
+      if code notin seen:
+        seen.incl(code)
+        result.add(code)
 
 proc manifestFailed(manifest: HcjValue): seq[string] =
   ## Optional producer extension: an explicit failed-symbol list. When
@@ -343,37 +288,32 @@ proc loadDailySeed*(pRunDir, sessionDate: string): DailySeed =
 
   var blockRaws: seq[HcjValue]
   var captured: seq[string]
-  var listPages: seq[ListPage]
+  var listAttempts: seq[RestRespAttempt]
   for i in 2 ..< recs.len - 1:
     let r = recs[i]
     if r.kind != kRestResp:
       continue
-    if r.raw.kind != hkObj:
-      raise sde("P-run rest_resp at seq " & $r.seq & " is not an object")
-    let api = strOf(r.raw, "api_id", "P-run rest_resp at seq " & $r.seq)
-    case api
-    of ka10081ApiId:
-      var a: RestRespAttempt
+    var attempt: RestRespAttempt
+    try:
+      attempt = parseAttempt(r.seq, r.raw)
+    except RestRespError as e:
+      raise sde("P-run rest_resp at seq " & $r.seq &
+                " is not a declared P-run record: " & e.msg)
+    case attempt.api
+    of raKa10081:
       try:
-        a = parseAttempt(r.seq, r.raw)
-      except RestRespError as e:
-        raise sde("P-run ka10081 record at seq " & $r.seq &
-                  " is not a declared capture: " & e.msg)
-      if a.api != raKa10081:
-        raise sde("P-run rest_resp at seq " & $r.seq & " did not parse as " &
-                  "ka10081")
-      try:
-        discard parsePageRows(ka10081Spec, a.resp)
+        discard parsePageRows(ka10081Spec, attempt.resp)
       except VendorInputError as e:
         raise sde("P-run ka10081 record at seq " & $r.seq &
                   " does not affirm success: " & e.msg)
-      captured.add(a.scope81.stkCd)
+      captured.add(attempt.scope81.stkCd)
       blockRaws.add(r.raw)
-    of ka10099ApiId:
-      listPages.add(parseListPage(r, marketCodes))
+    of raKa10099:
+      listAttempts.add(attempt)
     else:
       raise sde("P-run rest_resp at seq " & $r.seq & " declares api_id " &
-                api & "; a P-run carries only ka10099 universe pages and " &
+                strOf(r.raw, "api_id", "P-run rest_resp at seq " & $r.seq) &
+                "; a P-run carries only ka10099 universe pages and " &
                 "ka10081 captures")
 
   if capturedCount != blockRaws.len:
@@ -403,6 +343,11 @@ proc loadDailySeed*(pRunDir, sessionDate: string): DailySeed =
   of "explicit":
     hasExactKeys(uniCfg, ["source", "symbols"],
                  "P-run config.preopen_universe")
+    for a in listAttempts:
+      raise sde("P-run ka10099 rest_resp at seq " & $a.seqNo &
+                " is outside the explicit preopen_universe: an explicit " &
+                "universe declares its symbols and has no market-list " &
+                "source")
     var seen = initHashSet[string]()
     for sym in strItems(arrOf(uniCfg, "symbols",
                               "P-run config.preopen_universe"),
@@ -425,7 +370,7 @@ proc loadDailySeed*(pRunDir, sessionDate: string): DailySeed =
                         "P-run config.preopen_universe")
     if pageCap < 1:
       raise sde("P-run config.preopen_universe.page_cap must be >= 1")
-    derivedUniverse = deriveKa10099(listPages, cfgMarkets, pageCap,
+    derivedUniverse = deriveKa10099(listAttempts, cfgMarkets, pageCap,
                                     derivedTruncated)
   else:
     raise sde("unreachable universe source: " & source)

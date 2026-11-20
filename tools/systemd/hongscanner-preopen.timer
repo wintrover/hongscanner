@@ -1,0 +1,20 @@
+## Pre-open capture timer: Mon..Fri 07:00 Asia/Seoul, before the KRX open.
+## Persistent=false: a missed morning is not replayed later — a P-run that
+## starts after the open would fail closed anyway (the capture window must
+## end before the calendar open), and the S-run's missing seed is the
+## honest evidence of the miss. AccuracySec=1s keeps the start time real.
+##
+## The OnCalendar timezone suffix pins the wall clock to the exchange's
+## clock even if the host timezone changes; 07:00 leaves ~2 hours before
+## the regular 09:00 open for the universe + daily sweep.
+[Unit]
+Description=Hong Scanner Pre-open Daily Seed Capture Timer
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 07:00:00 Asia/Seoul
+Persistent=false
+AccuracySec=1s
+Unit=hongscanner-preopen.service
+
+[Install]
+WantedBy=timers.target

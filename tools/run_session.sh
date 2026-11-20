@@ -104,6 +104,28 @@ LOG_DIR="$(dirname "$OUT_ABS")"
 LAUNCHER_LOG="$LOG_DIR/$SESSION.launcher.log"
 UNIT="hsnotify-$SESSION"
 
+# Pre-open daily seed auto-discovery (REPLAY_CONTRACT §12.10.2): a P-run
+# captured earlier on the same trading day sits beside this session's run
+# dir as runs/<session_date>-preopen/. When its committed input exists and
+# the caller did not name a seed explicitly, the session starts from that
+# seed (the collector validates the whole P-run and refuses to start on any
+# deviation). No P-run -> the legacy args pass through byte-identical.
+COLLECTOR_ARGS=()
+PREOPEN_SEED_DIR="$LOG_DIR/$SESSION_DATE-preopen"
+PREOPEN_SEED_USED=0
+if [ -n "$SESSION_DATE" ] && [ -f "$PREOPEN_SEED_DIR/input.hcj.jsonl" ]; then
+  PREOPEN_SEED_USED=1
+  for arg in "$@"; do
+    case "$arg" in
+      --daily-seed=*) PREOPEN_SEED_USED=2 ;;
+    esac
+  done
+  if [ "$PREOPEN_SEED_USED" = "1" ]; then
+    COLLECTOR_ARGS+=("--daily-seed=$PREOPEN_SEED_DIR")
+  fi
+fi
+COLLECTOR_ARGS+=("$@")
+
 # ----------------------------------------------------------- prerequisites
 NOTIFY_CONFIG="${HSNOTIFY_CONFIG:-$HOME/.local/share/hongscanner/notify/notify_config.json}"
 COLLECTOR="${HSCOLLECTOR_BIN:-$REPO/tools/collector/collector}"
@@ -428,13 +450,18 @@ fi
   echo "RUN_PROVENANCE run_id=$SESSION session_date=${SESSION_DATE:-unknown}" \
     "git_commit=$GIT_COMMIT launcher_sha256=$LAUNCHER_SHA256" \
     "git_dirty=$GIT_DIRTY started_at=${STARTED_AT:-unknown}"
+  if [ "$PREOPEN_SEED_USED" = "1" ]; then
+    echo "PREOPEN_SEED dir=$PREOPEN_SEED_DIR source=auto"
+  elif [ "$PREOPEN_SEED_USED" = "2" ]; then
+    echo "PREOPEN_SEED dir=<caller> source=arg"
+  fi
 } >>"$LAUNCHER_LOG"
 
 # Collector FIRST, worker SECOND: the worker's --run-dir must exist before
 # its systemd start job can succeed (wait_for_run_dir explains why the
 # wait cannot lose events). The watchdog starts after the worker is up so
 # its subshell inherits the final WORKER_MODE.
-"$COLLECTOR" "$@" >>"$LAUNCHER_LOG" 2>&1 &
+"$COLLECTOR" "${COLLECTOR_ARGS[@]}" >>"$LAUNCHER_LOG" 2>&1 &
 COLLECTOR_PID=$!
 trap 'kill -TERM "$COLLECTOR_PID" 2>/dev/null || true' INT TERM
 
