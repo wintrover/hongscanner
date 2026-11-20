@@ -3552,6 +3552,25 @@ class MarketFoldSuite(unittest.TestCase):
         _, _, ma20 = serve.fold_market_projection(path, "2026-11-10")
         self.assertEqual(ma20, {"005930": 20000})
 
+    def test_fold_ka10081_pre_open_starts_at_completed_day(self):
+        # eligibility is by dt, not row index: a pre-open response may
+        # carry no session-date row at all, so row 0 is the latest
+        # completed day and all twenty rows count toward the sum
+        closes = [70000 + i for i in range(20)]
+        rows = [ka10081_row(dt, close)
+                for dt, close in zip(om_dts(20), closes)]
+        record = rest_resp_record(
+            2, {"return_code": 0, "return_msg": "정상처리 되었습니다.",
+                "stk_dt_pole_chart_qry": rows},
+            api_id="ka10081",
+            query={"base_dt": "", "stk_cd": "005930", "tick_kind": "2"})
+        path = self.write_input(record)
+        _, _, ma20 = serve.fold_market_projection(path, "2026-11-10")
+        self.assertEqual(ma20, {"005930": sum(closes)})
+        state = serve._fold_market_projection_inc(path, "2026-11-10")
+        self.assertEqual(state.bars["005930"],
+                         [set(om_dts(20)), sum(closes), 20])
+
     def test_fold_ka10081_violation_is_data_fault(self):
         for label, row, query in (
                 ("dt not YYYYMMDD",

@@ -586,6 +586,131 @@ contract on the same `rest_resp` envelope as §12.1/§12.8:
   the `stk_cd` echo of the measured shape are preserved verbatim in
   `body_hex` (§12.2 rules apply unchanged).
 
+### 12.10 Pre-open daily seed (target contract)
+
+**Status: target.** No producer, record kind or audit parameter exists yet.
+This section fixes the intended semantics so the implementation (P3) can be
+written against it; until the 12th kind exists, a stream carrying it is
+rejected by §3 and nothing here changes today's replay.
+
+**12.10.1 Pre-open capture run (P-run)**
+
+- A P-run has its own run directory (`run_id` e.g. `<session_date>-preopen`,
+  a namespace distinct from session runs) and records `calendar` and
+  `config` first (§2 Rule 2).
+- `config.preopen_universe` declares the universe source:
+  `{"source":"ka10099","market_codes":[...],"page_cap":N}` or
+  `{"source":"explicit","symbols":[...]}`. Any other shape is rejected
+  (exit 2).
+- ka10099 takes **one market per request** (`mrkt_tp`); each market is its
+  own cont-yn/next-key page chain. The universe is the deduped `stk_cd`
+  sequence in (declared market order, page order, row order). Pages are
+  preserved as `rest_resp` (api_id `ka10099`), so the derivation replays.
+  A chain closed at the declared cap while cont-yn=Y is a declared
+  truncated subset: `universe.truncated=true`, and the run never claims
+  "all symbols".
+- Each universe symbol gets exactly one ka10081 page (§12.9). A second page
+  or a repeat of the same symbol's scope is REJECT.
+- The last record is `daily_seed_manifest` (the 12th kind; ignored by
+  Core). Fields: `source_run_id`, `session_date`, `seed_sha256`,
+  `universe{source, market_codes, symbol_count, universe_sha256,
+  truncated}`, `captured_count`, `capture_failed_count`,
+  `history_short_count`, `capture_window{started_at, ended_at}`,
+  `binary_sha256`, `config_sha256`.
+- `seed_sha256` is sha256 over the P-run's ka10081 `raw` canonical lines in
+  order (`seq` excluded — a record never hashes its own file).
+  `symbol_count == captured_count + capture_failed_count` and
+  `history_short_count <= captured_count`.
+- `capture_window.ended_at` must be strictly before the calendar day's
+  `open` (a comparison of two recorded values, never a clock input).
+- A P-run has no `ws_frame`/`session_end`; its `verify` is INCOMPLETE
+  (exit 4) and is not the seed's authority. The manifest plus 12.10.5 is.
+
+**12.10.2 Seed entry into the session stream (S-run)**
+
+- `config.preopen_seed` is optional: `{"source_run_id","session_date",
+  "seed_sha256","symbol_count","failed":[...],"manifest_sha256"}`. Absent
+  means legacy: no seed block, no new audit, every byte unchanged.
+- The seed block is the first `K = captured_count` ka10081 `rest_resp`
+  records after record 2: the P-run `raw` bytes verbatim, renumbered to the
+  S-run's `seq`. Rule 3 diagnostic records may interleave; the block and
+  hash are defined by the first K ka10081 records and do not change.
+- `seed_sha256` must equal the block's canonical `raw`-line hash
+  (REJECT otherwise). `symbol_count == K + |failed|`; block symbols and
+  `failed` are disjoint, each duplicate-free.
+- A failed capture is **not** a `rest_resp` record (§12.9); its coverage
+  evidence is `failed`. A seed stream with a missing block, with a ka10081
+  scope outside block ∪ `failed`, or with a `failed` symbol that also has
+  an affirming record is REJECT.
+- `manifest_sha256` binds the source manifest; replay does not recompute
+  it without the source run directory — the acceptance audit checks both.
+
+**12.10.3 NO_EFFECT scope**
+
+- **bars/signals: neither.** Seed records are not ticks and create no
+  bar-range gap; seeded symbols enter `dailySeen`, so the sweep never
+  re-requests them. This is not the §10 `NO_EFFECT` class: §10 is declared
+  only for `out_frame`/`ws_conn`/`pong`.
+- **events: different by design.** `stepInto` advances `lastSeq`/
+  `lastEvidence` on every record (`src/hs/event_gen.nim:678-679`), so K
+  seed records shift every later `seq` and `SESSION_ENDED`'s evidence.
+  Events byte-identity is therefore defined only between live and replay
+  of the **same** seeded bytes (§13.4's Rule-3 reasoning, same cause).
+- **API projection: EFFECT.** Opening-MA20 P/ΣC come from the S-run's
+  ka10081 rows (`tools/api/serve.py:903-914`) and the coverage buckets
+  count seeded symbols. The seed is the projection's source; Rule 3 cannot
+  be read as "the projection ignores the seed".
+
+**12.10.4 dailySeen and logical tasks**
+
+- Every seeded symbol — success and failure — enters the S-run's
+  `dailySeen`. One symbol is one logical task (§12.9): success evidence is
+  the block record, failure evidence is `failed`.
+- A failed seed stays `capture_failed` and is not re-requested in the same
+  session. There is no second page and no retry: the 429 retry lives inside
+  the P-run's single physical attempt.
+- Projection `capture_failed` = `daily_capture_failed` gaps ∪
+  `preopen_seed.failed`; an affirmed capture is never capture_failed (the
+  existing priority is preserved).
+
+**12.10.5 Audit: declared universe**
+
+- Every ka10081 `stk_cd` must belong to the declared universe: in a P-run
+  the derived universe, in an S-run `(block ∪ failed)` ∪ the sweep queue
+  derived by replay from the verified ka10027 chains (§12.9
+  `dailyUniverseOf` rule). Outside is REJECT.
+- `verifyAttempts` gains a `declaredSymbols` parameter
+  (`src/hs/rest_resp.nim:379-381`; call `src/hs/replay.nim:364-367`).
+  Without a declaration (legacy) behavior is unchanged.
+
+**12.10.6 Acceptance**
+
+- Eligibility is by `dt`, never by row index: distinct `dt` values strictly
+  before the session date; 20 of them is computable, fewer is
+  `history_short` (not an error), and a row with `dt >= session_date` never
+  counts (`tools/api/serve.py:903-914`, `src/hs/collector.nim:754-766`).
+  A pre-open response may carry no session-date row at all.
+- The coverage six-bucket sum equals `candidate_count`, with the single
+  priority capture_failed → no_record → history_short → no_price → flat →
+  computable (rising+falling, flat excluded)
+  (`tools/api/serve.py:1062-1089,1100-1114`). A seeded success lands in
+  computable/flat/no_price/history_short, a seeded failure in
+  capture_failed; a seeded symbol that lands in no_record is an audit
+  failure.
+- Same input snapshot + same `as_of` = same projection. The response
+  already carries `input_snapshot{sha256,size}` and `data_as_of`; live and
+  offline recompute on that snapshot must be byte-identical.
+- Replay of a seeded stream is `VERDICT MATCH` on bars/signals/events/
+  CHECKSUMS; the unseeded stream differs only in events (12.10.3) and each
+  stream matches its own replay.
+
+**UNKNOWN (kept explicit).** ka10099's response shape and `mrkt_tp` market
+vocabulary are unmeasured in this repository; the value is fixed on
+approval. ka10081's 600 rows are our measurement, not a vendor guarantee.
+The real-domain rate limit is UNKNOWN (the mock measured ≈1/s). The
+`capture_window` times are recorded declarations, not independently proven
+wall-clock facts.
+
 ## 13. Events (VS-3 contract)
 
 The judgment layer described in this section is implemented

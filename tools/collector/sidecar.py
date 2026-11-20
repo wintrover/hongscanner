@@ -129,6 +129,17 @@ DAILY_PARAM_FIELDS = ["stk_cd", "base_dt", "upd_stkpc_tp"]
 # the final response, whatever it is, is reported once and the core owns
 # the verdict (a second consecutive failure is the reported skip fact).
 DAILY_RETRY_429_WAIT = 1.0
+# ka10099 종목정보 리스트 (official document, 2026-11-20): one market per
+# request — mrkt_tp "0" KOSPI, "10" KOSDAQ, "8" ETF, "60" ETN, ... and no
+# all-markets value. The request body is exactly {"mrkt_tp": code};
+# pagination is the same cont-yn/next-key header pair as the other REST
+# paths. One page per command: the sidecar never follows pagination, the
+# caller decides the next page (the ka10081 design).
+LIST_API_ID = "ka10099"
+LIST_REST_PATH = "/api/dostk/stkinfo"
+# Same measured transport retry as ka10081: one bounded retry after the
+# 1 s wait, paced by the shared REST lock like every other attempt.
+LIST_RETRY_429_WAIT = 1.0
 # base_dt is the documented OPTIONAL request field: present (non-empty
 # string) it is sent verbatim; absent or empty it is omitted from the body.
 TOKEN_BUFFER_SECONDS = 600
@@ -1000,6 +1011,96 @@ class Sidecar:
                          "cont_yn": cont, "next_key": key,
                          "body_hex": body.hex()})
 
+    # --------------------------------------------------- ka10099 list REST
+
+    def do_list(self, mrkt_tp, cont_yn, next_key):
+        """One ka10099 list page on the caller's executor thread: one
+        market per request, the declared market sent verbatim, the
+        response reported raw exactly like do_daily — status, response
+        cont-yn/next-key headers, body bytes. The shared _pace_rest
+        spacing applies to every attempt; the one bounded retry is
+        transport-level: HTTP 429 waits LIST_RETRY_429_WAIT and retries
+        once, then the final response is returned and the core owns the
+        verdict."""
+        attempts = 0
+        while True:
+            self._pace_rest()
+            data = json.dumps({"mrkt_tp": mrkt_tp}, ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json;charset=utf-8",
+                "api-id": LIST_API_ID,
+                "authorization": ("%s %s" % (self.token_type,
+                                             self.token)).strip(),
+            }
+            if cont_yn == "Y":
+                headers["cont-yn"] = "Y"
+            if next_key:
+                headers["next-key"] = next_key
+            req = urllib.request.Request(
+                self.rest_domain + LIST_REST_PATH, data=data,
+                headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return (resp.status, resp.headers.get("cont-yn") or "",
+                            resp.headers.get("next-key") or "", resp.read())
+            except urllib.error.HTTPError as e:
+                # An HTTP response with an error status is still a response:
+                # the core owns the verdict (429 included — after the one
+                # bounded retry).
+                try:
+                    body = e.read()
+                    cont = e.headers.get("cont-yn") or ""
+                    key = e.headers.get("next-key") or ""
+                except Exception:
+                    body, cont, key = b"", "", ""
+                if e.code == 429 and attempts == 0:
+                    attempts = 1
+                    time.sleep(LIST_RETRY_429_WAIT)
+                    continue
+                return e.code, cont, key, body
+            except Exception as exc:
+                raise RestError("transport failed: " + type(exc).__name__)
+
+    def _list_mrkt_tp(self, cmd):
+        """Validate the list command's declared market (transport shape
+        only): a non-empty string. The official code set (0 KOSPI, 10
+        KOSDAQ, 8 ETF, 60 ETN, ...) is vendor_input's value authority,
+        never this process."""
+        mrkt_tp = cmd.get("mrkt_tp")
+        if not isinstance(mrkt_tp, str) or not mrkt_tp:
+            raise SidecarExit(4, "list mrkt_tp must be a non-empty string")
+        return mrkt_tp
+
+    async def handle_list(self, cmd):
+        mrkt_tp = self._list_mrkt_tp(cmd)
+        cont_yn = cmd.get("cont_yn", "")
+        if cont_yn not in ("", "Y", "N"):
+            raise SidecarExit(4, "list cont_yn must be Y, N or empty")
+        next_key = cmd.get("next_key", "")
+        if not isinstance(next_key, str):
+            raise SidecarExit(4, "list next_key must be a string")
+        # page is the caller's 1-based logical page number, not a vendor
+        # field: the sidecar forwards the request once and never follows
+        # pagination itself.
+        if isinstance(cmd.get("page"), bool) or \
+           not isinstance(cmd.get("page"), int) or cmd["page"] < 1:
+            raise SidecarExit(4, "list command needs page >= 1")
+        loop = asyncio.get_running_loop()
+        try:
+            status, cont, key, body = await loop.run_in_executor(
+                None, self.do_list, mrkt_tp, cont_yn, next_key)
+        except RestError as exc:
+            # The req discriminator attributes the failure to the list
+            # path, exactly like the daily transport.
+            self.emit({"ev": "error", "what": "rest", "req": "list",
+                             "detail": exc.args[0]})
+            return
+        self.emit({"ev": "rest_list", "mrkt_tp": mrkt_tp,
+                         "page": cmd["page"], "status": status,
+                         "cont_yn": cont, "next_key": key,
+                         "body_hex": body.hex()})
+
     # -------------------------------------------------------- commands
 
     async def handle(self, cmd):
@@ -1039,6 +1140,8 @@ class Sidecar:
             await self.handle_chart(cmd)
         elif ctype == "daily_req":
             await self.handle_daily(cmd)
+        elif ctype == "list_req":
+            await self.handle_list(cmd)
         elif ctype == "refresh_token":
             try:
                 self.acquire_token(force=True)

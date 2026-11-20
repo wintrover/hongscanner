@@ -19,6 +19,7 @@ and runs this module through unittest.
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import queue
@@ -1256,6 +1257,335 @@ class SidecarContract(unittest.IsolatedAsyncioTestCase):
             {"api_id": "ka10080",
              "params": {"stk_cd": "005930", "tic_scope": "3",
                         "upd_stkpc_tp": "0"}, "page": "1"},
+        ]
+        for cmd in cases:
+            h = self.harness()
+            await h.start()
+            with self.assertRaises(sidecar.SidecarExit) as raised:
+                await h.sc.handle(cmd)
+            self.assertEqual(raised.exception.code, 4, str(cmd))
+            h.close()
+
+    # ------------------------------------------------------ list (ka10099)
+
+    async def test_list_req_reports_the_raw_page(self):
+        """One ka10099 market page: POST /api/dostk/stkinfo, api-id
+        ka10099, body {"mrkt_tp": code}; the raw body and the response
+        cont-yn/next-key headers are preserved verbatim."""
+        h = self.harness()
+        await h.start()
+        captured = {}
+        page_body = json.dumps({
+            "return_code": 0, "return_msg": "",
+            "list": [{"code": "005930", "name": "삼성전자"}]},
+            ensure_ascii=False).encode("utf-8")
+
+        class FakeResp:
+            status = 200
+
+            def __init__(self):
+                self.headers = {"cont-yn": "Y", "next-key": "lp2"}
+
+            def read(self):
+                return page_body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["req"] = req
+            captured["timeout"] = timeout
+            return FakeResp()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            h.send(type="list_req", mrkt_tp="0", page=1,
+                   cont_yn="", next_key="")
+            evs = await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest_list" for e in evs),
+                "the rest_list event")
+
+        ev = [e for e in evs if e.get("ev") == "rest_list"][-1]
+        self.assertEqual(ev["mrkt_tp"], "0")
+        self.assertEqual(ev["page"], 1)
+        self.assertEqual(ev["status"], 200)
+        self.assertEqual(ev["cont_yn"], "Y")
+        self.assertEqual(ev["next_key"], "lp2")
+        self.assertEqual(ev["body_hex"], page_body.hex())
+        self.assertNotIn("api_id", ev)
+        self.assertNotIn(TOKEN, "\n".join(h.stdout.lines))
+
+        req = captured["req"]
+        self.assertEqual(req.full_url,
+                         sidecar.DEMO_REST_DOMAIN + "/api/dostk/stkinfo")
+        self.assertEqual(req.headers.get("Api-id"), "ka10099")
+        self.assertEqual(req.headers.get("Authorization"),
+                         "Bearer " + TOKEN)
+        self.assertEqual(json.loads(req.data.decode("utf-8")),
+                         {"mrkt_tp": "0"})
+        self.assertEqual(captured["timeout"], 30)
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_req_continuation_is_caller_driven(self):
+        """The sidecar sends exactly one page per command: page 2 and the
+        previous response's cont-yn/next-key are forwarded as the caller
+        supplied them — the sidecar never follows pagination itself."""
+        h = self.harness()
+        await h.start()
+        calls = []
+
+        class FakeResp:
+            status = 200
+            headers = {"cont-yn": "N", "next-key": ""}
+
+            def read(self):
+                return b'{"return_code":0,"list":[]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            return FakeResp()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            h.send(type="list_req", mrkt_tp="10", page=2,
+                   cont_yn="Y", next_key="lp2")
+            evs = await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest_list" for e in evs),
+                "the rest_list event")
+
+        ev = [e for e in evs if e.get("ev") == "rest_list"][-1]
+        self.assertEqual(ev["mrkt_tp"], "10")
+        self.assertEqual(ev["page"], 2)
+        self.assertEqual(len(calls), 1,
+                         "one command is exactly one vendor request")
+        self.assertEqual(calls[0].headers.get("Cont-yn"), "Y")
+        self.assertEqual(calls[0].headers.get("Next-key"), "lp2")
+        self.assertEqual(json.loads(calls[0].data.decode("utf-8")),
+                         {"mrkt_tp": "10"})
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_requests_share_the_rest_pacing(self):
+        """The shared 1.5 s REST lock (shrunk here) spaces list pages
+        against every other REST path, the vendor's one-TR-per-second
+        limit being per account/token."""
+        h = self.harness(rest_min_interval=0.25)
+        await h.start()
+        stamps = []
+
+        class FakeResp:
+            status = 200
+            headers = {}
+
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            stamps.append(time.monotonic())
+            return FakeResp()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            h.send(type="rest_req", direction="up", page=1,
+                   cont_yn="", next_key="")
+            await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest" for e in evs),
+                "the rest event")
+            h.send(type="list_req", mrkt_tp="0", page=1,
+                   cont_yn="", next_key="")
+            await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest_list" for e in evs),
+                "the rest_list event")
+
+        self.assertEqual(len(stamps), 2)
+        self.assertGreaterEqual(stamps[1] - stamps[0], 0.23,
+                                "the list page raced the rkinfo page " +
+                                "inside the vendor's one-request-per-second " +
+                                "limit")
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_req_429_retries_once_then_reports_the_success(self):
+        """The measured transport retry: HTTP 429 waits and retries once;
+        the retry passes the shared pacing lock again, and only the final
+        response is reported."""
+        h = self.harness(rest_min_interval=0.15)
+        await h.start()
+        stamps = []
+
+        class FakeResp:
+            status = 200
+            headers = {"cont-yn": "N", "next-key": ""}
+
+            def read(self):
+                return b'{"return_code":0,"list":[]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            stamps.append(time.monotonic())
+            if len(stamps) == 1:
+                raise urllib.error.HTTPError(
+                    "http://test", 429, "too many requests",
+                    {"cont-yn": "", "next-key": ""}, None)
+            return FakeResp()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen), \
+                mock.patch.object(sidecar, "LIST_RETRY_429_WAIT", 0.05):
+            h.send(type="list_req", mrkt_tp="0", page=1,
+                   cont_yn="", next_key="")
+            evs = await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest_list" for e in evs),
+                "the rest_list event after the retry")
+
+        ev = [e for e in evs if e.get("ev") == "rest_list"][-1]
+        self.assertEqual(len(stamps), 2, "exactly one retry")
+        self.assertGreaterEqual(stamps[1] - stamps[0], 0.13,
+                                "the retry skipped the shared pacing lock")
+        self.assertEqual(ev["status"], 200)
+        self.assertEqual(ev["body_hex"], b'{"return_code":0,"list":[]}'.hex())
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_req_second_429_is_reported_not_retried_again(self):
+        h = self.harness()
+        await h.start()
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            raise urllib.error.HTTPError(
+                "http://test", 429, "too many requests",
+                {"cont-yn": "Y", "next-key": "again"}, None)
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen), \
+                mock.patch.object(sidecar, "LIST_RETRY_429_WAIT", 0.01):
+            h.send(type="list_req", mrkt_tp="0", page=1,
+                   cont_yn="", next_key="")
+            evs = await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest_list" for e in evs),
+                "the final 429 as a rest_list event")
+
+        ev = [e for e in evs if e.get("ev") == "rest_list"][-1]
+        self.assertEqual(len(calls), 2, "the retry is bounded to one")
+        self.assertEqual(ev["status"], 429)
+        self.assertEqual(ev["cont_yn"], "Y")
+        self.assertEqual(ev["next_key"], "again")
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_req_unauthorized_is_a_raw_response_not_an_error(self):
+        """Fail-closed at the transport boundary: an HTTP error status is
+        still a raw response for the core to judge — the sidecar neither
+        retries it nor calls it a success."""
+        h = self.harness()
+        await h.start()
+        calls = []
+        body = b'{"return_code":3,"return_msg":"unauthorized"}'
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            raise urllib.error.HTTPError(
+                "http://test", 401, "unauthorized",
+                {"cont-yn": "", "next-key": ""}, io.BytesIO(body))
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            h.send(type="list_req", mrkt_tp="0", page=1,
+                   cont_yn="", next_key="")
+            evs = await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest_list" for e in evs),
+                "the 401 as a rest_list event, not an error")
+
+        self.assertEqual(len(calls), 1)
+        ev = [e for e in evs if e.get("ev") == "rest_list"][-1]
+        self.assertEqual(ev["status"], 401)
+        self.assertEqual(ev["body_hex"], body.hex())
+        self.assertFalse(any(e.get("ev") == "error" for e in evs))
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_req_malformed_body_is_preserved_not_parsed(self):
+        """A 200 with a non-JSON body is reported raw with its bytes
+        intact; the sidecar never parses and never fabricates a page."""
+        h = self.harness()
+        await h.start()
+        body = b"<html>not json</html>"
+
+        class FakeResp:
+            status = 200
+            headers = {}
+
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch("urllib.request.urlopen",
+                        lambda req, timeout=None: FakeResp()):
+            h.send(type="list_req", mrkt_tp="8", page=1,
+                   cont_yn="", next_key="")
+            evs = await h.wait_for(
+                lambda evs: any(e.get("ev") == "rest_list" for e in evs),
+                "the malformed page as a raw rest_list event")
+
+        ev = [e for e in evs if e.get("ev") == "rest_list"][-1]
+        self.assertEqual(ev["mrkt_tp"], "8")
+        self.assertEqual(ev["status"], 200)
+        self.assertEqual(ev["cont_yn"], "")
+        self.assertEqual(ev["next_key"], "")
+        self.assertEqual(ev["body_hex"], body.hex())
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_transport_failure_is_an_error_event(self):
+        h = self.harness()
+        await h.start()
+
+        def fake_urlopen(req, timeout=None):
+            raise ConnectionRefusedError("no route")
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            h.send(type="list_req", mrkt_tp="0", page=1,
+                   cont_yn="", next_key="")
+            evs = await h.wait_for(
+                lambda evs: any(e.get("ev") == "error" and
+                                e.get("what") == "rest" for e in evs),
+                "the list transport failure as error what=rest")
+        err = [e for e in evs if e.get("ev") == "error"][-1]
+        self.assertEqual(err["req"], "list",
+                         "the failure is attributable to the list path")
+        self.assertTrue(err["detail"].startswith("transport failed"))
+        self.assertEqual(await h.stop_and_join(), 0)
+
+    async def test_list_command_shape_is_refused_fail_closed(self):
+        """Transport-shape law: a non-empty mrkt_tp string, page >= 1,
+        cont_yn Y|N|"", next_key string — anything else is exit 4, never a
+        guessed request."""
+        cases = [
+            {"type": "list_req", "mrkt_tp": "", "page": 1},
+            {"type": "list_req", "mrkt_tp": 0, "page": 1},
+            {"type": "list_req", "page": 1},
+            {"type": "list_req", "mrkt_tp": "0", "page": 0},
+            {"type": "list_req", "mrkt_tp": "0", "page": "1"},
+            {"type": "list_req", "mrkt_tp": "0", "page": True},
+            {"type": "list_req", "mrkt_tp": "0", "page": 1,
+             "cont_yn": "X"},
+            {"type": "list_req", "mrkt_tp": "0", "page": 1,
+             "next_key": 5},
         ]
         for cmd in cases:
             h = self.harness()
