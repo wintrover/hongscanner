@@ -529,6 +529,18 @@ class SidecarContract(unittest.IsolatedAsyncioTestCase):
                 sidecar.parse_init(json.dumps(line))
             self.assertEqual(cm.exception.code, 4)
 
+    def test_init_accepts_every_declared_page_cap(self):
+        # page_cap is the scanner-side declared chain limit (1..200);
+        # collector --page-cap validates the same range. A sidecar that
+        # pinned one value refused the declared 40 and died before init
+        # in the 2026-11-20 09:40 restart.
+        for page_cap in (sidecar.PAGE_CAP_MIN, 10, 40,
+                         sidecar.PAGE_CAP_MAX):
+            cfg = approved_cfg()
+            cfg["page_cap"] = page_cap
+            parsed = sidecar.parse_init(json.dumps(cfg))
+            self.assertEqual(parsed["page_cap"], page_cap)
+
     def test_init_rejects_every_unapproved_value(self):
         def mutate(**changes):
             cfg = approved_cfg()
@@ -547,7 +559,12 @@ class SidecarContract(unittest.IsolatedAsyncioTestCase):
             ("rest_domain", mutate(rest_domain="https://evil.example")),
             ("ws_endpoint", mutate(ws_endpoint="wss://evil.example:10000")),
             ("api_id", mutate(api_id="ka10099")),
-            ("page_cap", mutate(page_cap=11)),
+            ("page_cap zero", mutate(page_cap=0)),
+            ("page_cap above the declared maximum", mutate(page_cap=201)),
+            ("page_cap bool", mutate(page_cap=True)),
+            ("page_cap string", mutate(page_cap="40")),
+            ("page_cap float", mutate(page_cap=40.5)),
+            ("page_cap absent", mutate(page_cap=None)),
             ("repoll_seconds", mutate(repoll_seconds=299)),
             ("drain_seconds", mutate(drain_seconds=11)),
             ("ack_timeout_seconds", mutate(ack_timeout_seconds=9)),

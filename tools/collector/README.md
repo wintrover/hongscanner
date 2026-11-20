@@ -109,7 +109,9 @@ Nim collector-core (src/hs/collector.nim + tools/collector/collector.nim)
   계층이 부분 유니버스를 판정하지 않아 **오전 내내 후보 갱신·랭킹이 0건**
   이었다. 실전 세션은 `--page-cap=40`(최대 8,000행)을 선언한다 — cap은
   스캐너측 선언이며 config 레코드에 그대로 남는다. cap을 넘는 목록은
-  여전히 절단으로 기록되고 판정되지 않는다(fail-closed). `repoll_seconds`=300(§5 승인값),
+  여전히 절단으로 기록되고 판정되지 않는다(fail-closed). sidecar도 같은
+  1..200 정수 범위를 검증한다 — 단일값 고정은 선언된 40을 거부해 init 전에
+  세션을 죽인다(2026-11-20 09:40 재시작 실측). `repoll_seconds`=300(§5 승인값),
   `drain_seconds`=10(§5), `ack_timeout_seconds`=10(승인된 drain 값과 같은
   "프로토콜 1단계 정적 한계"로 선언, §5 표에 명시된 값에서 유도 —
   config 레코드에 그 사실과 함께 기록), `watchdog`=15:40 KST(스캐너 시계,
