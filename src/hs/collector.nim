@@ -57,6 +57,18 @@ import hcj, records, calendars, engine, vendor_input, rest_resp, sub_input,
 type
   CollectorError* = object of CatchableError
 
+  PreopenSeedDecl* = object
+    ## The S-run's declared binding to one P-run's ka10081 seed
+    ## (REPLAY_CONTRACT §12.10.2). Exactly the six recorded fields; the
+    ## block itself is carried separately (preopenBlock) so the config
+    ## record stays a declaration and the block records stay records.
+    sourceRunId*: string
+    sessionDate*: string
+    seedSha256*: string
+    symbolCount*: int
+    failed*: seq[string]
+    manifestSha256*: string
+
   CollectorConfig* = object
     sessionDate*: string
     environment*: string       ## "demo" | "real" (the only two names)
@@ -82,6 +94,15 @@ type
                                ## streams), "single-page-initial-pair" = the
                                ## same legacy scope declared explicitly,
                                ## "accumulate-v2" = FIFO union across polls
+    preopenSeed*: Option[PreopenSeedDecl]
+                               ## config.preopen_seed (REPLAY_CONTRACT
+                               ## §12.10.2): absent = the legacy stream, no
+                               ## seed key and not one changed byte.
+    preopenBlock*: seq[HcjValue]
+                               ## The P-run ka10081 raw records, verbatim, in
+                               ## P-run order: emitted as the S-run's rest_resp
+                               ## records immediately after the config record
+                               ## (§12.10.2). Non-empty only with preopenSeed.
     params*: Params
     calendar*: HcjValue        ## the approved calendar snapshot (recorded as seq 1)
 
@@ -146,10 +167,11 @@ type
     dailyCursor*: int            ## index of the next universe symbol to request
     dailyPending*: string        ## stk_cd of the in-flight daily request (""
                                  ## = none)
-    dailySeen*: HashSet[string]  ## accumulate-v2 assignment ledger (REPLAY
-                                 ## CONTRACT §12.9): a symbol enters the FIFO
+    dailySeen*: HashSet[string]  ## the one-capture ledger (REPLAY_CONTRACT
+                                 ## §12.9/§12.10.4): a symbol enters the FIFO
                                  ## universe at most once, so no capture is
-                                 ## ever re-issued on a later poll round
+                                 ## ever re-issued; a pre-open seed starts it
+                                 ## with captured ∪ failed before any round
     wsCount*: int
     wsSincePoll*: int
     parseFailures*: int
@@ -205,6 +227,69 @@ proc wsEndpointFor*(environment: string): string =
   of "real": realWsEndpoint
   else: raise cerr("environment must be demo or real: " & environment)
 
+proc isSha256Hex(s: string): bool =
+  s.len == 64 and s.allCharsInSet({'0' .. '9', 'a' .. 'f'})
+
+proc seedBlockSymbol(raw: HcjValue; idx: int): string =
+  ## The stk_cd a pre-open seed block record declares (its ka10081 query
+  ## scope). The block is copied verbatim from the P-run, so only the
+  ## fields the ledger needs are inspected here; Core re-validates the
+  ## whole record on replay.
+  if raw.kind != hkObj:
+    raise cerr("preopen seed block record " & $idx & " is not an object")
+  let api = raw.getOpt("api_id")
+  if api.isNone or api.get.kind != hkStr or api.get.strVal != ka10081ApiId:
+    raise cerr("preopen seed block record " & $idx & " is not a " &
+               ka10081ApiId & " rest_resp record")
+  let q = raw.getOpt("query")
+  if q.isNone or q.get.kind != hkObj:
+    raise cerr("preopen seed block record " & $idx &
+               " has no declared query object")
+  let sym = q.get.getOpt("stk_cd")
+  if sym.isNone or sym.get.kind != hkStr or sym.get.strVal.len == 0:
+    raise cerr("preopen seed block record " & $idx & " declares no stk_cd")
+  sym.get.strVal
+
+proc validatePreopenSeed(seed: PreopenSeedDecl; blockRaws: seq[HcjValue];
+                         sessionDate: string) =
+  ## The recorded shape is exactly the six §12.10.2 fields and the block
+  ## must match the declared arithmetic: K = symbol_count - |failed|,
+  ## duplicate-free captured symbols, captured ∩ failed empty. The hash is
+  ## verified by the adapter that read the P-run (which owns the block
+  ## bytes); this is the pure invariant the core can still check.
+  if seed.sourceRunId.len == 0:
+    raise cerr("preopen seed source_run_id must not be empty")
+  if seed.sessionDate != sessionDate:
+    raise cerr("preopen seed session_date " & seed.sessionDate &
+               " does not equal the session date " & sessionDate)
+  if not isSha256Hex(seed.seedSha256):
+    raise cerr("preopen seed seed_sha256 is not a 64-digit lowercase sha256")
+  if not isSha256Hex(seed.manifestSha256):
+    raise cerr("preopen seed manifest_sha256 is not a 64-digit lowercase " &
+               "sha256")
+  if seed.symbolCount < 0:
+    raise cerr("preopen seed symbol_count must be >= 0")
+  var failed = initHashSet[string]()
+  for sym in seed.failed:
+    if sym.len == 0:
+      raise cerr("preopen seed failed carries an empty symbol")
+    if sym in failed:
+      raise cerr("preopen seed failed repeats symbol: " & sym)
+    failed.incl(sym)
+  if seed.symbolCount != blockRaws.len + seed.failed.len:
+    raise cerr("preopen seed symbol_count " & $seed.symbolCount &
+               " does not equal K " & $blockRaws.len & " + |failed| " &
+               $seed.failed.len)
+  var captured = initHashSet[string]()
+  for i, raw in blockRaws:
+    let sym = seedBlockSymbol(raw, i)
+    if sym in captured:
+      raise cerr("preopen seed block repeats symbol: " & sym)
+    if sym in failed:
+      raise cerr("preopen seed symbol " & sym &
+                 " is both a block capture and a declared failed capture")
+    captured.incl(sym)
+
 proc initCollectorConfig*(sessionDate, environment, profile: string;
                           mrktTp, trdeQtyCnd, stkCnd, crdCnd, updownIncls,
                           pricCnd, trdePricaCnd, stexTp: string;
@@ -212,7 +297,10 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
                           tokenSource = "kiwoomcli";
                           runId = "";
                           dailyScope = "";
-                          pageCap = defaultPageCap): CollectorConfig =
+                          pageCap = defaultPageCap;
+                          preopenSeed: Option[PreopenSeedDecl] =
+                            none(PreopenSeedDecl);
+                          preopenBlock: seq[HcjValue] = @[]): CollectorConfig =
   ## Build and validate the collector configuration. The approved PH-1
   ## values are pinned here (README §5/§6.1): environment-derived
   ## endpoints, page cap 10 (the declared default; a session may declare
@@ -262,6 +350,13 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
   # a larger cap; an implausible one is refused, never silently run.
   if pageCap < 1 or pageCap > 200:
     raise cerr("page_cap must be 1..200: " & $pageCap)
+  # config.preopen_seed (REPLAY_CONTRACT §12.10.2): optional, fail-closed
+  # when present. Absent, the block must be empty too — a block without
+  # its declaration would be records no audit can bind to a source run.
+  if preopenSeed.isSome:
+    validatePreopenSeed(preopenSeed.get, preopenBlock, sessionDate)
+  elif preopenBlock.len > 0:
+    raise cerr("preopen seed block requires config.preopen_seed")
   # The declared query scope must be inside the documented enums for both
   # directions before anything is recorded or sent.
   discard initKa10027Query(dirUp, mrktTp, trdeQtyCnd, stkCnd, crdCnd,
@@ -289,6 +384,8 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     tokenSource: tokenSource,
     runId: runId,
     dailyScope: dailyScope,
+    preopenSeed: preopenSeed,
+    preopenBlock: preopenBlock,
     params: params,
     calendar: calendar)
 
@@ -344,6 +441,19 @@ proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
       ("repoll_seconds", hInt(cfg.repollSeconds))]
     if cfg.dailyScope.len > 0:
       pairs.add(("daily_scope", hStr(cfg.dailyScope)))
+    if cfg.preopenSeed.isSome:
+      # Exactly the six §12.10.2 fields. An absent seed adds no key at all:
+      # the legacy config record stays byte-identical.
+      let s = cfg.preopenSeed.get
+      var failed: seq[HcjValue]
+      for sym in s.failed: failed.add(hStr(sym))
+      pairs.add(("preopen_seed", hObj(
+        ("failed", hArrSeq(failed)),
+        ("manifest_sha256", hStr(s.manifestSha256)),
+        ("seed_sha256", hStr(s.seedSha256)),
+        ("session_date", hStr(s.sessionDate)),
+        ("source_run_id", hStr(s.sourceRunId)),
+        ("symbol_count", hInt(s.symbolCount)))))
     if cfg.runId.len > 0:
       pairs.add(("run_id", hStr(cfg.runId)))
     pairs.add(("selection_policy", hStr(selectionPolicyId)))
@@ -354,6 +464,12 @@ proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
     pairs.add(("watchdog", hStr(cfg.watchdog)))
     hObj(pairs)
   result = @[(kCalendar, cfg.calendar), (kConfig, cfgRaw)]
+  # The seed block starts immediately after record 2 (§12.10.2): the P-run
+  # raw values verbatim, each renumbered only by the Recorder's S-run seq.
+  # Rule-3 diagnostics follow the whole block in this producer; Core defines
+  # the block as the first K ka10081 records after record 2 regardless.
+  for raw in cfg.preopenBlock:
+    result.add((kRestResp, raw))
 
 # ---------------------------------------------------------------- wire out
 
@@ -461,7 +577,16 @@ proc tE(obj: HcjValue): string =
 
 proc startCollector*(cfg: CollectorConfig): Collector =
   discard sessionFor(cfg.calendar, cfg.sessionDate)
-  Collector(cfg: cfg, phase: phStart, guard: initSubGuard())
+  result = Collector(cfg: cfg, phase: phStart, guard: initSubGuard())
+  # REPLAY_CONTRACT §12.10.4: every seeded symbol — captured and failed —
+  # enters dailySeen before any candidate round, so the sweep never
+  # re-requests it and a failed seed is not retried. The ledger is also
+  # what filters the initial universe (below).
+  if cfg.preopenSeed.isSome:
+    for i, raw in cfg.preopenBlock:
+      result.dailySeen.incl(seedBlockSymbol(raw, i))
+    for sym in cfg.preopenSeed.get.failed:
+      result.dailySeen.incl(sym)
 
 proc gapRecord(symbol: string; what, detail, t: string): RecOut =
   ## One gap record (existing kind). symbol == "" means a connection-wide
@@ -968,10 +1093,23 @@ proc chainAdvance(c: var Collector; records: var seq[RecOut];
     # union. Under accumulate-v2 this is the FIFO seed (later poll rounds
     # append their new symbols via extendDailyUniverse); under the legacy
     # scope a symbol that appears only in a later round stays uncaptured.
-    c.dailyUniverse = dailyUniverseOf(c, upPages, downPages,
-                                      finished.firstTruncated, truncated)
+    var universe = dailyUniverseOf(c, upPages, downPages,
+                                   finished.firstTruncated, truncated)
+    if c.cfg.preopenSeed.isSome:
+      # REPLAY_CONTRACT §12.10.4: a seeded symbol (captured or failed) is
+      # already one completed logical task, so it never enters this
+      # session's sweep queue — one symbol, one capture (§12.9). The
+      # derived universe itself is unchanged; only the queue is filtered.
+      var queue: seq[string]
+      for sym in universe:
+        if sym notin c.dailySeen: queue.add(sym)
+      universe = queue
+    c.dailyUniverse = universe
     if c.cfg.dailyScope == dailyScopeAccumulate:
-      c.dailySeen = initHashSet[string]()
+      # Without a seed this is the historical FIFO seed. With a seed the
+      # ledger already holds captured ∪ failed and must not be reset.
+      if c.cfg.preopenSeed.isNone:
+        c.dailySeen = initHashSet[string]()
       for sym in c.dailyUniverse:
         c.dailySeen.incl(sym)
     c.dailyReady = true

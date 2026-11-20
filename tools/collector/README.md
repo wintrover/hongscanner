@@ -622,6 +622,39 @@ REG(신세대, refresh="1")→ack. 0s는 스왑 경로에 절대 등장하지 �
 재시작·스왑·폴 재시작)는 선출된 집합으로 구성된다 — 원본 전체 후보가
 composeRegData에 도달하는 경로는 없다.
 
+### 6.3 개장 전 시드 (`--daily-seed=<P-run dir>`)
+
+`--daily-seed`는 P-run 디렉터리의 `input.hcj.jsonl`을 읽어 그
+`daily_seed_manifest` 봉인을 이 세션의 `config.preopen_seed`와 ka10081
+시드 블록으로 물질화한다(REPLAY_CONTRACT §12.10.1/§12.10.2). 실행
+디렉터리·레코더·사이드카를 만들기 **전에** 전부 검증하며, 어느 하나라도
+어긋나면 exit 2로 거부한다 — 부분 시드는 없다.
+
+- 마지막 커밋 레코드가 `daily_seed_manifest`여야 한다(P-run은
+  `session_end` 없이 `abandon()`으로 끝난다).
+- manifest의 `session_date` == `--session-date`, `captured_count` ==
+  ka10081 `rest_resp` 레코드 수 K, `symbol_count` == K + |failed|,
+  `universe.symbol_count` == 선언 유니버스 크기,
+  `capture_failed_count` == |failed|, `history_short_count` <= K.
+- `failed` = 선언 유니버스 − 캡처 심볼(유니버스 순서). producer가
+  manifest에 `failed` 목록을 기록하면 그 목록은 파생값과 일치해야 한다.
+  캡처·실패는 각각 중복이 없고 서로소다.
+- `seed_sha256` == 캡처 블록의 `canonical(raw)`+LF 해시. manifest
+  바인딩(`config.preopen_seed.manifest_sha256`)은 manifest 레코드의
+  `canonical(raw)`+LF 해시다.
+- 유니버스 소스는 `explicit`(symbols) 또는 `ka10099`(시장별
+  cont-yn/next-key 체인, `code` 중복 제거, 선언 시장→페이지→행 순서;
+  선언 cap에서 cont-yn=Y로 닫힌 체인은 `universe.truncated=true`)뿐이다.
+- 캡처 블록(K개, raw 바이트 그대로)은 config 레코드(seq 2) 바로 뒤에
+  S-run seq로 재번호되어 기록되고, 그 뒤로 평소 세션 프리앰블이 이어진다.
+- 캡처·실패 심볼 전부가 첫 후보 라운드 전에 `dailySeen`에 들어간다:
+  스윕은 이들을 다시 요청하지 않는다. 실패 심볼의 증거는
+  `config.preopen_seed.failed`이며 `daily_capture_failed` 갭을 중복으로
+  남기지 않는다.
+
+`--daily-seed`가 없으면 레거시 스트림 그대로다: config에
+`preopen_seed` 키가 없고 블록도 없으며 바이트가 동일하다.
+
 ## 7. GAP 분류 (계약 §12 확정표의 구현 매핑 — 전부 기존 kind)
 
 | 사건 | 기록 | 후속 |
@@ -741,7 +774,9 @@ composeRegData에 도달하는 경로는 없다.
   (새 스위트 포함). CI는 python 3.13 설치 단계를 갖는다.
 - 실행(라이브, 별도 사전검증 단계에서만): 
   `tools/collector/collector --profile <alias> --session-date YYYY-MM-DD
-  --out runs/<dir> [--environment=demo|real]` — 기본값은 demo다.
+  --out runs/<dir> [--environment=demo|real] [--daily-seed=<P-run dir>]`
+  — 기본값은 demo이고, `--daily-seed`가 없으면 레거시(비시드) 스트림이다
+  (§6.3).
   개발 중 라이브 호출 금지(하드 규칙). 바이너리는
   `nim c -d:release --path:src -o:tools/collector/collector tools/collector/collector.nim`.
 
