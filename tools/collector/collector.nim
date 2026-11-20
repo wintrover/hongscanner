@@ -20,9 +20,10 @@
 ##                [--token-source=kiwoomcli]
 ##                [--mrkt-tp=000] ... (declared query
 ##                scope, approved PH-1 values by default).
-import std/[os, osproc, strutils, posix, times, streams]
+import std/[os, osproc, strutils, posix, times, streams, options]
 import hs/[hcj, records, calendars, engine, collector, recorder, event_gen,
           vendor_input]
+import preopen
 
 const usageText = """collector — the VS-2 live collector (demo|real)
 
@@ -31,6 +32,7 @@ const usageText = """collector — the VS-2 live collector (demo|real)
             [--environment=demo]
             [--token-source=kiwoomcli]
             [--daily-scope=single-page-initial-pair|accumulate-v2]
+            [--daily-seed=<P-run dir>]
             [--page-cap=10]
             [--mrkt-tp=000 --trde-qty-cnd=0000 --stk-cnd=0 --crd-cnd=0
              --updown-incls=1 --pric-cnd=0 --trde-prica-cnd=0 --stex-tp=1]
@@ -58,6 +60,17 @@ refuses to start on demo variables, and vice versa.
 "single-page-initial-pair" (the same legacy scope declared explicitly)
 or "accumulate-v2" (the FIFO universe: each later poll round appends its
 new symbols and the sweep resumes). Any other value is refused.
+
+--daily-seed materializes one P-run's pre-open ka10081 seed
+(REPLAY_CONTRACT §12.10): the P-run directory's input.hcj.jsonl must end
+with its daily_seed_manifest seal. The manifest, the declared universe
+(explicit symbols or the preserved ka10099 chains), the failed list and
+the block hash are validated before anything is written; the captured
+ka10081 pages are then copied verbatim into this session's stream
+immediately after the config record, and captured ∪ failed start the
+one-capture ledger so the sweep never re-requests them. Any deviation
+refuses to start (exit 2), never a partial seed. Absent, the stream is
+the legacy unseeded one, byte-identical.
 
 --page-cap declares the scanner-side page upper limit (REPLAY_CONTRACT
 §12.1); the default is 10, the PH-1 value. A live KRX ranking can exceed
@@ -269,6 +282,21 @@ proc main(): int =
                 "environment)")
   if tokenSource != "kiwoomcli" and tokenSource != "env":
     fail(2, "collector: --token-source must be kiwoomcli or env")
+  # --daily-seed (REPLAY_CONTRACT §12.10): read and validate the whole
+  # P-run before any run directory, recorder or sidecar exists. A bad seed
+  # is exit 2 with nothing written — never a partial seed.
+  var seedOpt: Option[PreopenSeedDecl]
+  var seedBlock: seq[HcjValue]
+  if hasArgValue(args, "daily-seed"):
+    let seedPath = argValue(args, "daily-seed")
+    if seedPath.len == 0:
+      fail(2, "collector: --daily-seed requires a P-run directory")
+    try:
+      let ds = loadDailySeed(seedPath, sessionDate)
+      seedOpt = some(ds.seed)
+      seedBlock = ds.blockRaws
+    except DailySeedError as e:
+      fail(2, "COLLECTOR DAILY SEED: " & e.msg)
   # createDir is pure creation: it never destroys an existing directory's
   # content, and openRecorder refuses an existing input file outright.
   try:
@@ -308,7 +336,9 @@ proc main(): int =
       lastPathPart(outDir),
       dailyScope = dailyScope,
       pageCap = argValue(args, "page-cap").defaultInt(defaultPageCap,
-        "page-cap"))
+        "page-cap"),
+      preopenSeed = seedOpt,
+      preopenBlock = seedBlock)
   except CollectorError as e:
     fail(2, "COLLECTOR CONFIG: " & e.msg)
   except CoverageError as e:

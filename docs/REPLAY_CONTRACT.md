@@ -592,13 +592,15 @@ contract on the same `rest_resp` envelope as §12.1/§12.8:
 
 ### 12.10 Pre-open daily seed (target contract)
 
-**Status: target, Core side implemented (P3).** No producer exists yet. The
-12th kind `daily_seed_manifest`, the optional `config.preopen_seed` parser
-and the `verifyAttempts` `declaredSymbols` audit exist (`src/hs/records.nim`,
-`src/hs/replay.nim`, `src/hs/rest_resp.nim`); a stream without
-`config.preopen_seed` replays exactly as before. The producer (P-run
-capture and S-run materialization) is not implemented, so a real seeded
-stream remains unproduced and the P12 approval boundary is untouched.
+**Status: target, Core side and S-run materialization implemented (P3).**
+The 12th kind `daily_seed_manifest`, the optional `config.preopen_seed`
+parser and the `verifyAttempts` `declaredSymbols` audit exist
+(`src/hs/records.nim`, `src/hs/replay.nim`, `src/hs/rest_resp.nim`); the
+S-run reads a P-run seal with `--daily-seed` (`tools/collector/preopen.nim`,
+`src/hs/collector.nim`) and a stream without `config.preopen_seed` replays
+exactly as before. The P-run capture producer is not implemented yet, so
+a real seeded stream remains unproduced and the P12 approval boundary is
+untouched.
 
 **12.10.1 Pre-open capture run (P-run)**
 
@@ -651,12 +653,22 @@ stream remains unproduced and the P12 approval boundary is untouched.
   followed by LF for each block record, in block order, `seq` excluded.
   `symbol_count == K + |failed|`; block symbols and
   `failed` are disjoint, each duplicate-free.
+- `failed` is the source P-run's declared universe minus the block's
+  captured symbols (recorded in universe order when derived): the
+  manifest names `capture_failed_count`, the preserved universe records
+  name the identities, so the derivation replays. A producer-recorded
+  explicit `failed` list must carry exactly that set, and
+  `capture_failed_count == |failed|`.
 - A failed capture is **not** a `rest_resp` record (§12.9); its coverage
   evidence is `failed`. A seed stream with a missing block, with a ka10081
   scope outside block ∪ `failed`, or with a `failed` symbol that also has
   an affirming record is REJECT.
-- `manifest_sha256` binds the source manifest; replay does not recompute
-  it without the source run directory — the acceptance audit checks both.
+- `manifest_sha256` binds the source manifest: sha256 over the manifest
+  record's `canonical(raw)` + LF — the same line framing as
+  `seed_sha256`, `seq` excluded because a record never hashes its own
+  envelope. Replay does not recompute it without the source run
+  directory — the acceptance audit compares the recorded value against
+  the source seal.
 
 **12.10.3 NO_EFFECT scope**
 
