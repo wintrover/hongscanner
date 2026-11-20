@@ -262,6 +262,27 @@ Nim collector-core (src/hs/collector.nim + tools/collector/collector.nim)
 - 응답은 `rest_daily` 이벤트(§3.8)로 원문 보고한다. cont-yn=Y가 실려
   와도 연속조회는 송신하지 않는다: 1페이지가 선언 스코프다.
 
+### 2.9 `list_req` — REST ka10099 1페이지 (종목정보 리스트, 개장 전 유니버스)
+
+```json
+{"type":"list_req","mrkt_tp":"0","page":1,"cont_yn":"","next_key":""}
+```
+
+- 목적: 개장 전 유니버스(REPLAY_CONTRACT §12.10) 도출용 시장별 종목 목록.
+  ka10099는 호출당 시장 하나(`mrkt_tp`)이며 시장별 연속조회
+  (cont-yn/next-key) 체인을 갖는다. `page`는 호출자의 1 기반 논리 페이지
+  번호다.
+- `mrkt_tp`는 비지 않은 문자열이어야 한다. 시장 코드 어휘(0 KOSPI,
+  10 KOSDAQ, 8 ETF 등)의 값 권위는 core/config이고 sidecar는 전달만 한다.
+  `cont_yn`은 `""|"Y"|"N"`, `next_key`는 문자열이다. 위반은 exit 4.
+- sidecar는 **정확히 1페이지**를 송신하고 연속조회를 스스로 따르지 않는다
+  (호출자가 다음 페이지를 결정 — ka10081과 같은 설계).
+- 같은 `_pace_rest` 간격이 적용되고, HTTP 429는 1초 대기 후 1회만
+  재시도한 뒤 최종 응답을 한 번 보고한다.
+- HTTP 전송 실패는 `rest_daily` 대신 `error what=rest` + `"req":"list"`
+  이벤트로 보고한다(§3.6).
+- 응답은 `rest_list` 이벤트(§3.9)로 원문 보고한다.
+
 ## 3. sidecar → core 이벤트
 
 모든 이벤트는 `"ev"`와 `"t"`(ISO 8601, 숫자 오프셋, KST +09:00 —
@@ -383,6 +404,22 @@ sidecar 소유 시계)를 가진다.
 - core의 기록 규칙은 §2.8·§12.9와 같다: 성립 검증(parsePageRows)을 통과한
   응답만 rest_resp 레코드가 되고, 실패(본문 미성립)는 daily_capture_failed
   갭 후 다음 종목 진행(전송 실패는 §3.6 error req="daily" 경로).
+
+### 3.9 `rest_list` — ka10099 REST 응답 (원문)
+
+```json
+{"ev":"rest_list","mrkt_tp":"0","page":1,"status":200,
+ "cont_yn":"Y","next_key":"...","body_hex":"7b0a...","t":"..."}
+```
+
+- `rest_chart`/`rest_daily`(§3.7/§3.8)와 같은 원문 보고 계약: `status`·
+  `cont_yn`/`next_key`(헤더 원문, 없으면 "")·`body_hex`(원문 bytes 소문자
+  hex). 요청 파라미터(`mrkt_tp`·`page`)가 이벤트에 실린다 — 응답 본문이
+  종목 코드만 담고 요청 시장을 반복하지 않기 때문이다.
+- `cont_yn=Y`는 보존되는 응답 증거다. 연속조회 여부는 호출자(core)가
+  결정하며 sidecar는 스스로 다음 페이지를 요청하지 않는다.
+- core는 아직 이 이벤트를 기록하지 않는다(REPLAY_CONTRACT §12.10은 목표
+  계약). 소비자는 개장 전 수집 구현이다.
 
 ## 4. sidecar의 최소 판별 (전부 — 이것 밖에 없다)
 
