@@ -48,6 +48,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 PROTOCOL = 1
+PAGE_CAP_MIN = 1
+PAGE_CAP_MAX = 200
 KST = timezone(timedelta(hours=9))
 DEMO_REST_DOMAIN = "https://mockapi.kiwoom.com"
 DEMO_WS_ENDPOINT = "wss://mockapi.kiwoom.com:10000/api/dostk/websocket"
@@ -245,7 +247,12 @@ def parse_init(line):
                           % environment)
     if cfg.get("api_id") != "ka10027":
         raise SidecarExit(4, "api_id must be ka10027")
-    for key, want in [("page_cap", 10), ("repoll_seconds", 300),
+    page_cap = cfg.get("page_cap")
+    if isinstance(page_cap, bool) or not isinstance(page_cap, int) or \
+       not PAGE_CAP_MIN <= page_cap <= PAGE_CAP_MAX:
+        raise SidecarExit(4, "init page_cap must be an integer %d..%d"
+                          % (PAGE_CAP_MIN, PAGE_CAP_MAX))
+    for key, want in [("repoll_seconds", 300),
                       ("drain_seconds", 10), ("ack_timeout_seconds", 10)]:
         if cfg.get(key) != want:
             raise SidecarExit(4, "init %s must be the approved value %d"

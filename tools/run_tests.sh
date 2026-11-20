@@ -40,6 +40,7 @@ run nim c -r --hints:off --warnings:off --path:src tests/test_collector_stream_c
 run nim c -r --hints:off --warnings:off --path:src tests/test_subscription_selection_contract.nim
 run bash tests/test_collector_pipe_contract.sh
 run bash tools/collector/test_sidecar.sh
+run bash tests/test_collector_sidecar_init.sh
 run bash tools/notify/test_notify.sh
 run bash tools/notify/drill/drill_fcm.sh
 run bash tools/notify/drill/drill_watch.sh
