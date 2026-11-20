@@ -1,0 +1,29 @@
+## Pre-open daily seed capture (P-run) — REPLAY_CONTRACT §12.10.1.
+## One oneshot run per trading day, before the market open: it captures the
+## ka10099 universe and one ka10081 page per symbol into
+## runs/<session_date>-preopen/ and seals it with daily_seed_manifest.
+## The same day's session launcher (tools/run_session.sh) discovers that
+## committed P-run and starts the collector with --daily-seed.
+##
+## ExecStart is the server-side wrapper (the hongscanner-session-start.sh
+## analog): it calls the repository's tools/run_preopen.sh with the
+## operator's --calendar/--profile/--environment arguments. The wrapper is
+## installed on the server, not in this repository; the unit is inert
+## until it exists.
+##
+## Type=oneshot: the capture has one finite job and a real exit status
+## (0 sealed, 2 refusal, 3 calendar, 4 capture failure). Restart is
+## deliberately absent: a failed P-run keeps its unsealed evidence and a
+## retry must use a NEW run directory, never overwrite the failure.
+##
+## TimeoutStartSec covers a slow vendor: ~2,600 one-page requests plus the
+## market chains; the run itself fails closed at the calendar open.
+[Unit]
+Description=Hong Scanner Pre-open Daily Seed Capture (P-run)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/wintrover/hongscanner
+ExecStart=/home/wintrover/.local/bin/hongscanner-preopen-start.sh
+Environment=PYTHONUNBUFFERED=1
+TimeoutStartSec=30min

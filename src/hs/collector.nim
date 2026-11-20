@@ -69,6 +69,14 @@ type
     failed*: seq[string]
     manifestSha256*: string
 
+  PreopenUniverseDecl* = object
+    ## The P-run's declared ka10099 universe source (REPLAY_CONTRACT
+    ## §12.10.1). The producer emits exactly this shape; the `explicit`
+    ## source is a Core/consumer declaration that the capture producer
+    ## never writes. Absent (none) = a legacy/S-run config record.
+    marketCodes*: seq[string]  ## declared market order, unique, non-empty
+    pageCap*: int              ## per-market chain cap, >= 1
+
   CollectorConfig* = object
     sessionDate*: string
     environment*: string       ## "demo" | "real" (the only two names)
@@ -103,6 +111,12 @@ type
                                ## P-run order: emitted as the S-run's rest_resp
                                ## records immediately after the config record
                                ## (§12.10.2). Non-empty only with preopenSeed.
+    preopenUniverse*: Option[PreopenUniverseDecl]
+                               ## config.preopen_universe (REPLAY_CONTRACT
+                               ## §12.10.1): the P-run producer's declared
+                               ## ka10099 universe source. Absent = the key is
+                               ## not recorded and the config record is
+                               ## byte-identical to the legacy one.
     params*: Params
     calendar*: HcjValue        ## the approved calendar snapshot (recorded as seq 1)
 
@@ -298,16 +312,21 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
                           runId = "";
                           dailyScope = "";
                           pageCap = defaultPageCap;
+                          repollSeconds = 300;
                           preopenSeed: Option[PreopenSeedDecl] =
                             none(PreopenSeedDecl);
-                          preopenBlock: seq[HcjValue] = @[]): CollectorConfig =
+                          preopenBlock: seq[HcjValue] = @[];
+                          preopenUniverse: Option[PreopenUniverseDecl] =
+                            none(PreopenUniverseDecl)): CollectorConfig =
   ## Build and validate the collector configuration. The approved PH-1
-  ## values are pinned here (README §5/§6.1): environment-derived
-  ## endpoints, page cap 10 (the declared default; a session may declare
+  ## values are pinned here (README §5/§6.1): the environment-derived
+  ## endpoint, page cap 10 (the declared default; a session may declare
   ## a larger cap — REPLAY_CONTRACT §12.1 "the cap is a scanner-side
   ## declaration" — and the recorded config carries it), repoll 300 s,
   ## drain 10 s, ack timeout 10 s, watchdog 15:40 KST. A different value
-  ## is refused, never silently run.
+  ## is refused, never silently run. `repollSeconds = 0` is the P-run
+  ## declaration: a pre-open universe capture is one chain per market,
+  ## never a re-poll round.
   if environment != "demo" and environment != "real":
     raise cerr("environment must be demo or real: " & environment)
   if sessionDate.len != 10 or sessionDate[4] != '-' or sessionDate[7] != '-':
@@ -350,6 +369,10 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
   # a larger cap; an implausible one is refused, never silently run.
   if pageCap < 1 or pageCap > 200:
     raise cerr("page_cap must be 1..200: " & $pageCap)
+  # The declared re-poll cadence: 300 is the approved PH-1 value and 0 is
+  # the P-run declaration (single-round page chains). Negative is refused.
+  if repollSeconds < 0:
+    raise cerr("repoll_seconds must be >= 0: " & $repollSeconds)
   # config.preopen_seed (REPLAY_CONTRACT §12.10.2): optional, fail-closed
   # when present. Absent, the block must be empty too — a block without
   # its declaration would be records no audit can bind to a source run.
@@ -357,6 +380,26 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     validatePreopenSeed(preopenSeed.get, preopenBlock, sessionDate)
   elif preopenBlock.len > 0:
     raise cerr("preopen seed block requires config.preopen_seed")
+  # config.preopen_universe (REPLAY_CONTRACT §12.10.1): the P-run
+  # declaration is exclusive with config.preopen_seed, and every field is
+  # validated here before any record or request exists. Absent, nothing
+  # changes.
+  if preopenUniverse.isSome:
+    if preopenSeed.isSome:
+      raise cerr("config.preopen_universe and config.preopen_seed are " &
+                 "mutually exclusive: a stream is a P-run or an S-run")
+    let u = preopenUniverse.get
+    if u.marketCodes.len == 0:
+      raise cerr("preopen_universe.market_codes must not be empty")
+    var markets = initHashSet[string]()
+    for m in u.marketCodes:
+      if m.len == 0:
+        raise cerr("preopen_universe.market_codes carries an empty market")
+      if m in markets:
+        raise cerr("preopen_universe.market_codes repeats market: " & m)
+      markets.incl(m)
+    if u.pageCap < 1 or u.pageCap > 200:
+      raise cerr("preopen_universe.page_cap must be 1..200: " & $u.pageCap)
   # The declared query scope must be inside the documented enums for both
   # directions before anything is recorded or sent.
   discard initKa10027Query(dirUp, mrktTp, trdeQtyCnd, stkCnd, crdCnd,
@@ -376,7 +419,7 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     updownIncls: updownIncls, pricCnd: pricCnd,
     trdePricaCnd: trdePricaCnd, stexTp: stexTp,
     pageCap: pageCap,
-    repollSeconds: 300,
+    repollSeconds: repollSeconds,
     drainSeconds: 10,
     ackTimeoutSeconds: 10,
     watchdog: approvedWatchdog,
@@ -386,6 +429,7 @@ proc initCollectorConfig*(sessionDate, environment, profile: string;
     dailyScope: dailyScope,
     preopenSeed: preopenSeed,
     preopenBlock: preopenBlock,
+    preopenUniverse: preopenUniverse,
     params: params,
     calendar: calendar)
 
@@ -454,6 +498,17 @@ proc preambleRecords*(cfg: CollectorConfig): seq[RecOut] =
         ("session_date", hStr(s.sessionDate)),
         ("source_run_id", hStr(s.sourceRunId)),
         ("symbol_count", hInt(s.symbolCount)))))
+    if cfg.preopenUniverse.isSome:
+      # Exactly the §12.10.1 ka10099 shape: source, market order, cap.
+      # Absent adds no key, so every legacy/S-run config record is
+      # byte-identical.
+      let u = cfg.preopenUniverse.get
+      var markets: seq[HcjValue]
+      for m in u.marketCodes: markets.add(hStr(m))
+      pairs.add(("preopen_universe", hObj(
+        ("market_codes", hArrSeq(markets)),
+        ("page_cap", hInt(u.pageCap)),
+        ("source", hStr("ka10099")))))
     if cfg.runId.len > 0:
       pairs.add(("run_id", hStr(cfg.runId)))
     pairs.add(("selection_policy", hStr(selectionPolicyId)))

@@ -24,6 +24,7 @@ import std/[os, osproc, strutils, posix, times, streams, options]
 import hs/[hcj, records, calendars, engine, collector, recorder, event_gen,
           vendor_input]
 import preopen
+import preopen_capture
 
 const usageText = """collector — the VS-2 live collector (demo|real)
 
@@ -259,6 +260,11 @@ proc closeEventsLog(el: var EventsLog) =
 
 proc main(): int =
   let args = commandLineParams()
+  if "--preopen" in args:
+    # The P-run producer (REPLAY_CONTRACT §12.10.1) shares this binary's
+    # sidecar boundary but none of the WS session path: the branch returns
+    # its own exit code and the session code below is never reached.
+    return preopenMain(args)
   if args.len == 0 or argFlag(args, "help") or argFlag(args, "h"):
     stdout.write(usageText)
     return 2

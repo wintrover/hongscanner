@@ -655,6 +655,61 @@ composeRegData에 도달하는 경로는 없다.
 `--daily-seed`가 없으면 레거시 스트림 그대로다: config에
 `preopen_seed` 키가 없고 블록도 없으며 바이트가 동일하다.
 
+### 6.4 개장 전 캡처 (`--preopen`, P-run producer)
+
+`--preopen`은 collector 바이너리의 P-run 생산 모드다
+(`tools/collector/preopen_capture.nim`, REPLAY_CONTRACT §12.10.1). 세션
+경로(WS·구독·이벤트)는 전혀 실행하지 않고, 사이드카의 `list_req`/
+`daily_req`만 사용한다.
+
+```
+tools/run_preopen.sh --session-date=YYYY-MM-DD --calendar=<snapshot> \
+  [--out=<dir>] [--profile=<alias>] [--environment=demo|real] \
+  [--preopen-markets=0,10] [--preopen-page-cap=10]
+```
+
+- 기본 실행 디렉터리는 `runs/<session_date>-preopen/`이고, 이미 존재하는
+  경로는 거부한다(exit 2 — 실패한 P-run의 증거를 덮어쓰지 않는다).
+  실행 로그는 `runs/<session_date>.preopen.log`.
+- 레코드 순서: `calendar`(seq 1) → `config`(seq 2, `preopen_universe`와
+  `run_id` 포함, `repoll_seconds=0` — P-run은 재폴링 라운드가 없다) →
+  시장별 ka10099 `rest_resp` 페이지(선언 시장 순서·페이지 순서) →
+  유니버스 순서의 ka10081 `rest_resp`(캡처 성공) 또는
+  `daily_capture_failed` 갭(실패) → 마지막 `daily_seed_manifest`.
+  `ws_frame`·`session_end`는 없고, 레코더는 `finish()`가 아니라
+  `abandon()`으로 닫힌다(seal은 manifest 레코드 자체다).
+- 유니버스: 기본 시장 `0`(KOSPI)+`10`(KOSDAQ), 시장별 cont-yn/next-key
+  체인을 따라가며 `code`를 첫 등장 순서로 중복 제거한다. 페이지 캡은
+  시장별 예산(1..200, 기본 10)이며 cap에서 cont-yn=Y로 닫힌 체인은
+  `universe.truncated=true`로 정직하게 기록된다(완전한 유니버스로
+  주장하지 않는다).
+- 종목당 ka10081 페이지는 정확히 1장(페이지네이션 없음). 유효 완료일은
+  행 인덱스가 아니라 `dt`(YYYYMMDD) < `session_date` 그리고 `cur_prc`가
+  양의 정수인 행의 **서로 다른 날짜 수**다. 0일이면 캡처가 아니라
+  `daily_capture_failed` 갭(심볼 포함)이고, 1..19일이면 캡처이면서
+  `history_short_count`에 포함된다. 전송 오류·성립하지 않는 응답·429
+  재시도 후 실패도 갭이다.
+- manifest는 정확히 10개 필드다: `binary_sha256`,
+  `capture_failed_count`, `capture_window{started_at,ended_at}`,
+  `captured_count`, `config_sha256`, `history_short_count`,
+  `seed_sha256`, `session_date`, `source_run_id`,
+  `universe{market_codes,source,symbol_count,truncated,universe_sha256}`.
+  `universe_sha256`/`seed_sha256` 프레이밍은 Core와 동일하며, manifest를
+  append하기 **전에** `preopenUniverseOf`/`preopenFailedOf`/
+  `validatePreopenManifest`로 자기 감사한다 — Core가 거부할 seal은
+  기록되지 않는다.
+- `capture_window`는 정확히 `YYYY-MM-DDTHH:MM:SS+09:00`이고
+  `started_at <= ended_at < 달력의 open`이어야 한다(기록값 비교). 요청
+  경계와 최종 창에서 개장을 넘으면 `preopen_window_overrun` 런 갭을
+  남기고 manifest 없이 exit 4로 끝난다.
+- exit 코드: 0 봉인됨, 2 사용법/거부/설정, 3 세션 날짜가 달력에 없음,
+  4 캡처 실패·창 초과(증거 보존, seal 없음).
+- 같은 날 세션 실행(`tools/run_session.sh`)은
+  `runs/<session_date>-preopen/input.hcj.jsonl`이 있으면 자동으로
+  `--daily-seed=<dir>`를 붙인다(§6.3). P-run이 없으면 레거시 인자
+  그대로다. systemd는 `hongscanner-preopen.timer`가 평일 07:00
+  Asia/Seoul에 oneshot 서비스를 깨운다(`Persistent=false`).
+
 ## 7. GAP 분류 (계약 §12 확정표의 구현 매핑 — 전부 기존 kind)
 
 | 사건 | 기록 | 후속 |
@@ -684,6 +739,9 @@ composeRegData에 도달하는 경로는 없다.
 - **사용법·내부 계약 위반**: exit 2.
 - exit 코드는 이 문서가 정의한다: 0 정상, 2 사용법·계약, 4 INCOMPLETE.
   실패를 성공으로 꾸미는 경로는 존재하지 않는다.
+- P-run(`--preopen`)도 같은 번호를 쓰되 의미가 다르다: 0 봉인된 P-run,
+  2 사용법·기존 디렉터리 거부·설정 오류, 3 달력에 없는 세션 날짜,
+  4 캡처 실패·창 초과(manifest 없음, 기록된 증거는 보존).
 
 ## 9. 0B/0s 와이어 형상 (공식 스펙 JSON으로 확정 — tickwire.nim 단일 파서)
 
@@ -762,6 +820,9 @@ composeRegData에 도달하는 경로는 없다.
 - Nim collector-core: `src/hs/`의 순수 모듈(collector/tickwire/subcheck) —
   테스트는 `tests/test_collector_contract.nim`, `tests/test_tickwire_contract.nim`,
   `tests/test_subcheck_contract.nim`, `tests/test_collector_stream_contract.nim`.
+  P-run producer 계약은
+  `tests/test_preopen_capture_producer_contract.nim`(fake sidecar + 주입
+  시계, `--path:tools/collector` 포함).
 - sidecar: Python 3.13 격리 venv(`tools/collector/.venv`, gitignore),
   의존성은 `requirements.txt`(websockets만 — 키움 SDK 불필요·복제 금지).
   `bash tools/collector/test_sidecar.sh`가 venv를 보장하고 unittest를
@@ -777,7 +838,10 @@ composeRegData에 도달하는 경로는 없다.
   --out runs/<dir> [--environment=demo|real] [--daily-seed=<P-run dir>]`
   — 기본값은 demo이고, `--daily-seed`가 없으면 레거시(비시드) 스트림이다
   (§6.3).
-  개발 중 라이브 호출 금지(하드 규칙). 바이너리는
+- P-run 실행(라이브, 별도 사전검증 단계에서만):
+  `tools/run_preopen.sh --session-date YYYY-MM-DD --calendar=<snapshot>`
+  (기본 `runs/<session_date>-preopen`, §6.4).
+- 개발 중 라이브 호출 금지(하드 규칙). 바이너리는
   `nim c -d:release --path:src -o:tools/collector/collector tools/collector/collector.nim`.
 
 ## 12. UNVERIFIED·사전 검증 목록 (merge 후 실측 항목)
@@ -805,3 +869,12 @@ composeRegData에 도달하는 경로는 없다.
   도메인 형상(공식 스펙 JSON에 없는 TR — 모든 사실이 모의 측정이다),
   upd_stkpc_tp 0/1의 실제 차이(모의 upd_rt 0.00으로 구분 불가),
   429 임계(1초 무휴면 연속 → 429 + return_code 5)의 운영값.
+- P-run producer(§6.4): ka10099 시장 코드 `0`/`10`은 운영자 선언이며
+  실제 KOSPI/KOSDAQ 전체 목록 크기·체인 길이(페이지 캡 도달 여부)는
+  미실측. 사이드카의 `daily_req` 429 재시도(1회)는 list 경로와 달리
+  Python 단위 테스트가 없다 — 프로듀서 계약 테스트는 "재시도 후 성공
+  이벤트 1건"을 fake로 검증할 뿐, 실제 daily 429 동작은 실측 대상이다.
+  systemd `OnCalendar`의 timezone 접미사(`Asia/Seoul`)는 systemd >= 235
+  전제이며 서버 버전에서 확인해야 한다. 서버 래퍼
+  `/home/wintrover/.local/bin/hongscanner-preopen-start.sh`는 저장소에
+  없으므로, 설치 전까지 유닛은 비활성이다.
