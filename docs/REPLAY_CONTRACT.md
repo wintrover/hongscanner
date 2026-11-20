@@ -603,9 +603,13 @@ rejected by §3 and nothing here changes today's replay.
   `{"source":"explicit","symbols":[...]}`. Any other shape is rejected
   (exit 2).
 - ka10099 takes **one market per request** (`mrkt_tp`); each market is its
-  own cont-yn/next-key page chain. The universe is the deduped `stk_cd`
-  sequence in (declared market order, page order, row order). Pages are
-  preserved as `rest_resp` (api_id `ka10099`), so the derivation replays.
+  own cont-yn/next-key page chain. The response body is `list[]` with rows
+  carrying `code` (the symbol field), `name`, `marketCode`, `marketName`,
+  `state`, `auditInfo`, `orderWarning`, `companyClassName`, `nxtEnable`
+  (official spec JSON, fetched 2026-11-20). The universe is the deduped
+  `code` sequence in (declared market order, page order, row order). Pages
+  are preserved as `rest_resp` (api_id `ka10099`), so the derivation
+  replays.
   A chain closed at the declared cap while cont-yn=Y is a declared
   truncated subset: `universe.truncated=true`, and the run never claims
   "all symbols".
